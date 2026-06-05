@@ -373,6 +373,10 @@ static void enczWalParseHeaderPageSize(EnczFile *p, const u8 *aHdr){
 
 static int enczWalMetaLoad(EnczFile *p){
   sqlite3_int64 nSize = 0;
+  sqlite3_int64 nWalSize = 0;
+  sqlite3_int64 nMetaPayload;
+  sqlite3_int64 nFrameSize;
+  sqlite3_int64 nWalFrames = 0;
   u8 *aBuf = 0;
   WalMetaHdr hdr;
   u32 i;
@@ -399,9 +403,32 @@ static int enczWalMetaLoad(EnczFile *p){
     rc = SQLITE_CORRUPT;
     goto walmeta_load_out;
   }
+  nMetaPayload = nSize - 20;
+  if( (nMetaPayload % (sqlite3_int64)sizeof(WalMetaEntry))!=0 ){
+    rc = SQLITE_CORRUPT;
+    goto walmeta_load_out;
+  }
+  if( hdr.frameCount > (u32)(nMetaPayload / (sqlite3_int64)sizeof(WalMetaEntry)) ){
+    rc = SQLITE_CORRUPT;
+    goto walmeta_load_out;
+  }
+  p->walPageSize = hdr.pageSize ? (int)hdr.pageSize : p->walPageSize;
+  if( p->walPageSize<=0 ){
+    rc = SQLITE_CORRUPT;
+    goto walmeta_load_out;
+  }
+  rc = p->pSubFile->pMethods->xFileSize(p->pSubFile, &nWalSize);
+  if( rc!=SQLITE_OK ) goto walmeta_load_out;
+  nFrameSize = (sqlite3_int64)p->walPageSize + ENCZ_WAL_FRAME_HDR_SZ;
+  if( nWalSize > ENCZ_WAL_HDR_SZ ){
+    nWalFrames = (nWalSize - ENCZ_WAL_HDR_SZ) / nFrameSize;
+  }
+  if( hdr.frameCount > (u32)nWalFrames ){
+    rc = SQLITE_CORRUPT;
+    goto walmeta_load_out;
+  }
   rc = enczWalMetaEnsureCap(p, hdr.frameCount);
   if( rc!=SQLITE_OK ) goto walmeta_load_out;
-  p->walPageSize = hdr.pageSize ? (int)hdr.pageSize : p->walPageSize;
   p->walFrameCount = hdr.frameCount;
   for(i=0; i<hdr.frameCount; i++){
     WalMetaEntry *pEntry = &((WalMetaEntry*)&aBuf[20])[i];
