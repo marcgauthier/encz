@@ -13,8 +13,8 @@ through `database/sql`.
 ## Requirements
 
 - CGO enabled.
-- Native link dependencies available to the Go toolchain: `libcrypto`,
-  `libzstd`, and `libz`.
+- For **Linux AMD64** and **Windows AMD64**, the native library dependencies (`libcrypto`, `libzstd`, and `libz`) are pre-compiled and bundled directly within the `lib/` directory of this repository. No external library installations are required for these platforms.
+- For other platforms and architectures, the libraries (`libcrypto`, `libzstd`, `libz`) must be available to the Go toolchain (e.g., installed via a package manager).
 
 ## Install
 

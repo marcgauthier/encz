@@ -1214,7 +1214,28 @@ static int enczReadLogicalPage(EnczFile *p, u32 pgno, u8 *aPage){
 
   pEntry = &p->aMap[pgno-1];
   if( pEntry->offset==0 || pEntry->storedSize==0 ) return SQLITE_OK;
-  if( !p->hasKey ) return SQLITE_AUTH;
+  if( !p->hasKey ){
+    if( pgno==1 ){
+      memset(aPage, 0, (size_t)p->logicalPageSize);
+      memcpy(aPage, "SQLite format 3", 16);
+      aPage[16] = (u8)((p->logicalPageSize >> 8) & 0xff);
+      aPage[17] = (u8)(p->logicalPageSize & 0xff);
+      aPage[18] = 1;
+      aPage[19] = 1;
+      aPage[21] = 64;
+      aPage[22] = 32;
+      aPage[23] = 32;
+      aPage[47] = 4; // Schema format = 4
+      aPage[59] = 1; // Text encoding = 1 (UTF-8)
+      // b-tree leaf page header at offset 100
+      aPage[100] = 0x0d; // leaf table b-tree page
+      aPage[105] = (u8)((p->logicalPageSize >> 8) & 0xff);
+      aPage[106] = (u8)(p->logicalPageSize & 0xff);
+    }else{
+      memset(aPage, 0, (size_t)p->logicalPageSize);
+    }
+    return SQLITE_OK;
+  }
 
   aStored = sqlite3_malloc64((sqlite3_uint64)pEntry->storedSize);
   if( aStored==0 ) return SQLITE_NOMEM;
@@ -1438,9 +1459,8 @@ static int enczRead(sqlite3_file *pFile, void *pBuf, int iAmt, sqlite3_int64 iOf
   }
   rc = enczEnsureReady(p, 0);
   if( rc!=SQLITE_OK ) return rc;
-  if( !p->hasKey ) return SQLITE_AUTH;
 
-  p->ioStarted = 1;
+  if( p->hasKey ) p->ioStarted = 1;
   memset(aOut, 0, (size_t)iAmt);
   if( iAmt<=0 ) return SQLITE_OK;
   firstPg = (u32)(iOfst / p->logicalPageSize) + 1;

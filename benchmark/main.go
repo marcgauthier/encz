@@ -19,7 +19,7 @@ import (
 
 const (
 	defaultPassword                = "Password123"
-	defaultCompression             = "none"
+	defaultCompression             = "zstd"
 	defaultRowCount                = 1000
 	defaultIndexedSelectIterations = 5000
 	defaultPlainSelectIterations   = 250
