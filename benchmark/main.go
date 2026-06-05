@@ -20,10 +20,10 @@ import (
 const (
 	defaultPassword                = "Password123"
 	defaultCompression             = "none"
-	defaultRowCount                = 5000
-	defaultIndexedSelectIterations = 20000
-	defaultPlainSelectIterations   = 1000
-	defaultWriteBenchmarkRowCount  = 5000
+	defaultRowCount                = 1000
+	defaultIndexedSelectIterations = 5000
+	defaultPlainSelectIterations   = 250
+	defaultWriteBenchmarkRowCount  = 2000
 )
 
 type userRecord struct {
@@ -86,15 +86,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	db, err := encz.OpenEncz(cfg.dbPath, cfg.password, cfg.compression)
+	db, err := encz.OpenWithOptions(cfg.dbPath, encz.Options{
+		Key:         cfg.password,
+		Compression: cfg.compression,
+		JournalMode: "WAL",
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if err := configureDatabase(db, cfg.compression); err != nil {
-		_ = db.Close()
-		log.Fatal(err)
-	}
 	if err := createSchema(db); err != nil {
 		_ = db.Close()
 		log.Fatal(err)
@@ -106,6 +106,10 @@ func main() {
 
 	bench, err := runBenchmarks(context.Background(), db, seedUsers, benchmarkUsers, cfg)
 	if err != nil {
+		_ = db.Close()
+		log.Fatal(err)
+	}
+	if _, err := db.ExecContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		_ = db.Close()
 		log.Fatal(err)
 	}
@@ -159,19 +163,6 @@ func cleanupDatabaseArtifacts(path string) error {
 	}
 	for _, suffix := range []string{"-wal", "-shm", "-wal.cvmeta", ".wal"} {
 		_ = os.Remove(path + suffix)
-	}
-	return nil
-}
-
-func configureDatabase(db *sql.DB, compression string) error {
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		fmt.Sprintf("PRAGMA crypto_compression=%s", sqlQuote(compression)),
-	}
-	for _, pragma := range pragmas {
-		if _, err := db.ExecContext(context.Background(), pragma); err != nil {
-			return fmt.Errorf("exec %q: %w", pragma, err)
-		}
 	}
 	return nil
 }
@@ -306,7 +297,11 @@ func exhaustRows(rows *sql.Rows) error {
 }
 
 func validateReopen(cfg config, seedUsers, writeUsers []userRecord) (validationResult, error) {
-	db, err := encz.OpenEncz(cfg.dbPath, cfg.password, cfg.compression)
+	db, err := encz.OpenWithOptions(cfg.dbPath, encz.Options{
+		Key:         cfg.password,
+		Compression: cfg.compression,
+		JournalMode: "WAL",
+	})
 	if err != nil {
 		return validationResult{}, err
 	}
@@ -387,29 +382,6 @@ func equalBytes(a, b []byte) bool {
 		}
 	}
 	return true
-}
-
-func sqlQuote(value string) string {
-	return "'" + replaceAll(value, "'", "''") + "'"
-}
-
-func replaceAll(s, old, new string) string {
-	for {
-		index := indexOf(s, old)
-		if index < 0 {
-			return s
-		}
-		s = s[:index] + new + s[index+len(old):]
-	}
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 func generateUsers(count int, startID int) ([]userRecord, error) {
