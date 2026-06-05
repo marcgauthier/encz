@@ -17,6 +17,10 @@ func init() {
 		runCrashHelper()
 		os.Exit(0)
 	}
+	if os.Getenv("GO_TEST_EXIT_ZERO_HELPER") == "1" {
+		runExitZeroHelper()
+		os.Exit(0)
+	}
 }
 
 func runCrashHelper() {
@@ -288,5 +292,79 @@ func TestCorruptionTampering(t *testing.T) {
 		if err == nil {
 			t.Error("expected database open or query to fail on corrupted database, but both succeeded!")
 		}
+	}
+}
+
+func runExitZeroHelper() {
+	dbPath := os.Getenv("CRASH_DB_PATH")
+	if dbPath == "" {
+		return
+	}
+	key := "ExitZeroPassword123"
+	db, err := encz.OpenEncz(dbPath, key, "zstd")
+	if err != nil {
+		os.Exit(2)
+	}
+	_, err = db.Exec(`CREATE TABLE exit_zero_data (id INTEGER PRIMARY KEY, val TEXT)`)
+	if err != nil {
+		os.Exit(3)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		os.Exit(4)
+	}
+	for i := 0; i < 1000; i++ {
+		_, err = tx.Exec(`INSERT INTO exit_zero_data (val) VALUES (?)`, fmt.Sprintf("val_%d", i))
+		if err != nil {
+			tx.Rollback()
+			os.Exit(5)
+		}
+	}
+	err = tx.Commit()
+	if err != nil {
+		os.Exit(6)
+	}
+	os.Exit(0)
+}
+
+// TestAbruptExitGrace validates that calling os.Exit(0) mid-process without closing the DB
+// does not corrupt the database and all committed transaction data is preserved.
+func TestAbruptExitGrace(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "exit_zero.db")
+	key := "ExitZeroPassword123"
+
+	// 1. Spawn the helper process to insert 1000 items and call os.Exit(0)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("failed to find executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestAbruptExitGrace")
+	cmd.Env = append(os.Environ(), "GO_TEST_EXIT_ZERO_HELPER=1", "CRASH_DB_PATH="+dbPath)
+	err = cmd.Run()
+	if err != nil {
+		t.Fatalf("helper process failed to run: %v", err)
+	}
+
+	// 2. Reopen the database and verify integrity
+	db, err := encz.OpenEncz(dbPath, key, "zstd")
+	if err != nil {
+		t.Fatalf("failed to reopen DB after exit(0): %v", err)
+	}
+	defer db.Close()
+
+	var integrity string
+	err = db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
+	if err != nil || integrity != "ok" {
+		t.Fatalf("integrity check failed: %s, err=%v", integrity, err)
+	}
+
+	// Verify all 1000 rows are present
+	var count int
+	err = db.QueryRow(`SELECT count(*) FROM exit_zero_data`).Scan(&count)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if count != 1000 {
+		t.Errorf("expected 1000 rows, got %d", count)
 	}
 }
