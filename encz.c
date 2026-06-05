@@ -70,6 +70,8 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,6 +119,26 @@ typedef struct DirtyPage DirtyPage;
 typedef struct WalMetaHdr WalMetaHdr;
 typedef struct WalMetaEntry WalMetaEntry;
 typedef struct EnczFile EnczFile;
+
+static int enczDebugEnabled = -1;
+
+static int enczDebugOn(void){
+  if( enczDebugEnabled<0 ){
+    const char *z = getenv("ENCZ_DEBUG");
+    enczDebugEnabled = (z && z[0] && z[0]!='0') ? 1 : 0;
+  }
+  return enczDebugEnabled;
+}
+
+static void enczDebug(const char *zFmt, ...){
+  va_list ap;
+  if( !enczDebugOn() ) return;
+  va_start(ap, zFmt);
+  fprintf(stderr, "[encz] ");
+  vfprintf(stderr, zFmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+}
 
 struct EnczHdr {
   u8 magic[ENCZ_MAGIC_SZ];
@@ -817,6 +839,23 @@ static int enczRawWrite(EnczFile *p, const void *pBuf, int nBuf, i64 iOfst){
   return p->pSubFile->pMethods->xWrite(p->pSubFile, pBuf, nBuf, iOfst);
 }
 
+static int enczRawWriteChunked(EnczFile *p, const void *pBuf, int nBuf, i64 iOfst){
+  const u8 *aIn = (const u8*)pBuf;
+  int nRemaining = nBuf;
+  const int nChunk = 64 * 1024;
+  int rc = SQLITE_OK;
+
+  while( nRemaining>0 ){
+    int nWrite = nRemaining > nChunk ? nChunk : nRemaining;
+    rc = enczRawWrite(p, aIn, nWrite, iOfst);
+    if( rc!=SQLITE_OK ) return rc;
+    aIn += nWrite;
+    iOfst += nWrite;
+    nRemaining -= nWrite;
+  }
+  return SQLITE_OK;
+}
+
 static int enczParseCompression(const char *z){
   if( z==0 ) return -1;
   if( sqlite3_stricmp(z, "none")==0 ) return ENCZ_COMPRESSION_NONE;
@@ -1184,13 +1223,31 @@ static int enczEnsureReady(EnczFile *p, int pageSizeHint){
   if( p->initialized ) return SQLITE_OK;
   rc = p->pSubFile->pMethods->xFileSize(p->pSubFile, &nSize);
   if( rc!=SQLITE_OK ) return rc;
+  enczDebug(
+    "ensure ready file=%s size=%lld page_hint=%d initialized=%d",
+    p->zFName ? p->zFName : "(null)",
+    (long long)nSize,
+    pageSizeHint,
+    p->initialized
+  );
   if( nSize==0 ){
     rc = enczInitNewContainer(p, pageSizeHint);
     if( rc!=SQLITE_OK ) return rc;
   }else{
     rc = enczLoadHeaders(p);
-    if( rc==SQLITE_NOTFOUND ) return SQLITE_NOTADB;
+    if( rc==SQLITE_NOTFOUND ){
+      enczDebug("load headers returned SQLITE_NOTFOUND file=%s", p->zFName ? p->zFName : "(null)");
+      return SQLITE_NOTADB;
+    }
     if( rc!=SQLITE_OK ) return rc;
+    enczDebug(
+      "load headers ok file=%s page_size=%d page_count=%u generation=%llu data_end=%llu",
+      p->zFName ? p->zFName : "(null)",
+      p->logicalPageSize,
+      p->pageCount,
+      (unsigned long long)p->generation,
+      (unsigned long long)p->dataEnd
+    );
   }
   p->initialized = 1;
   return SQLITE_OK;
@@ -1337,7 +1394,18 @@ static int enczWriteMapSnapshot(
   }
   crc = enczCrc32(&aBlob[16], (size_t)mapSize - 16);
   enczPut32(&aBlob[12], crc);
-  rc = enczRawWrite(p, aBlob, (int)mapSize, (i64)mapOffset);
+  rc = enczRawWriteChunked(p, aBlob, (int)mapSize, (i64)mapOffset);
+  if( rc!=SQLITE_OK ){
+    enczDebug(
+      "map snapshot raw write failed file=%s rc=%d map_offset=%llu map_size=%llu data_end=%llu page_count=%u",
+      p->zFName ? p->zFName : "(null)",
+      rc,
+      (unsigned long long)mapOffset,
+      (unsigned long long)mapSize,
+      (unsigned long long)(mapOffset + mapSize),
+      p->pageCount
+    );
+  }
   sqlite3_free(aBlob);
   if( rc!=SQLITE_OK ) return rc;
   *pMapOffset = mapOffset;
@@ -1348,6 +1416,7 @@ static int enczWriteMapSnapshot(
 
 static int enczCommit(EnczFile *p, int flags){
   DirtyPage *pDirty;
+  u32 dirtyCount = 0;
   u64 dataEnd = p->dataEnd;
   u64 mapOffset = 0;
   u64 mapSize = 0;
@@ -1360,6 +1429,18 @@ static int enczCommit(EnczFile *p, int flags){
   if( !p->needsCommit ) return SQLITE_OK;
   if( !p->hasKey ) return SQLITE_AUTH;
   if( p->logicalPageSize<=0 ) return SQLITE_CORRUPT;
+  for(pDirty=p->pDirty; pDirty; pDirty=pDirty->pNext){
+    dirtyCount++;
+  }
+  enczDebug(
+    "commit begin file=%s page_size=%d page_count=%u dirty_pages=%u data_end=%llu pending_truncate=%d",
+    p->zFName ? p->zFName : "(null)",
+    p->logicalPageSize,
+    p->pageCount,
+    dirtyCount,
+    (unsigned long long)p->dataEnd,
+    p->pendingTruncate
+  );
 
   for(pDirty=p->pDirty; pDirty; pDirty=pDirty->pNext){
     u8 *aStored = 0;
@@ -1371,7 +1452,10 @@ static int enczCommit(EnczFile *p, int flags){
       p, pDirty->data, p->logicalPageSize,
       &aStored, &nStored, &flagsPage, nonce, tag
     );
-    if( rc!=SQLITE_OK ) break;
+    if( rc!=SQLITE_OK ){
+      enczDebug("commit encrypt failed pgno=%u rc=%d", pDirty->pgno, rc);
+      break;
+    }
     rc = enczRawWrite(p, aStored, nStored, (i64)dataEnd);
     if( rc==SQLITE_OK ){
       EnczMapEntry *pEntry = &p->aMap[pDirty->pgno - 1];
@@ -1382,11 +1466,22 @@ static int enczCommit(EnczFile *p, int flags){
       memcpy(pEntry->nonce, nonce, ENCZ_NONCE_SZ);
       memcpy(pEntry->tag, tag, ENCZ_TAG_SZ);
       dataEnd += (u64)nStored;
+    }else{
+      enczDebug(
+        "commit raw write failed pgno=%u rc=%d stored=%d data_end=%llu",
+        pDirty->pgno, rc, nStored, (unsigned long long)dataEnd
+      );
     }
     sqlite3_free(aStored);
     if( rc!=SQLITE_OK ) break;
   }
   if( rc!=SQLITE_OK ) return rc;
+  enczDebug(
+    "commit encrypted pages staged file=%s dirty_pages=%u new_data_end=%llu",
+    p->zFName ? p->zFName : "(null)",
+    dirtyCount,
+    (unsigned long long)dataEnd
+  );
 
   if( p->pendingTruncate>=0 && (u32)p->pendingTruncate < p->pageCount ){
     u32 i;
@@ -1397,9 +1492,25 @@ static int enczCommit(EnczFile *p, int flags){
   }
 
   rc = enczWriteMapSnapshot(p, &mapOffset, &mapSize, &dataEnd);
-  if( rc!=SQLITE_OK ) return rc;
+  if( rc!=SQLITE_OK ){
+    enczDebug(
+      "commit map snapshot failed rc=%d page_count=%u",
+      rc, p->pageCount
+    );
+    return rc;
+  }
+  enczDebug(
+    "commit map snapshot ok page_count=%u map_offset=%llu map_size=%llu new_data_end=%llu",
+    p->pageCount,
+    (unsigned long long)mapOffset,
+    (unsigned long long)mapSize,
+    (unsigned long long)dataEnd
+  );
   rc = p->pSubFile->pMethods->xSync(p->pSubFile, flags);
-  if( rc!=SQLITE_OK ) return rc;
+  if( rc!=SQLITE_OK ){
+    enczDebug("commit sync before header failed rc=%d", rc);
+    return rc;
+  }
 
   generation = p->generation + 1;
   enczMakeHeader(p, &hdr, mapOffset, mapSize, dataEnd, generation);
@@ -1409,9 +1520,15 @@ static int enczCommit(EnczFile *p, int flags){
     p, aHdr, ENCZ_HDR_SZ,
     nextSlot ? ENCZ_HDR_SLOT1 : ENCZ_HDR_SLOT0
   );
-  if( rc!=SQLITE_OK ) return rc;
+  if( rc!=SQLITE_OK ){
+    enczDebug("commit header write failed rc=%d next_slot=%d", rc, nextSlot);
+    return rc;
+  }
   rc = p->pSubFile->pMethods->xSync(p->pSubFile, flags);
-  if( rc!=SQLITE_OK ) return rc;
+  if( rc!=SQLITE_OK ){
+    enczDebug("commit final sync failed rc=%d", rc);
+    return rc;
+  }
 
   p->generation = generation;
   p->currentHdrSlot = nextSlot;
@@ -1419,6 +1536,13 @@ static int enczCommit(EnczFile *p, int flags){
   p->needsCommit = 0;
   p->pendingTruncate = -1;
   enczFreeDirtyPages(p);
+  enczDebug(
+    "commit success file=%s generation=%llu data_end=%llu current_slot=%d",
+    p->zFName ? p->zFName : "(null)",
+    (unsigned long long)p->generation,
+    (unsigned long long)p->dataEnd,
+    p->currentHdrSlot
+  );
   return SQLITE_OK;
 }
 
@@ -1786,6 +1910,13 @@ static int enczOpen(
   if( p->isMainDb || p->isWal ){
     if( p->isMainDb ){
       enczApplyUriConfig(p, zName);
+      enczDebug(
+        "open main file=%s readonly=%d has_key=%d compression=%d",
+        zName ? zName : "(null)",
+        p->isReadonly,
+        p->hasKey,
+        p->compression
+      );
     }
     if( p->isWal && zName ){
       sqlite3_file *pDb = sqlite3_database_file_object(zName);
@@ -1804,6 +1935,7 @@ static int enczOpen(
     pFile->pMethods = &encz_io_methods;
     rc = pSubVfs->xOpen(pSubVfs, zName, pSubFile, flags, pOutFlags);
     if( rc!=SQLITE_OK ){
+      enczDebug("subvfs open failed file=%s rc=%d", zName ? zName : "(null)", rc);
       pFile->pMethods = 0;
       return rc;
     }
