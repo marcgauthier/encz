@@ -1,50 +1,42 @@
 # encz
 
-`encz` is a Go database driver wrapper around `github.com/mattn/go-sqlite3` that marries **SQLite**'s SQL interface with **RocksDB**'s high-performance key-value storage engine. It provides page-level cryptographic encryption and optional page-level compression transparently.
+`encz` is a Go database driver wrapper around `github.com/mattn/go-sqlite3` that adds transparent page-level encryption to standard SQLite database files.
 
-## Architecture & Design
+## Architecture
 
-Instead of writing SQLite database pages directly to a traditional flat database file, `encz` intercepts SQLite page reads and writes via a custom VFS extension and routes them to a backing **RocksDB** instance:
+`encz` registers a custom SQLite VFS named `encz`. When a `crypto_key` is supplied, SQLite opens the database through that VFS and page I/O is transformed in place on the flat database file.
 
-- **Storage Mapping**: Each SQLite page is stored in RocksDB as a key-value pair, where the key is the 32-bit page number (`pgno`) and the value contains the page data.
-- **Compression**: Page data is optionally compressed (using `zstd` or `deflate`) before encryption. This maximizes storage efficiency.
-- **Encryption**: Compressed pages are encrypted using **AES-256-GCM**. Each encrypted page block stores its custom flags (4 bytes), nonce (12 bytes), GCM authentication tag (16 bytes), and the actual encrypted payload.
+- **Storage format**: Standard SQLite database and WAL files on disk.
+- **Reserved bytes**: `encz` uses SQLite's per-page reserved space. The current implementation reserves 32 bytes on each page.
+- **Encryption**: Page payloads are encrypted with **AES-256-GCM**.
+- **Per-page metadata**: The final 32 reserved bytes hold 4 bytes of flags, a 12-byte nonce, and a 16-byte authentication tag.
 
 ```
- SQLite Engine (SQL parsing, Query Planning, B-Trees)
-                      │
-                      ▼
+ SQLite Engine (SQL parsing, query planning, B-trees)
+                      |
+                      v
          Custom SQLite VFS Extension (encz)
-                      │
-        ┌─────────────┴─────────────┐
-        ▼                           ▼
-   Compression                  Decryption
-(none, zstd, deflate)         (AES-256-GCM)
-        │                           ▲
-        ▼                           │
-   Encryption                  Decompression
-  (AES-256-GCM)            (none, zstd, deflate)
-        │                           ▲
-        └─────────────┬─────────────┘
-                      │
-                      ▼
-                 RocksDB Engine
-         (Sorted String Tables (SST) on disk)
+                      |
+                      v
+             AES-256-GCM encryption
+                      |
+                      v
+           Flat SQLite database / WAL files
 ```
 
 ## Features
 
-- **Hybrid Engine**: SQL query capabilities of SQLite backed by the performant key-value LSM-tree architecture of RocksDB.
-- **Strong Encryption**: Secure AES-256-GCM protection on every single page block.
-- **Multiple Compression Algorithms**: Supports `zstd` (recommended), `deflate`, and `none` (uncompressed).
-- **Concurrent Writes**: Excellent concurrency capabilities. For multi-threaded writes, it is recommended to set `db.SetMaxOpenConns(1)` in Go's `database/sql` pool to serialize commits and prevent transaction locking overhead.
-- **Zero-Dependency Setup**: Bundles pre-compiled binary dependencies for Linux and Windows AMD64.
+- **SQLite-compatible driver**: Uses the `database/sql` API through a registered `go-sqlite3` driver.
+- **Per-page encryption**: AES-256-GCM protection on database pages.
+- **WAL-aware VFS**: Handles main database and WAL page I/O through the same VFS layer.
+- **Simple integration**: Open encrypted databases with `encz.OpenEncz` or use `OpenWithOptions` for more control.
 
 ## Requirements
 
 - CGO enabled.
-- For **Linux AMD64** and **Windows AMD64**, the native library dependencies (`librocksdb`, `libgflags`, `libzstd`, `libz`) are pre-compiled and bundled directly within the `lib/` directory of this repository. No external library installations are required.
-- For other platforms, the dependencies must be available to the Go toolchain (e.g. installed via system package manager).
+- OpenSSL development/runtime support.
+- On Linux AMD64 and Windows AMD64, this repository includes bundled native libraries under `lib/`.
+- On other platforms, the native dependencies must be available to the Go toolchain.
 
 ## Install
 
@@ -58,22 +50,20 @@ go get github.com/marcgauthier/encz
 package main
 
 import (
-	"database/sql"
 	"log"
 
 	"github.com/marcgauthier/encz"
 )
 
 func main() {
-	// Open an encrypted and compressed SQLite+RocksDB database
-	// Options: path, key, compression (e.g. "zstd", "deflate", "none")
-	db, err := encz.OpenEncz("users.db", "Password123Password123Password123", "zstd")
+	// Open an encrypted SQLite database using the encz VFS.
+	db, err := encz.OpenEncz("users.db", "Password123Password123Password123")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	// For write-heavy workloads with concurrent goroutines, serialize connections:
+	// For write-heavy workloads, serializing connections is often simpler.
 	db.SetMaxOpenConns(1)
 
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
@@ -83,4 +73,5 @@ func main() {
 ```
 
 - `encz.Open` opens a plain SQLite database through the same registered driver.
-- `encz.OpenWithOptions` can be used to pass custom options, such as `JournalMode: "WAL"` or `BusyTimeoutMillis`.
+- `encz.OpenEncz` opens a database with `vfs=encz` and a `crypto_key`.
+- `encz.OpenWithOptions` can be used to pass options such as `JournalMode: "WAL"` or `BusyTimeoutMillis`.

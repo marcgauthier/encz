@@ -8,13 +8,12 @@ import (
 )
 
 // TestLargeSingleTransactionCommit exercises the encz commit path used by
-// OVERWATCH populate: encrypted SQLite, no compression, DELETE journal mode,
+// OVERWATCH populate: encrypted SQLite, DELETE journal mode,
 // and one large transaction that dirties many pages before commit.
 func TestLargeSingleTransactionCommit(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "large-tx.db")
 	db, err := encz.OpenWithOptions(dbPath, encz.Options{
 		Key:         "LargeTxSecret123",
-		Compression: "none",
 		JournalMode: "DELETE",
 	})
 	if err != nil {

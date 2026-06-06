@@ -29,7 +29,7 @@ func runCrashHelper() {
 		return
 	}
 	key := "CrashPassword123"
-	db, err := encz.OpenEncz(dbPath, key, "zstd")
+	db, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		os.Exit(2)
 	}
@@ -112,7 +112,7 @@ func TestCrashRecovery(t *testing.T) {
 	key := "CrashPassword123"
 
 	// 1. Setup the database file with initial schema
-	setupDB, err := encz.OpenEncz(dbPath, key, "zstd")
+	setupDB, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to setup: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestCrashRecovery(t *testing.T) {
 	t.Logf("crash helper exited, error: %v", err)
 
 	// 3. Reopen and verify recovery
-	db, err := encz.OpenEncz(dbPath, key, "zstd")
+	db, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("reopen after crash failed: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestReadOnlyFileSystem(t *testing.T) {
 	key := "ReadOnlyKey"
 
 	// 1. Create and write initial table
-	db, err := encz.OpenEncz(dbPath, key, "none")
+	db, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to open: %v", err)
 	}
@@ -208,8 +208,7 @@ func TestReadOnlyFileSystem(t *testing.T) {
 
 	// 3. Attempt to open in read-only mode using URI parameters
 	opts := encz.Options{
-		Key:         key,
-		Compression: "none",
+		Key: key,
 		URIParameters: map[string]string{
 			"mode": "ro",
 		},
@@ -243,7 +242,7 @@ func TestCorruptionTampering(t *testing.T) {
 	key := "CorruptKey"
 
 	// 1. Create and write initial data
-	db, err := encz.OpenEncz(dbPath, key, "zstd")
+	db, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to open: %v", err)
 	}
@@ -283,7 +282,7 @@ func TestCorruptionTampering(t *testing.T) {
 
 	// 3. Attempt to open and read from the tampered database.
 	// Either the header load (OpenEncz/Ping) must fail, or the subsequent query must fail.
-	dbReopened, err := encz.OpenEncz(dbPath, key, "zstd")
+	dbReopened, err := encz.OpenEncz(dbPath, key)
 	if err == nil {
 		defer dbReopened.Close()
 		// Try to query data
@@ -301,7 +300,7 @@ func runExitZeroHelper() {
 		return
 	}
 	key := "ExitZeroPassword123"
-	db, err := encz.OpenEncz(dbPath, key, "zstd")
+	db, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		os.Exit(2)
 	}
@@ -346,7 +345,7 @@ func TestAbruptExitGrace(t *testing.T) {
 	}
 
 	// 2. Reopen the database and verify integrity
-	db, err := encz.OpenEncz(dbPath, key, "zstd")
+	db, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to reopen DB after exit(0): %v", err)
 	}

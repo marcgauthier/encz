@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-var compatCompressions = []string{"none", "zstd", "deflate"}
+var compatJournalModes = []string{"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
 
 func TestCompatOpenTxlock(t *testing.T) {
 	cases := []struct {
@@ -23,13 +23,14 @@ func TestCompatOpenTxlock(t *testing.T) {
 		{name: "exclusive", tx: "exclusive", want: true},
 		{name: "bogus", tx: "bogus", want: false},
 	}
-	for _, compression := range compatCompressions {
-		compression := compression
-		t.Run(compression, func(t *testing.T) {
+	for _, journalMode := range compatJournalModes {
+		journalMode := journalMode
+		t.Run("JournalMode_"+journalMode, func(t *testing.T) {
 			for _, tc := range cases {
+				tc := tc
 				t.Run(tc.name, func(t *testing.T) {
 					dbPath := filepath.Join(t.TempDir(), "open.db")
-					opts := compatOptions(compression)
+					opts := compatOptions(journalMode)
 					if tc.tx != "" {
 						opts.URIParameters["_txlock"] = tc.tx
 					}
@@ -56,13 +57,12 @@ func TestCompatOpenTxlock(t *testing.T) {
 }
 
 func TestCompatOpenNoCreate(t *testing.T) {
-	for _, compression := range compatCompressions {
-		compression := compression
-		t.Run(compression, func(t *testing.T) {
+	for _, journalMode := range compatJournalModes {
+		journalMode := journalMode
+		t.Run("JournalMode_"+journalMode, func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "missing.db")
 			_, err := OpenWithOptions(dbPath, Options{
-				Key:         "Password123",
-				Compression: compression,
+				Key: "Password123",
 				URIParameters: map[string]string{
 					"mode": "rw",
 				},
@@ -75,11 +75,11 @@ func TestCompatOpenNoCreate(t *testing.T) {
 			}
 
 			db, err := OpenWithOptions(dbPath, Options{
-				Key:         "Password123",
-				Compression: compression,
+				Key: "Password123",
 				URIParameters: map[string]string{
 					"mode": "rwc",
 				},
+				JournalMode: journalMode,
 			})
 			if err != nil {
 				t.Fatalf("mode=rwc open: %v", err)
@@ -93,11 +93,11 @@ func TestCompatOpenNoCreate(t *testing.T) {
 }
 
 func TestCompatReadonly(t *testing.T) {
-	for _, compression := range compatCompressions {
-		compression := compression
-		t.Run(compression, func(t *testing.T) {
+	for _, journalMode := range compatJournalModes {
+		journalMode := journalMode
+		t.Run("JournalMode_"+journalMode, func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "readonly.db")
-			writer, err := OpenWithOptions(dbPath, compatOptions(compression))
+			writer, err := OpenWithOptions(dbPath, compatOptions(journalMode))
 			if err != nil {
 				t.Fatalf("writer open: %v", err)
 			}
@@ -109,20 +109,22 @@ func TestCompatReadonly(t *testing.T) {
 				_ = writer.Close()
 				t.Fatalf("seed row: %v", err)
 			}
-			if _, err := writer.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-				_ = writer.Close()
-				t.Fatalf("checkpoint: %v", err)
+			if journalMode == "WAL" {
+				if _, err := writer.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+					_ = writer.Close()
+					t.Fatalf("checkpoint: %v", err)
+				}
 			}
 			if err := writer.Close(); err != nil {
 				t.Fatalf("close writer: %v", err)
 			}
 
 			reader, err := OpenWithOptions(dbPath, Options{
-				Key:         "Password123",
-				Compression: compression,
+				Key: "Password123",
 				URIParameters: map[string]string{
 					"mode": "ro",
 				},
+				JournalMode: journalMode,
 			})
 			if err != nil {
 				t.Fatalf("reader open: %v", err)
@@ -136,13 +138,13 @@ func TestCompatReadonly(t *testing.T) {
 }
 
 func TestCompatForeignKeysAndDeferred(t *testing.T) {
-	for _, compression := range compatCompressions {
-		compression := compression
-		t.Run(compression, func(t *testing.T) {
+	for _, journalMode := range compatJournalModes {
+		journalMode := journalMode
+		t.Run("JournalMode_"+journalMode, func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "fk.db")
 			db, err := OpenWithOptions(dbPath, Options{
 				Key:         "Password123",
-				Compression: compression,
+				JournalMode: journalMode,
 				URIParameters: map[string]string{
 					"_foreign_keys": "1",
 				},
@@ -185,10 +187,10 @@ func TestCompatForeignKeysAndDeferred(t *testing.T) {
 }
 
 func TestCompatCRUDAndTypes(t *testing.T) {
-	for _, compression := range compatCompressions {
-		compression := compression
-		t.Run(compression, func(t *testing.T) {
-			db := compatOpenDB(t, compression, "crud.db")
+	for _, journalMode := range compatJournalModes {
+		journalMode := journalMode
+		t.Run("JournalMode_"+journalMode, func(t *testing.T) {
+			db := compatOpenDB(t, journalMode, "crud.db")
 			defer db.Close()
 
 			if _, err := db.Exec(`CREATE TABLE foo (id INTEGER PRIMARY KEY, name TEXT, active BOOL, payload BLOB, created_at TIMESTAMP)`); err != nil {
@@ -242,10 +244,10 @@ func TestCompatCRUDAndTypes(t *testing.T) {
 }
 
 func TestCompatUpsertNamedParamsAndNull(t *testing.T) {
-	for _, compression := range compatCompressions {
-		compression := compression
-		t.Run(compression, func(t *testing.T) {
-			db := compatOpenDB(t, compression, "named.db")
+	for _, journalMode := range compatJournalModes {
+		journalMode := journalMode
+		t.Run("JournalMode_"+journalMode, func(t *testing.T) {
+			db := compatOpenDB(t, journalMode, "named.db")
 			defer db.Close()
 
 			if _, err := db.Exec(`CREATE TABLE foo (name TEXT PRIMARY KEY, counter INTEGER, note TEXT NULL)`); err != nil {
@@ -277,10 +279,10 @@ func TestCompatUpsertNamedParamsAndNull(t *testing.T) {
 }
 
 func TestCompatTransactionRollback(t *testing.T) {
-	for _, compression := range compatCompressions {
-		compression := compression
-		t.Run(compression, func(t *testing.T) {
-			db := compatOpenDB(t, compression, "tx.db")
+	for _, journalMode := range compatJournalModes {
+		journalMode := journalMode
+		t.Run("JournalMode_"+journalMode, func(t *testing.T) {
+			db := compatOpenDB(t, journalMode, "tx.db")
 			defer db.Close()
 			if _, err := db.Exec(`CREATE TABLE foo (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
 				t.Fatalf("create table: %v", err)
@@ -310,15 +312,15 @@ func TestCompatTransactionRollback(t *testing.T) {
 }
 
 func TestCompatCorruptDbError(t *testing.T) {
-	for _, compression := range compatCompressions {
-		compression := compression
-		t.Run(compression, func(t *testing.T) {
+	for _, journalMode := range compatJournalModes {
+		journalMode := journalMode
+		t.Run("JournalMode_"+journalMode, func(t *testing.T) {
 			dir := t.TempDir()
 			dbPath := filepath.Join(dir, "corrupt.db")
 			if err := os.WriteFile(dbPath, []byte{1, 2, 3, 4, 5}, 0o644); err != nil {
 				t.Fatalf("write corrupt db: %v", err)
 			}
-			_, err := OpenWithOptions(dbPath, compatOptions(compression))
+			_, err := OpenWithOptions(dbPath, compatOptions(journalMode))
 			if err == nil {
 				t.Fatal("expected corrupt db open to fail")
 			}
@@ -330,21 +332,20 @@ func TestCompatCorruptDbError(t *testing.T) {
 	}
 }
 
-func compatOpenDB(t *testing.T, compression, name string) *sql.DB {
+func compatOpenDB(t *testing.T, journalMode, name string) *sql.DB {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), name)
-	db, err := OpenWithOptions(dbPath, compatOptions(compression))
+	db, err := OpenWithOptions(dbPath, compatOptions(journalMode))
 	if err != nil {
-		t.Fatalf("open db (%s): %v", compression, err)
+		t.Fatalf("open db: %v", err)
 	}
 	return db
 }
 
-func compatOptions(compression string) Options {
+func compatOptions(journalMode string) Options {
 	return Options{
 		Key:         "Password123",
-		Compression: compression,
-		JournalMode: "WAL",
+		JournalMode: journalMode,
 		URIParameters: map[string]string{
 			"_busy_timeout": "5000",
 		},

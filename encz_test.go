@@ -33,8 +33,8 @@ func TestOpenPlainSQLite(t *testing.T) {
 }
 
 func TestBuildEnczDSN(t *testing.T) {
-	dsn := BuildEnczDSN("users.db", "secret", "zstd")
-	expected := "file:users.db?crypto_compression=zstd&crypto_key=secret&vfs=encz"
+	dsn := BuildEnczDSN("users.db", "secret")
+	expected := "file:users.db?crypto_key=secret&vfs=encz"
 	if dsn != expected {
 		t.Fatalf("unexpected dsn %q", dsn)
 	}
@@ -43,7 +43,7 @@ func TestBuildEnczDSN(t *testing.T) {
 func TestOpenEnczSQLite(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "encz.db")
 
-	db, err := OpenEncz(dbPath, "Password123", "none")
+	db, err := OpenEncz(dbPath, "Password123")
 	if err != nil {
 		t.Fatalf("OpenEncz: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestOpenEnczSQLite(t *testing.T) {
 		t.Fatalf("close after write: %v", err)
 	}
 
-	reopened, err := OpenEncz(dbPath, "Password123", "none")
+	reopened, err := OpenEncz(dbPath, "Password123")
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -87,7 +87,6 @@ func TestEnczWALCheckpointReopenIntegrity(t *testing.T) {
 
 	db, err := OpenWithOptions(dbPath, Options{
 		Key:         "Password123",
-		Compression: "none",
 		JournalMode: "WAL",
 	})
 	if err != nil {
@@ -116,7 +115,6 @@ func TestEnczWALCheckpointReopenIntegrity(t *testing.T) {
 
 	reopened, err := OpenWithOptions(dbPath, Options{
 		Key:         "Password123",
-		Compression: "none",
 		JournalMode: "WAL",
 	})
 	if err != nil {

@@ -23,7 +23,7 @@ func TestJournalModes(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "journal.db")
 
 			// Open database
-			db, err := encz.OpenEncz(dbPath, key, "zstd")
+			db, err := encz.OpenEncz(dbPath, key)
 			if err != nil {
 				t.Fatalf("failed to open: %v", err)
 			}
@@ -92,7 +92,6 @@ func TestWALCheckpointing(t *testing.T) {
 	// Open with WAL mode
 	opts := encz.Options{
 		Key:         key,
-		Compression: "zstd",
 		JournalMode: "WAL",
 	}
 	db, err := encz.OpenWithOptions(dbPath, opts)
@@ -155,7 +154,7 @@ func TestLockingModes(t *testing.T) {
 	key := "LockSecret"
 
 	// Setup db and table
-	setupDB, err := encz.OpenEncz(dbPath, key, "none")
+	setupDB, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("setup open: %v", err)
 	}
@@ -167,7 +166,7 @@ func TestLockingModes(t *testing.T) {
 	setupDB.Close()
 
 	// Connection 1: Open with normal options
-	db1, err := encz.OpenEncz(dbPath, key, "none")
+	db1, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("db1 open: %v", err)
 	}
@@ -176,7 +175,6 @@ func TestLockingModes(t *testing.T) {
 	// Connection 2: Open with short busy timeout (50ms)
 	db2, err := encz.OpenWithOptions(dbPath, encz.Options{
 		Key:               key,
-		Compression:       "none",
 		BusyTimeoutMillis: intPtr(50),
 	})
 	if err != nil {
@@ -223,7 +221,7 @@ func TestBusyTimeout(t *testing.T) {
 	key := "BusySecret"
 
 	// Setup table
-	setupDB, err := encz.OpenEncz(dbPath, key, "none")
+	setupDB, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("setup open: %v", err)
 	}
@@ -235,7 +233,7 @@ func TestBusyTimeout(t *testing.T) {
 	setupDB.Close()
 
 	// Conn 1: holds lock
-	db1, err := encz.OpenEncz(dbPath, key, "none")
+	db1, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("db1 open: %v", err)
 	}
@@ -244,7 +242,6 @@ func TestBusyTimeout(t *testing.T) {
 	// Conn 2: waits up to 600ms
 	db2, err := encz.OpenWithOptions(dbPath, encz.Options{
 		Key:               key,
-		Compression:       "none",
 		BusyTimeoutMillis: intPtr(600),
 	})
 	if err != nil {
@@ -293,7 +290,6 @@ func TestReaderThreadContention(t *testing.T) {
 	// Open with WAL mode for concurrent reads/writes
 	opts := encz.Options{
 		Key:         key,
-		Compression: "zstd",
 		JournalMode: "WAL",
 	}
 	db, err := encz.OpenWithOptions(dbPath, opts)

@@ -10,4 +10,3 @@ long __isoc23_strtol(const char *nptr, char **endptr, int base) {
 }
 */
 import "C"
-

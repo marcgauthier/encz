@@ -16,15 +16,11 @@ func OpenWithOptions(path string, opts Options) (*sql.DB, error) {
 	return openDSN(BuildDSN(path, opts))
 }
 
-func OpenEncz(path, key, compression string) (*sql.DB, error) {
+func OpenEncz(path, key string) (*sql.DB, error) {
 	if err := mustRegister(); err != nil {
 		return nil, err
 	}
-	opts := Options{
-		Key:         key,
-		Compression: normalizeCompression(compression),
-	}
-	return openDSN(BuildDSN(path, opts))
+	return openDSN(BuildDSN(path, Options{Key: key}))
 }
 
 func openDSN(dsn string) (*sql.DB, error) {

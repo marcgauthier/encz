@@ -443,7 +443,7 @@ func TestFullTextSearchFTS5(t *testing.T) {
 		// Insert documents
 		_, err = db.Exec(`INSERT INTO documents (title, body) VALUES
 			("Introduction to Go Programming", "Go is a statically typed programming language developed at Google. It is highly efficient."),
-			("SQLite VFS transparent encryption", "The encz library registers a custom Virtual File System (VFS) to provide transparent database encryption and compression.")
+			("SQLite VFS transparent encryption", "The encz library registers a custom Virtual File System (VFS) to provide transparent database encryption.")
 		`)
 		if err != nil {
 			t.Fatalf("insert fts5: %v", err)

@@ -4,6 +4,6 @@ package encz
 
 /*
 #cgo CFLAGS: -I${SRCDIR} -DSQLITE_CORE=1 -DSQLITE_CRYPTOVFS_STATIC=1
-#cgo LDFLAGS: -L${SRCDIR}/lib/windows_amd64 -lcrypto -lzstd -lz
+#cgo LDFLAGS: -L${SRCDIR}/lib/windows_amd64 -lcrypto
 */
 import "C"

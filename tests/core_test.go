@@ -11,15 +11,18 @@ import (
 	"github.com/marcgauthier/encz"
 )
 
+var journalModes = []string{"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+
 // openTestDB opens a test database with specific VFS configuration.
-func openTestDB(t *testing.T, encrypted bool, compression string, foreignKeys bool) (*sql.DB, string) {
+func openTestDB(t *testing.T, encrypted bool, foreignKeys bool, journalMode string) (*sql.DB, string) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	opts := encz.Options{
-		Compression: compression,
-	}
+	opts := encz.Options{}
 	if encrypted {
 		opts.Key = "TestSecretKey123"
+	}
+	if journalMode != "" {
+		opts.JournalMode = journalMode
 	}
 	if foreignKeys {
 		opts.URIParameters = map[string]string{
@@ -28,7 +31,7 @@ func openTestDB(t *testing.T, encrypted bool, compression string, foreignKeys bo
 	}
 	db, err := encz.OpenWithOptions(dbPath, opts)
 	if err != nil {
-		t.Fatalf("failed to open database (encrypted=%v, compression=%s): %v", encrypted, compression, err)
+		t.Fatalf("failed to open database (encrypted=%v): %v", encrypted, err)
 	}
 	t.Cleanup(func() {
 		db.Close()
@@ -38,25 +41,25 @@ func openTestDB(t *testing.T, encrypted bool, compression string, foreignKeys bo
 
 // runWithConfigs runs the test case function with multiple VFS configurations:
 // - Plain SQLite (unencrypted)
-// - Encrypted with compression "none"
-// - Encrypted with compression "zstd"
-// - Encrypted with compression "deflate"
+// - Encrypted
 func runWithConfigs(t *testing.T, foreignKeys bool, testFn func(t *testing.T, db *sql.DB)) {
 	configs := []struct {
-		name        string
-		encrypted   bool
-		compression string
+		name      string
+		encrypted bool
 	}{
-		{name: "Plain", encrypted: false, compression: ""},
-		{name: "Encrypted_None", encrypted: true, compression: "none"},
-		{name: "Encrypted_Zstd", encrypted: true, compression: "zstd"},
-		{name: "Encrypted_Deflate", encrypted: true, compression: "deflate"},
+		{name: "Plain", encrypted: false},
+		{name: "Encrypted", encrypted: true},
 	}
 
 	for _, cfg := range configs {
 		t.Run(cfg.name, func(t *testing.T) {
-			db, _ := openTestDB(t, cfg.encrypted, cfg.compression, foreignKeys)
-			testFn(t, db)
+			for _, journalMode := range journalModes {
+				journalMode := journalMode
+				t.Run("JournalMode_"+journalMode, func(t *testing.T) {
+					db, _ := openTestDB(t, cfg.encrypted, foreignKeys, journalMode)
+					testFn(t, db)
+				})
+			}
 		})
 	}
 }

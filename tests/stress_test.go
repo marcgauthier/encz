@@ -31,39 +31,38 @@ func TestMassiveBlobPayloads(t *testing.T) {
 			sizeStr = fmt.Sprintf("%dMB", size/(1024*1024))
 		}
 		t.Run("Size_"+sizeStr, func(t *testing.T) {
-			runWithConfigs(t, false, func(t *testing.T, db *sql.DB) {
-				_, err := db.Exec(`CREATE TABLE blobs (payload BLOB)`)
-				if err != nil {
-					t.Fatalf("create table: %v", err)
-				}
+			db, _ := openTestDB(t, false, false, "DELETE")
+			_, err := db.Exec(`CREATE TABLE blobs (payload BLOB)`)
+			if err != nil {
+				t.Fatalf("create table: %v", err)
+			}
 
-				payload := make([]byte, size)
-				_, err = rand.Read(payload)
-				if err != nil {
-					t.Fatalf("failed to generate random bytes: %v", err)
-				}
+			payload := make([]byte, size)
+			_, err = rand.Read(payload)
+			if err != nil {
+				t.Fatalf("failed to generate random bytes: %v", err)
+			}
 
-				_, err = db.Exec(`INSERT INTO blobs (payload) VALUES (?)`, payload)
-				if err != nil {
-					t.Fatalf("insert failed: %v", err)
-				}
+			_, err = db.Exec(`INSERT INTO blobs (payload) VALUES (?)`, payload)
+			if err != nil {
+				t.Fatalf("insert failed: %v", err)
+			}
 
-				var gotPayload []byte
-				err = db.QueryRow(`SELECT payload FROM blobs`).Scan(&gotPayload)
-				if err != nil {
-					t.Fatalf("query failed: %v", err)
-				}
+			var gotPayload []byte
+			err = db.QueryRow(`SELECT payload FROM blobs`).Scan(&gotPayload)
+			if err != nil {
+				t.Fatalf("query failed: %v", err)
+			}
 
-				if !bytesEqual(gotPayload, payload) {
-					t.Error("payload data corruption: bytes mismatch")
-				}
+			if !bytesEqual(gotPayload, payload) {
+				t.Error("payload data corruption: bytes mismatch")
+			}
 
-				var integrity string
-				err = db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
-				if err != nil || integrity != "ok" {
-					t.Errorf("integrity check failed: %s, err=%v", integrity, err)
-				}
-			})
+			var integrity string
+			err = db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
+			if err != nil || integrity != "ok" {
+				t.Errorf("integrity check failed: %s, err=%v", integrity, err)
+			}
 		})
 	}
 }
@@ -149,7 +148,6 @@ func TestConcurrencyStressPool(t *testing.T) {
 
 	opts := encz.Options{
 		Key:         key,
-		Compression: "zstd",
 		JournalMode: "WAL",
 	}
 
@@ -236,7 +234,7 @@ func TestMemoryLeakLongevity(t *testing.T) {
 
 	// Run loop opening, writing, reading, and closing databases
 	for i := 0; i < iterations; i++ {
-		db, err := encz.OpenEncz(dbPath, key, "zstd")
+		db, err := encz.OpenEncz(dbPath, key)
 		if err != nil {
 			t.Fatalf("failed to open on iteration %d: %v", i, err)
 		}

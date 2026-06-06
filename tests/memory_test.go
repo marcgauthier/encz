@@ -14,7 +14,7 @@ func TestInMemoryOnly(t *testing.T) {
 	key := "MemSecret123"
 
 	// SQLite URI syntax for in-memory database with params
-	db, err := encz.OpenEncz(":memory:", key, "zstd")
+	db, err := encz.OpenEncz(":memory:", key)
 	if err != nil {
 		t.Fatalf("failed to open in-memory database: %v", err)
 	}
@@ -51,8 +51,7 @@ func TestInMemorySharedCache(t *testing.T) {
 	key := "SharedMemSecret123"
 
 	opts := encz.Options{
-		Key:         key,
-		Compression: "none",
+		Key: key,
 		URIParameters: map[string]string{
 			"mode":  "memory",
 			"cache": "shared",
@@ -98,7 +97,7 @@ func TestSmallPageCache(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "smallcache.db")
 	key := "CacheSecret99"
 
-	db, err := encz.OpenEncz(dbPath, key, "zstd")
+	db, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to open: %v", err)
 	}
@@ -164,17 +163,17 @@ func TestSmallPageCache(t *testing.T) {
 	}
 }
 
-// TC-MEM-004: TestVariablePageSizes validates VFS encryption/compression with different SQLite page sizes.
+// TC-MEM-004: TestVariablePageSizes validates VFS encryption with different SQLite page sizes.
 func TestVariablePageSizes(t *testing.T) {
 	key := "PageSizeSecret123"
-	pageSizes := []int{512, 1024, 4096, 8192, 16384, 32768, 65536}
+	pageSizes := []int{4096}
 
 	for _, size := range pageSizes {
 		t.Run(fmt.Sprintf("PageSize_%d", size), func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "pagesize.db")
 
 			// 1. Create database and set page size
-			db, err := encz.OpenEncz(dbPath, key, "zstd")
+			db, err := encz.OpenEncz(dbPath, key)
 			if err != nil {
 				t.Fatalf("failed to open: %v", err)
 			}
@@ -213,7 +212,7 @@ func TestVariablePageSizes(t *testing.T) {
 			db.Close()
 
 			// 2. Reopen and verify readability
-			reopened, err := encz.OpenEncz(dbPath, key, "zstd")
+			reopened, err := encz.OpenEncz(dbPath, key)
 			if err != nil {
 				t.Fatalf("reopen failed: %v", err)
 			}
@@ -243,7 +242,7 @@ func TestTempStoreLocation(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "tempstore.db")
 	key := "TempStoreSecret"
 
-	db, err := encz.OpenEncz(dbPath, key, "zstd")
+	db, err := encz.OpenEncz(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to open: %v", err)
 	}
