@@ -19,6 +19,7 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -317,11 +318,25 @@ static int enczEnsureReady(EnczFile *p, int pageSizeHint){
   return SQLITE_OK;
 }
 
+extern void enczGoLog(const char *zMsg);
+
+static void enczLog(const char *zFormat, ...){
+  va_list ap;
+  char *zMsg;
+  va_start(ap, zFormat);
+  zMsg = sqlite3_vmprintf(zFormat, ap);
+  va_end(ap);
+  if( zMsg ){
+    enczGoLog(zMsg);
+    sqlite3_free(zMsg);
+  }
+}
+
 static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) {
   int P = p->isWal ? p->walPageSize : p->logicalPageSize;
   int rc = SQLITE_OK;
   
-  fprintf(stderr, "[encz] READ pgno=%u, iOfst=%lld, P=%d\n", pgno, (long long)iOfst, P);
+  // fprintf(stderr, "[encz] READ pgno=%u, iOfst=%lld, P=%d\n", pgno, (long long)iOfst, P);
   
   u8 *aBuf = sqlite3_malloc64(P);
   if( aBuf==0 ) return SQLITE_NOMEM;
@@ -347,7 +362,7 @@ static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) 
       sqlite3_free(aBuf);
       return SQLITE_OK;
     }
-    fprintf(stderr, "[encz] READ xRead failed, rc=%d\n", rc);
+    enczLog("[encz] READ xRead failed, rc=%d\n", rc);
     sqlite3_free(aBuf);
     return rc;
   }
@@ -356,7 +371,7 @@ static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) 
   int nPlain = P - H - 32;
   
   if( !p->hasKey ){
-    fprintf(stderr, "[encz] READ no key, returning stub for pgno=%u\n", pgno);
+    enczLog("[encz] READ no key, returning stub for pgno=%u\n", pgno);
     if( pgno == 1 ){
       memset(aPlain, 0, P);
       memcpy(aPlain, "SQLite format 3", 16);
@@ -388,10 +403,10 @@ static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) 
   
   u32 nCipher = flags & 0x00ffffff;
   
-  fprintf(stderr, "[encz] READ parsing flags=%08x, nCipher=%u\n", flags, nCipher);
+  // fprintf(stderr, "[encz] READ parsing flags=%08x, nCipher=%u\n", flags, nCipher);
   
   if( nCipher > (u32)nPlain ){
-    fprintf(stderr, "[encz] READ nCipher (%u) > nPlain (%d), corrupt!\n", nCipher, nPlain);
+    enczLog("[encz] READ nCipher (%u) > nPlain (%d), corrupt!\n", nCipher, nPlain);
     sqlite3_free(aBuf);
     return SQLITE_CORRUPT;
   }
@@ -416,11 +431,11 @@ static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) 
    || EVP_DecryptUpdate(pCtx, aTmp, &nOut, aBuf + H, nCipher)!=1
    || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_SET_TAG, 16, aTag)!=1
   ){
-    fprintf(stderr, "[encz] READ EVP init/update/ctrl failed\n");
+    enczLog("[encz] READ EVP init/update/ctrl failed\n");
     rc = SQLITE_ERROR;
   } else {
     if( EVP_DecryptFinal_ex(pCtx, aTmp + nOut, &nDec)!=1 ){
-      fprintf(stderr, "[encz] READ DecryptFinal (MAC check failed) for pgno=%u\n", pgno);
+      enczLog("[encz] READ DecryptFinal (MAC check failed) for pgno=%u\n", pgno);
       rc = SQLITE_CORRUPT;
     } else {
       nDec += nOut;
@@ -487,7 +502,7 @@ static int enczEncryptAndWritePageAtOffset(EnczFile *p, const u8 *aPlain, u32 pg
    || EVP_EncryptFinal_ex(pCtx, aCipher + nOut, &nCipher)!=1
    || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_GET_TAG, 16, aTag)!=1
   ){
-    fprintf(stderr, "[encz] WRITE EVP init/update/ctrl/tag failed for pgno=%u\n", pgno);
+    enczLog("[encz] WRITE EVP init/update/ctrl/tag failed for pgno=%u\n", pgno);
     rc = SQLITE_ERROR;
   } else {
     nCipher += nOut;
@@ -497,10 +512,10 @@ static int enczEncryptAndWritePageAtOffset(EnczFile *p, const u8 *aPlain, u32 pg
     memcpy(aBuf + P - 28, aNonce, 12);
     memcpy(aBuf + P - 16, aTag, 16);
     
-    fprintf(stderr, "[encz] WRITE pgno=%u, iOfst=%lld, nCipher=%d, flags=%08x\n", pgno, (long long)iOfst, nCipher, flags);
+    // fprintf(stderr, "[encz] WRITE pgno=%u, iOfst=%lld, nCipher=%d, flags=%08x\n", pgno, (long long)iOfst, nCipher, flags);
     rc = p->pSubFile->pMethods->xWrite(p->pSubFile, aBuf, P, iOfst);
     if( rc!=SQLITE_OK ){
-      fprintf(stderr, "[encz] WRITE xWrite failed, rc=%d\n", rc);
+      enczLog("[encz] WRITE xWrite failed, rc=%d\n", rc);
     }
   }
   

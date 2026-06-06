@@ -54,7 +54,7 @@ func openTestDB(t *testing.T, encrypted bool, foreignKeys bool, journalMode stri
 	t.Cleanup(func() {
 		db.Close()
 	})
-	return db, dbPath
+	return db.SQLDB(), dbPath
 }
 
 // runWithConfigs runs the test case function with multiple VFS configurations:

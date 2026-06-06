@@ -332,7 +332,7 @@ func TestCompatCorruptDbError(t *testing.T) {
 	}
 }
 
-func compatOpenDB(t *testing.T, journalMode, name string) *sql.DB {
+func compatOpenDB(t *testing.T, journalMode, name string) *DB {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), name)
 	db, err := OpenWithOptions(dbPath, compatOptions(journalMode))

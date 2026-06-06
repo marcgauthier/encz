@@ -2,7 +2,7 @@ package tests
 
 import (
 	"database/sql"
-	"os"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,113 +10,100 @@ import (
 	"github.com/marcgauthier/encz"
 )
 
-func TestCryptoKeyHex(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "hexkey.db")
-	hexKey := "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
-
-	opts := encz.Options{
-		URIParameters: map[string]string{
-			"vfs":            "encz",
-			"crypto_key_hex": hexKey,
-		},
-	}
-	db, err := encz.OpenWithOptions(dbPath, opts)
+func TestReKey(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rekey.db")
+	db, err := encz.OpenEncz(dbPath, "OldSecret")
 	if err != nil {
-		t.Fatalf("failed to open database with hex key: %v", err)
+		t.Fatalf("open: %v", err)
 	}
-
-	if _, err := db.Exec(`CREATE TABLE hex_test (val TEXT)`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE rekey_test (val TEXT)`); err != nil {
 		db.Close()
 		t.Fatalf("create table: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO hex_test VALUES ("hex-success")`); err != nil {
+	if _, err := db.Exec(`INSERT INTO rekey_test VALUES ("rekey-success")`); err != nil {
 		db.Close()
 		t.Fatalf("insert: %v", err)
 	}
-	db.Close()
-
-	dbReopen, err := encz.OpenWithOptions(dbPath, opts)
-	if err != nil {
-		t.Fatalf("failed to reopen: %v", err)
+	if err := db.ReKey("OldSecret", "NewSecret"); err != nil {
+		db.Close()
+		t.Fatalf("ReKey: %v", err)
 	}
-	defer dbReopen.Close()
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if _, err := encz.OpenEncz(dbPath, "OldSecret"); err == nil {
+		t.Fatal("expected old key to fail after rekey")
+	}
+	reopened, err := encz.OpenEncz(dbPath, "NewSecret")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
 
 	var val string
-	if err := dbReopen.QueryRow(`SELECT val FROM hex_test`).Scan(&val); err != nil {
+	if err := reopened.QueryRow(`SELECT val FROM rekey_test`).Scan(&val); err != nil {
 		t.Fatalf("read failed: %v", err)
 	}
-	if val != "hex-success" {
-		t.Errorf("expected 'hex-success', got %q", val)
-	}
-
-	wrongHexKey := "9999999999999999999999999999999999999999999999999999999999999999"
-	wrongOpts := encz.Options{
-		URIParameters: map[string]string{
-			"vfs":            "encz",
-			"crypto_key_hex": wrongHexKey,
-		},
-	}
-	dbWrong, err := encz.OpenWithOptions(dbPath, wrongOpts)
-	if err == nil {
-		defer dbWrong.Close()
-		err = dbWrong.QueryRow(`SELECT val FROM hex_test`).Scan(&val)
-		if err == nil {
-			t.Error("expected decryption failure with wrong hex key, but it succeeded")
-		}
+	if val != "rekey-success" {
+		t.Fatalf("unexpected value %q", val)
 	}
 }
 
-func TestCryptoKeyEnv(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "envkey.db")
-	envVarName := "TEST_DATABASE_CRYPTO_PASSPHRASE"
-	passphrase := "SecurePassphraseViaEnv123!!!"
-
-	os.Setenv(envVarName, passphrase)
-	defer os.Unsetenv(envVarName)
-
-	opts := encz.Options{
-		URIParameters: map[string]string{
-			"vfs":            "encz",
-			"crypto_key_env": envVarName,
-		},
-	}
-	db, err := encz.OpenWithOptions(dbPath, opts)
+func TestSetRotationPolicy(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "policy.db")
+	db, err := encz.OpenEncz(dbPath, "MyRotationSecret")
 	if err != nil {
-		t.Fatalf("failed to open database with env key: %v", err)
+		t.Fatalf("open: %v", err)
 	}
-
-	if _, err := db.Exec(`CREATE TABLE env_test (val TEXT)`); err != nil {
+	policy := encz.RotationPolicy{KEKRotationDays: 30, AutoRewrap: false, KeepPreviousKey: false}
+	if err := db.SetRotationPolicy(policy); err != nil {
 		db.Close()
-		t.Fatalf("create table: %v", err)
+		t.Fatalf("SetRotationPolicy: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO env_test VALUES ("env-success")`); err != nil {
-		db.Close()
-		t.Fatalf("insert: %v", err)
-	}
-	db.Close()
-
-	dbReopen, err := encz.OpenWithOptions(dbPath, opts)
+	status, err := db.RotationStatus()
 	if err != nil {
-		t.Fatalf("reopen failed: %v", err)
+		db.Close()
+		t.Fatalf("RotationStatus: %v", err)
 	}
-	defer dbReopen.Close()
+	if status.KEKRotationDays != 30 {
+		db.Close()
+		t.Fatalf("expected KEKRotationDays=30, got %d", status.KEKRotationDays)
+	}
+	if status.AutoRewrap {
+		db.Close()
+		t.Fatal("expected AutoRewrap=false")
+	}
+	if status.KeepPreviousKey {
+		db.Close()
+		t.Fatal("expected KeepPreviousKey=false")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
 
-	var val string
-	if err := dbReopen.QueryRow(`SELECT val FROM env_test`).Scan(&val); err != nil {
-		t.Fatalf("read failed: %v", err)
+	reopened, err := encz.OpenEncz(dbPath, "MyRotationSecret")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
 	}
-	if val != "env-success" {
-		t.Errorf("expected 'env-success', got %q", val)
+	defer reopened.Close()
+	status, err = reopened.RotationStatus()
+	if err != nil {
+		t.Fatalf("RotationStatus after reopen: %v", err)
 	}
+	if status.KEKRotationDays != 30 || status.AutoRewrap || status.KeepPreviousKey {
+		t.Fatalf("unexpected reopened status: %+v", status)
+	}
+}
 
-	os.Setenv(envVarName, "IncorrectPassphrase!!!")
-	dbWrong, err := encz.OpenWithOptions(dbPath, opts)
-	if err == nil {
-		defer dbWrong.Close()
-		err = dbWrong.QueryRow(`SELECT val FROM env_test`).Scan(&val)
-		if err == nil {
-			t.Error("expected decryption failure when environment variable passphrase was changed, but it succeeded")
-		}
+func TestSetRotationPolicyRejectsInvalidDays(t *testing.T) {
+	db, err := encz.OpenEncz(filepath.Join(t.TempDir(), "invalid-policy.db"), "InvalidPolicySecret")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if err := db.SetRotationPolicy(encz.RotationPolicy{KEKRotationDays: 0}); !errors.Is(err, encz.ErrRotationPolicyInvalid) {
+		t.Fatalf("expected ErrRotationPolicyInvalid, got %v", err)
 	}
 }
 

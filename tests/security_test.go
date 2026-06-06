@@ -90,8 +90,8 @@ func TestUnencryptedToEncrypted(t *testing.T) {
 	}
 
 	// 4. Opening encrypted database without a key must fail at the package boundary.
-	if _, err := encz.Open(encPath); err == nil {
-		t.Error("expected Open to reject encrypted database without a key")
+	if _, err := encz.OpenWithOptions(encPath, encz.Options{}); err == nil {
+		t.Error("expected OpenWithOptions to reject encrypted database without a key")
 	}
 }
 
