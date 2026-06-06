@@ -3,24 +3,22 @@ package encz
 import "database/sql"
 
 func Open(path string) (*sql.DB, error) {
-	if err := mustRegister(); err != nil {
-		return nil, err
-	}
-	return openDSN(BuildDSN(path, Options{}))
+	return nil, ErrKeyRequired
 }
 
 func OpenWithOptions(path string, opts Options) (*sql.DB, error) {
+	resolved, err := resolveOpenOptions(path, opts)
+	if err != nil {
+		return nil, err
+	}
 	if err := mustRegister(); err != nil {
 		return nil, err
 	}
-	return openDSN(BuildDSN(path, opts))
+	return openDSN(BuildDSN(path, resolved))
 }
 
 func OpenEncz(path, key string) (*sql.DB, error) {
-	if err := mustRegister(); err != nil {
-		return nil, err
-	}
-	return openDSN(BuildDSN(path, Options{Key: key}))
+	return OpenWithOptions(path, Options{Key: key})
 }
 
 func openDSN(dsn string) (*sql.DB, error) {

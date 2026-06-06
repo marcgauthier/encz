@@ -11,6 +11,8 @@ type Options struct {
 	URIParameters     map[string]string
 	JournalMode       string
 	BusyTimeoutMillis *int
+	ManifestPath      string
+	RotationPolicy    *RotationPolicy
 }
 
 func BuildDSN(path string, opts Options) string {

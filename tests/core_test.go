@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"database/sql"
 	"math"
+	"net/url"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/marcgauthier/encz"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 var journalModes = []string{"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
@@ -17,10 +19,26 @@ var journalModes = []string{"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "O
 func openTestDB(t *testing.T, encrypted bool, foreignKeys bool, journalMode string) (*sql.DB, string) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	opts := encz.Options{}
-	if encrypted {
-		opts.Key = "TestSecretKey123"
+	if !encrypted {
+		values := make(url.Values)
+		if journalMode != "" {
+			values.Set("_journal_mode", journalMode)
+		}
+		if foreignKeys {
+			values.Set("_foreign_keys", "1")
+		}
+		dsn := "file:" + filepath.ToSlash(dbPath)
+		if encoded := values.Encode(); encoded != "" {
+			dsn += "?" + encoded
+		}
+		db, err := sql.Open("sqlite3", dsn)
+		if err != nil {
+			t.Fatalf("failed to open plain database: %v", err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return db, dbPath
 	}
+	opts := encz.Options{Key: "TestSecretKey123"}
 	if journalMode != "" {
 		opts.JournalMode = journalMode
 	}

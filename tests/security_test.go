@@ -2,11 +2,13 @@ package tests
 
 import (
 	"bytes"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/marcgauthier/encz"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // TC-SEC-001: TestInvalidKeyRejection verifies that opening/querying a DB with an incorrect key fails.
@@ -52,8 +54,8 @@ func TestUnencryptedToEncrypted(t *testing.T) {
 	plainPath := filepath.Join(tempDir, "plain.db")
 	encPath := filepath.Join(tempDir, "encrypted.db")
 
-	// 1. Create plain database
-	dbPlain, err := encz.Open(plainPath)
+	// 1. Create plain database outside encz.
+	dbPlain, err := sql.Open("sqlite3", plainPath)
 	if err != nil {
 		t.Fatalf("failed to open plain DB: %v", err)
 	}
@@ -87,15 +89,9 @@ func TestUnencryptedToEncrypted(t *testing.T) {
 		}
 	}
 
-	// 4. Try to open encrypted database as plain (no key)
-	dbEncAsPlain, err := encz.Open(encPath)
-	if err == nil {
-		defer dbEncAsPlain.Close()
-		var count int
-		err = dbEncAsPlain.QueryRow(`SELECT count(*) FROM foo`).Scan(&count)
-		if err == nil {
-			t.Error("expected read error when opening encrypted database without a key")
-		}
+	// 4. Opening encrypted database without a key must fail at the package boundary.
+	if _, err := encz.Open(encPath); err == nil {
+		t.Error("expected Open to reject encrypted database without a key")
 	}
 }
 

@@ -148,6 +148,100 @@ func TestWALCheckpointing(t *testing.T) {
 	}
 }
 
+// TC-CON-002A: TestWALSupportsMaxOpenConnsFive verifies WAL operation with a 5-connection pool.
+func TestWALSupportsMaxOpenConnsFive(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wal-maxopenconns-five.db")
+	key := "WalPoolFiveKey"
+
+	opts := encz.Options{
+		Key:         key,
+		JournalMode: "WAL",
+	}
+	db, err := encz.OpenWithOptions(dbPath, opts)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	db.SetMaxOpenConns(5)
+
+	if _, err := db.Exec(`CREATE TABLE wal_pool (id INTEGER PRIMARY KEY, note TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for writer := 0; writer < 5; writer++ {
+		wg.Add(1)
+		go func(writerID int) {
+			defer wg.Done()
+			for i := 0; i < 40; i++ {
+				if _, err := db.ExecContext(ctx, `INSERT INTO wal_pool (note) VALUES (?)`, fmt.Sprintf("writer_%d_%d", writerID, i)); err != nil {
+					if err != context.DeadlineExceeded && err != context.Canceled {
+						t.Errorf("writer %d insert %d: %v", writerID, i, err)
+					}
+					return
+				}
+			}
+		}(writer)
+	}
+
+	for reader := 0; reader < 5; reader++ {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+			for i := 0; i < 40; i++ {
+				var count int
+				if err := db.QueryRowContext(ctx, `SELECT count(*) FROM wal_pool`).Scan(&count); err != nil {
+					if err != context.DeadlineExceeded && err != context.Canceled {
+						t.Errorf("reader %d query %d: %v", readerID, i, err)
+					}
+					return
+				}
+			}
+		}(reader)
+	}
+
+	wg.Wait()
+
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM wal_pool`).Scan(&count); err != nil {
+		t.Fatalf("count before checkpoint: %v", err)
+	}
+	if count != 200 {
+		t.Fatalf("expected 200 rows, got %d", count)
+	}
+
+	if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := encz.OpenWithOptions(dbPath, opts)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	reopened.SetMaxOpenConns(5)
+
+	if err := reopened.QueryRow(`SELECT count(*) FROM wal_pool`).Scan(&count); err != nil {
+		t.Fatalf("count after reopen: %v", err)
+	}
+	if count != 200 {
+		t.Fatalf("expected 200 rows after reopen, got %d", count)
+	}
+
+	var integrity string
+	if err := reopened.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
+		t.Fatalf("integrity check failed: %s, err=%v", integrity, err)
+	}
+}
+
 // TC-CON-003: TestLockingModes validates SQLite locking behavior.
 func TestLockingModes(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "locking.db")
@@ -298,12 +392,8 @@ func TestReaderThreadContention(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Limit connection pool to 1 active connection.
-	// Since encz VFS tracks WAL frames using a separate .cvmeta metadata file
-	// that is loaded once when a VFS handle is opened, multiple concurrent active
-	// connection handles will experience WAL metadata desynchronization.
-	// Restricting the pool to a single connection resolves this VFS design constraint.
-	db.SetMaxOpenConns(1)
+	// Exercise concurrent use through Go's connection pool.
+	db.SetMaxOpenConns(5)
 
 	_, err = db.Exec(`CREATE TABLE log_data (id INTEGER PRIMARY KEY, category TEXT, payload TEXT)`)
 	if err != nil {

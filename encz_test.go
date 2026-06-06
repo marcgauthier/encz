@@ -5,30 +5,28 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestOpenPlainSQLite(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "plain.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
+func TestOpenRequiresKey(t *testing.T) {
+	_, err := Open(filepath.Join(t.TempDir(), "plain.db"))
+	if err == nil {
+		t.Fatal("expected Open to reject missing key")
 	}
-	defer db.Close()
+	if err != ErrKeyRequired {
+		t.Fatalf("expected ErrKeyRequired, got %v", err)
+	}
+}
 
-	if _, err := db.Exec(`CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`); err != nil {
-		t.Fatalf("create table: %v", err)
+func TestOpenWithOptionsRequiresKey(t *testing.T) {
+	_, err := OpenWithOptions(filepath.Join(t.TempDir(), "encz.db"), Options{})
+	if err == nil {
+		t.Fatal("expected OpenWithOptions to reject missing key")
 	}
-	if _, err := db.Exec(`INSERT INTO items(name) VALUES (?)`, "plain"); err != nil {
-		t.Fatalf("insert: %v", err)
-	}
-
-	var got string
-	if err := db.QueryRow(`SELECT name FROM items WHERE id = 1`).Scan(&got); err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if got != "plain" {
-		t.Fatalf("unexpected value %q", got)
+	if err != ErrKeyRequired {
+		t.Fatalf("expected ErrKeyRequired, got %v", err)
 	}
 }
 
@@ -71,6 +69,150 @@ func TestOpenEnczSQLite(t *testing.T) {
 	}
 	if got != "secret" {
 		t.Fatalf("unexpected reopened value %q", got)
+	}
+}
+
+func TestManifestCreatedAndOpaque(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "manifest.db")
+	masterKey := "ManifestMasterPass"
+
+	db, err := OpenEncz(dbPath, masterKey)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE manifest_test (val TEXT)`); err != nil {
+		db.Close()
+		t.Fatalf("create table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	manifestPath := dbPath + ".encz"
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if len(manifest) == 0 {
+		t.Fatal("expected manifest data")
+	}
+	if !bytes.HasPrefix(manifest, []byte(manifestMagic)) {
+		t.Fatalf("expected manifest magic prefix %q", manifestMagic)
+	}
+	if bytes.Contains(manifest, []byte(masterKey)) {
+		t.Fatal("manifest should not contain the master key in plaintext")
+	}
+	if bytes.Contains(manifest, []byte("active_dek_hex")) {
+		t.Fatal("manifest should not expose JSON payload in plaintext")
+	}
+}
+
+func TestMissingManifestFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "missing-manifest.db")
+	db, err := OpenEncz(dbPath, "MissingManifestPass")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE missing_manifest_test (val TEXT)`); err != nil {
+		db.Close()
+		t.Fatalf("create table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := os.Remove(dbPath + ".encz"); err != nil {
+		t.Fatalf("remove manifest: %v", err)
+	}
+	if _, err := OpenEncz(dbPath, "MissingManifestPass"); err != ErrManifestMissing {
+		t.Fatalf("expected ErrManifestMissing, got %v", err)
+	}
+}
+
+func TestRotateManifestKey(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rotate-manifest.db")
+	oldKey := "OldManifestMasterPass"
+	newKey := "NewManifestMasterPass"
+
+	db, err := OpenEncz(dbPath, oldKey)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE rotate_manifest_test (val TEXT)`); err != nil {
+		db.Close()
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO rotate_manifest_test (val) VALUES ('ok')`); err != nil {
+		db.Close()
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if err := RotateManifestKey(dbPath, oldKey, newKey, Options{}); err != nil {
+		t.Fatalf("RotateManifestKey: %v", err)
+	}
+	if _, err := OpenEncz(dbPath, oldKey); err == nil {
+		t.Fatal("expected old manifest key to fail after rotation")
+	}
+	reopened, err := OpenEncz(dbPath, newKey)
+	if err != nil {
+		t.Fatalf("reopen with new key: %v", err)
+	}
+	defer reopened.Close()
+	var val string
+	if err := reopened.QueryRow(`SELECT val FROM rotate_manifest_test LIMIT 1`).Scan(&val); err != nil {
+		t.Fatalf("query after rotation: %v", err)
+	}
+	if val != "ok" {
+		t.Fatalf("unexpected value %q", val)
+	}
+}
+
+func TestMigrateLegacyKeyedDatabase(t *testing.T) {
+	if err := mustRegister(); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	legacyKey := "LegacyDirectKeyPass"
+	masterKey := "ManifestMasterKeyPass"
+
+	legacyDB, err := openDSN(BuildDSN(dbPath, Options{Key: legacyKey}))
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := legacyDB.Exec(`CREATE TABLE legacy_data (val TEXT)`); err != nil {
+		legacyDB.Close()
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := legacyDB.Exec(`INSERT INTO legacy_data (val) VALUES ('legacy-ok')`); err != nil {
+		legacyDB.Close()
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	if err := legacyDB.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	if err := MigrateLegacyKeyedDatabase(dbPath, legacyKey, Options{Key: masterKey}); err != nil {
+		t.Fatalf("MigrateLegacyKeyedDatabase: %v", err)
+	}
+	if _, err := os.Stat(dbPath + ".encz"); err != nil {
+		t.Fatalf("stat manifest: %v", err)
+	}
+	if _, err := OpenEncz(dbPath, legacyKey); err == nil {
+		t.Fatal("expected legacy direct key to fail after migration")
+	}
+	reopened, err := OpenEncz(dbPath, masterKey)
+	if err != nil {
+		t.Fatalf("reopen migrated db: %v", err)
+	}
+	defer reopened.Close()
+	var val string
+	if err := reopened.QueryRow(`SELECT val FROM legacy_data LIMIT 1`).Scan(&val); err != nil {
+		t.Fatalf("query migrated row: %v", err)
+	}
+	if val != "legacy-ok" {
+		t.Fatalf("unexpected migrated value %q", val)
 	}
 }
 

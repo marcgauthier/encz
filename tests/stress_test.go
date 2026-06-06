@@ -157,8 +157,7 @@ func TestConcurrencyStressPool(t *testing.T) {
 	}
 	defer db.Close()
 
-	// MaxOpenConns = 1 handles WAL .cvmeta metadata limitation safely
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(5)
 
 	_, err = db.Exec(`CREATE TABLE pool_data (val INTEGER)`)
 	if err != nil {

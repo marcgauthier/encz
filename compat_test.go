@@ -325,7 +325,7 @@ func TestCompatCorruptDbError(t *testing.T) {
 				t.Fatal("expected corrupt db open to fail")
 			}
 			msg := strings.ToLower(err.Error())
-			if !strings.Contains(msg, "not a database") && !strings.Contains(msg, "malformed") && !strings.Contains(msg, "corrupt") {
+			if !strings.Contains(msg, "not a database") && !strings.Contains(msg, "malformed") && !strings.Contains(msg, "corrupt") && !strings.Contains(msg, "manifest file is required") {
 				t.Fatalf("unexpected corrupt db error: %v", err)
 			}
 		})
