@@ -3,7 +3,7 @@
 package encz
 
 /*
-#cgo CFLAGS: -I${SRCDIR} -DSQLITE_CORE=1 -DSQLITE_CRYPTOVFS_STATIC=1
-#cgo LDFLAGS: -L${SRCDIR}/lib/linux_amd64 -lcrypto -lzstd -lz
+#cgo CFLAGS: -I${SRCDIR} -I${SRCDIR}/lib/include -DSQLITE_CORE=1 -DSQLITE_CRYPTOVFS_STATIC=1
+#cgo LDFLAGS: -L${SRCDIR}/lib/linux_amd64 -lrocksdb -lgflags -lstdc++ -lm -lcrypto -lzstd -lz -Wl,-rpath,${SRCDIR}/lib/linux_amd64 -Wl,--disable-new-dtags
 */
 import "C"
