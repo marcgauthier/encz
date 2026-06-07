@@ -34,3 +34,14 @@ func enczGoFillActiveKey(handle C.ulonglong, outKeyID *C.uint, out *C.uchar) C.i
 	*outKeyID = C.uint(keyID)
 	return 1
 }
+
+//export enczGoFillDBUUID
+func enczGoFillDBUUID(handle C.ulonglong, out *C.uchar) C.int {
+	reg, ok := getKeyRegistry(uint64(handle))
+	if !ok || out == nil {
+		return 0
+	}
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(out)), 16)
+	copy(dst, reg.dbUUID[:])
+	return 1
+}

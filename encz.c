@@ -84,6 +84,7 @@ static int enczUnfetch(sqlite3_file*, sqlite3_int64, void*);
 
 static int enczDecryptAndReadPage(EnczFile*, u8*, u32, i64);
 static int enczEncryptAndWritePageAtOffset(EnczFile*, const u8*, u32, i64);
+static void enczInitPlainPage(u8*, int, u32);
 
 static int enczOpen(sqlite3_vfs*, const char*, sqlite3_file*, int, int*);
 static int enczDelete(sqlite3_vfs*, const char*, int);
@@ -229,6 +230,7 @@ static int enczHexNibble(char c){
 extern void enczGoLog(const char *zMsg);
 extern int enczGoFillKey(unsigned long long handle, unsigned int keyId, unsigned char *aOut);
 extern int enczGoFillActiveKey(unsigned long long handle, unsigned int *pKeyId, unsigned char *aOut);
+extern int enczGoFillDBUUID(unsigned long long handle, unsigned char *aOut);
 
 static int enczSetKeyHex(EnczFile *p, const char *z){
   size_t n;
@@ -275,6 +277,25 @@ static int enczFillActiveKey(EnczFile *p, u32 *pKeyId, u8 *aKeyOut){
   return SQLITE_ERROR;
 }
 
+static void enczInitPlainPage(u8 *aPlain, int P, u32 pgno){
+  memset(aPlain, 0, P);
+  if( pgno!=1 ) return;
+  memcpy(aPlain, "SQLite format 3", 16);
+  aPlain[16] = (u8)((P >> 8) & 0xff);
+  aPlain[17] = (u8)(P & 0xff);
+  aPlain[18] = 1;
+  aPlain[19] = 1;
+  aPlain[20] = ENCZ_RESERVED_SZ;
+  aPlain[21] = 64;
+  aPlain[22] = 32;
+  aPlain[23] = 32;
+  aPlain[47] = 4;
+  aPlain[59] = 1;
+  aPlain[100] = 0x0d;
+  aPlain[105] = (u8)(((P - ENCZ_RESERVED_SZ) >> 8) & 0xff);
+  aPlain[106] = (u8)((P - ENCZ_RESERVED_SZ) & 0xff);
+}
+
 static int enczSetKeyEnv(EnczFile *p, const char *zEnv){
   const char *zValue = zEnv ? getenv(zEnv) : 0;
   if( zValue==0 ) return SQLITE_ERROR;
@@ -285,21 +306,7 @@ static int enczInitNewDatabase(EnczFile *p) {
   int P = 4096;
   u8 *aPlain = sqlite3_malloc64(P);
   if( aPlain==0 ) return SQLITE_NOMEM;
-  memset(aPlain, 0, P);
-  memcpy(aPlain, "SQLite format 3", 16);
-  aPlain[16] = 0x10; // Page size: 4096 (high byte)
-  aPlain[17] = 0x00; // Page size: 4096 (low byte)
-  aPlain[18] = 1;    // File format write version
-  aPlain[19] = 1;    // File format read version
-  aPlain[20] = ENCZ_RESERVED_SZ;   // Reserved bytes
-  aPlain[21] = 64;   // Max embedded payload
-  aPlain[22] = 32;   // Min embedded payload
-  aPlain[23] = 32;   // Leaf payload fraction
-  aPlain[47] = 4;    // Schema format
-  aPlain[59] = 1;    // Text encoding UTF-8
-  aPlain[100] = 0x0d; // leaf table b-tree page
-  aPlain[105] = (u8)(((P - ENCZ_RESERVED_SZ) >> 8) & 0xff);
-  aPlain[106] = (u8)((P - ENCZ_RESERVED_SZ) & 0xff);
+  enczInitPlainPage(aPlain, P, 1);
   
   p->logicalPageSize = P;
   p->hasReservedBytes = ENCZ_RESERVED_SZ;
@@ -377,21 +384,7 @@ static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) 
   rc = p->pSubFile->pMethods->xRead(p->pSubFile, aBuf, P, iOfst);
   if( rc!=SQLITE_OK ){
     if( pgno == 1 && (rc == SQLITE_IOERR_SHORT_READ || rc == SQLITE_OK) ){
-      memset(aPlain, 0, P);
-      memcpy(aPlain, "SQLite format 3", 16);
-      aPlain[16] = (u8)((P >> 8) & 0xff);
-      aPlain[17] = (u8)(P & 0xff);
-      aPlain[18] = 1;
-      aPlain[19] = 1;
-      aPlain[20] = ENCZ_RESERVED_SZ;
-      aPlain[21] = 64;
-      aPlain[22] = 32;
-      aPlain[23] = 32;
-      aPlain[47] = 4;
-      aPlain[59] = 1;
-      aPlain[100] = 0x0d;
-      aPlain[105] = (u8)(((P - ENCZ_RESERVED_SZ) >> 8) & 0xff);
-      aPlain[106] = (u8)((P - ENCZ_RESERVED_SZ) & 0xff);
+      enczInitPlainPage(aPlain, P, pgno);
       sqlite3_free(aBuf);
       return SQLITE_OK;
     }
@@ -405,25 +398,7 @@ static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) 
   
   if( !p->hasKey && !p->registryHandle ){
     enczLog("[encz] READ no key, returning stub for pgno=%u\n", pgno);
-    if( pgno == 1 ){
-      memset(aPlain, 0, P);
-      memcpy(aPlain, "SQLite format 3", 16);
-      aPlain[16] = (u8)((P >> 8) & 0xff);
-      aPlain[17] = (u8)(P & 0xff);
-      aPlain[18] = 1;
-      aPlain[19] = 1;
-      aPlain[20] = ENCZ_RESERVED_SZ;
-      aPlain[21] = 64;
-      aPlain[22] = 32;
-      aPlain[23] = 32;
-      aPlain[47] = 4;
-      aPlain[59] = 1;
-      aPlain[100] = 0x0d;
-      aPlain[105] = (u8)(((P - ENCZ_RESERVED_SZ) >> 8) & 0xff);
-      aPlain[106] = (u8)((P - ENCZ_RESERVED_SZ) & 0xff);
-    } else {
-      memset(aPlain, 0, P);
-    }
+    enczInitPlainPage(aPlain, P, pgno);
     sqlite3_free(aBuf);
     return SQLITE_OK;
   }
@@ -464,10 +439,31 @@ static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) 
     return SQLITE_NOMEM;
   }
   
+  u8 aDbUuid[16];
+  memset(aDbUuid, 0, 16);
+  if( p->registryHandle ){
+    enczGoFillDBUUID((unsigned long long)p->registryHandle, aDbUuid);
+  }
+  
+  u8 aAAD[32];
+  memcpy(aAAD, aDbUuid, 16);
+  enczPut32(aAAD + 16, pgno);
+  aAAD[20] = (u8)(iOfst & 0xff);
+  aAAD[21] = (u8)((iOfst >> 8) & 0xff);
+  aAAD[22] = (u8)((iOfst >> 16) & 0xff);
+  aAAD[23] = (u8)((iOfst >> 24) & 0xff);
+  aAAD[24] = (u8)((iOfst >> 32) & 0xff);
+  aAAD[25] = (u8)((iOfst >> 40) & 0xff);
+  aAAD[26] = (u8)((iOfst >> 48) & 0xff);
+  aAAD[27] = (u8)((iOfst >> 56) & 0xff);
+  aAAD[28] = p->isWal ? 1 : 0;
+  memset(aAAD + 29, 0, 3);
+
   int nOut = 0, nDec = 0;
   if( EVP_DecryptInit_ex(pCtx, EVP_aes_256_gcm(), 0, 0, 0)!=1
    || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_SET_IVLEN, 12, 0)!=1
    || EVP_DecryptInit_ex(pCtx, 0, 0, aKey, aNonce)!=1
+   || EVP_DecryptUpdate(pCtx, 0, &nOut, aAAD, sizeof(aAAD))!=1
    || EVP_DecryptUpdate(pCtx, aTmp, &nOut, aBuf + H, nCipher)!=1
    || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_SET_TAG, 16, aTag)!=1
   ){
@@ -542,10 +538,31 @@ static int enczEncryptAndWritePageAtOffset(EnczFile *p, const u8 *aPlain, u32 pg
     return SQLITE_NOMEM;
   }
   
+  u8 aDbUuid[16];
+  memset(aDbUuid, 0, 16);
+  if( p->registryHandle ){
+    enczGoFillDBUUID((unsigned long long)p->registryHandle, aDbUuid);
+  }
+  
+  u8 aAAD[32];
+  memcpy(aAAD, aDbUuid, 16);
+  enczPut32(aAAD + 16, pgno);
+  aAAD[20] = (u8)(iOfst & 0xff);
+  aAAD[21] = (u8)((iOfst >> 8) & 0xff);
+  aAAD[22] = (u8)((iOfst >> 16) & 0xff);
+  aAAD[23] = (u8)((iOfst >> 24) & 0xff);
+  aAAD[24] = (u8)((iOfst >> 32) & 0xff);
+  aAAD[25] = (u8)((iOfst >> 40) & 0xff);
+  aAAD[26] = (u8)((iOfst >> 48) & 0xff);
+  aAAD[27] = (u8)((iOfst >> 56) & 0xff);
+  aAAD[28] = p->isWal ? 1 : 0;
+  memset(aAAD + 29, 0, 3);
+
   int nOut = 0, nCipher = 0;
   if( EVP_EncryptInit_ex(pCtx, EVP_aes_256_gcm(), 0, 0, 0)!=1
    || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_SET_IVLEN, 12, 0)!=1
    || EVP_EncryptInit_ex(pCtx, 0, 0, aKey, aNonce)!=1
+   || EVP_EncryptUpdate(pCtx, 0, &nOut, aAAD, sizeof(aAAD))!=1
    || EVP_EncryptUpdate(pCtx, aCipher, &nOut, aPlain + H, nPlain)!=1
    || EVP_EncryptFinal_ex(pCtx, aCipher + nOut, &nCipher)!=1
    || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_GET_TAG, 16, aTag)!=1
@@ -669,19 +686,31 @@ static int enczWalWriteRegion(EnczFile *p, const void *pBuf, int iAmt, sqlite3_i
         iFrameOfst += nHdr;
       }
       if( nFrame>0 ){
+        sqlite3_int64 walSize = 0;
         i64 pageStartOfst = iOfst - (iFrameOfst - ENCZ_WAL_FRAME_HDR_SZ);
         u8 *aPage = sqlite3_malloc64(P);
         if( aPage==0 ) return SQLITE_NOMEM;
         
         int iPayloadOfst = iFrameOfst - ENCZ_WAL_FRAME_HDR_SZ;
         u32 dbPgno = enczGetWalPgno(p, pageStartOfst);
+        enczInitPlainPage(aPage, P, dbPgno);
         if( nFrame < P ){
-          rc = enczDecryptAndReadPage(p, aPage, dbPgno, pageStartOfst);
-          if( rc!=SQLITE_OK && rc!=SQLITE_IOERR_SHORT_READ ){
+          rc = p->pSubFile->pMethods->xFileSize(p->pSubFile, &walSize);
+          if( rc!=SQLITE_OK ){
             sqlite3_free(aPage);
             break;
           }
-          rc = SQLITE_OK;
+          rc = enczDecryptAndReadPage(p, aPage, dbPgno, pageStartOfst);
+          if( rc==SQLITE_IOERR_SHORT_READ ){
+            if( walSize >= pageStartOfst + P ){
+              sqlite3_free(aPage);
+              break;
+            }
+            rc = SQLITE_OK;
+          }else if( rc!=SQLITE_OK ){
+            sqlite3_free(aPage);
+            break;
+          }
         }
         
         memcpy(aPage + iPayloadOfst, aIn, (size_t)nFrame);

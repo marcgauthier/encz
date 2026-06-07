@@ -222,6 +222,106 @@ func TestBackup(file, masterKey, tempFolder string) error {
 	return nil
 }
 
+// RestoreBackup decrypts an encrypted backup archive, extracts its contents into
+// toFolder, and verifies the database integrity check succeeds.
+// If overwriteExistingFile is true, existing files in toFolder will be overwritten;
+// if false, the restore will fail if any destination file already exists.
+func RestoreBackup(fle, masterkey, toFolder string, overwriteExistingFile bool) error {
+	if strings.TrimSpace(fle) == "" {
+		return ErrBackupTargetRequired
+	}
+	if strings.TrimSpace(masterkey) == "" {
+		return ErrKeyRequired
+	}
+	if strings.TrimSpace(toFolder) == "" {
+		return fmt.Errorf("encz: restore target folder is required")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "encz-restore-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	zipPath, err := decryptBackupArchive(fle, masterkey, tmpDir)
+	if err != nil {
+		return err
+	}
+
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	if !overwriteExistingFile {
+		for _, f := range r.File {
+			target := filepath.Join(toFolder, f.Name)
+			if _, err := os.Stat(target); err == nil {
+				return fmt.Errorf("encz: restore target file already exists: %s", target)
+			}
+		}
+	}
+
+	if err := os.MkdirAll(toFolder, 0o755); err != nil {
+		return err
+	}
+
+	var dbPath, manifestPath string
+	for _, f := range r.File {
+		target := filepath.Join(toFolder, f.Name)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := extractZipEntry(f, target); err != nil {
+			return err
+		}
+		if strings.HasSuffix(f.Name, ".bak.encz") {
+			manifestPath = target
+		} else if strings.HasSuffix(f.Name, ".bak") {
+			dbPath = target
+		}
+	}
+
+	if dbPath == "" {
+		return fmt.Errorf("encz: backup archive missing .bak database")
+	}
+	if manifestPath == "" {
+		return ErrManifestMissing
+	}
+
+	keyBuf := memguard.NewBufferFromBytes([]byte(masterkey))
+	defer keyBuf.Destroy()
+
+	payload, policy, err := loadManifest(manifestPath, keyBuf)
+	if err != nil {
+		return err
+	}
+
+	handle, err := registerKeyRegistry(manifestPath, keyBuf, payload, policy, false)
+	if err != nil {
+		return err
+	}
+	defer destroyKeyRegistry(handle)
+
+	backupDSN := BuildDSN(dbPath, applyRegistryToOptions(Options{}, handle))
+	opened, err := openSQLDB(backupDSN)
+	if err != nil {
+		return err
+	}
+	defer opened.Close()
+
+	var integrity string
+	if err := opened.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil {
+		return err
+	}
+	if integrity != "ok" {
+		return fmt.Errorf("encz: backup integrity check failed: %s", integrity)
+	}
+
+	return nil
+}
+
 func extractBackupArchive(file, tempFolder string) (dbPath string, manifestPath string, err error) {
 	if err := os.MkdirAll(tempFolder, 0o755); err != nil {
 		return "", "", err
@@ -305,12 +405,13 @@ func encryptBackupArchive(plainZipPath, encryptedPath string, key *memguard.Lock
 	if err != nil {
 		return err
 	}
+	t, m, thr := getArgonParams()
 	buf := make([]byte, 0, backupArchiveHeaderSize()+len(sealed))
 	buf = append(buf, []byte(backupArchiveMagic)...)
 	buf = append(buf, backupArchiveVersion)
-	buf = binary.LittleEndian.AppendUint32(buf, defaultArgonTime)
-	buf = binary.LittleEndian.AppendUint32(buf, defaultArgonMemory)
-	buf = append(buf, defaultArgonThreads)
+	buf = binary.LittleEndian.AppendUint32(buf, t)
+	buf = binary.LittleEndian.AppendUint32(buf, m)
+	buf = append(buf, thr)
 	buf = append(buf, hdr.Salt[:]...)
 	buf = append(buf, hdr.Nonce[:]...)
 	buf = append(buf, sealed...)
@@ -336,10 +437,11 @@ func decryptBackupArchiveToFile(encryptedPath, zipPath string, key *memguard.Loc
 
 func newBackupArchiveHeader(key *memguard.LockedBuffer) (backupArchiveHeader, []byte, error) {
 	var hdr backupArchiveHeader
+	t, m, thr := getArgonParams()
 	hdr.Version = backupArchiveVersion
-	hdr.ArgonTime = defaultArgonTime
-	hdr.ArgonMemory = defaultArgonMemory
-	hdr.ArgonThreads = defaultArgonThreads
+	hdr.ArgonTime = t
+	hdr.ArgonMemory = m
+	hdr.ArgonThreads = thr
 	if _, err := rand.Read(hdr.Salt[:]); err != nil {
 		return hdr, nil, err
 	}

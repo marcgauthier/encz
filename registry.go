@@ -18,6 +18,7 @@ type keyRegistry struct {
 	policy           RotationPolicy
 	keys             map[uint32]*memguard.LockedBuffer
 	allowDEKRotation bool
+	dbUUID           [16]byte
 }
 
 var (
@@ -39,6 +40,10 @@ func registerKeyRegistry(manifestPath string, masterKey *memguard.LockedBuffer, 
 	if err != nil {
 		return 0, err
 	}
+	var dbUUID [16]byte
+	if decoded, err := hex.DecodeString(payload.DBUUID); err == nil && len(decoded) == 16 {
+		copy(dbUUID[:], decoded)
+	}
 	reg := &keyRegistry{
 		manifestPath:     manifestPath,
 		masterKey:        cloneLockedBuffer(masterKey),
@@ -46,6 +51,7 @@ func registerKeyRegistry(manifestPath string, masterKey *memguard.LockedBuffer, 
 		policy:           policy,
 		keys:             keys,
 		allowDEKRotation: allowDEKRotation,
+		dbUUID:           dbUUID,
 	}
 	handle := keyRegistrySeq.Add(1)
 	keyRegistryMu.Lock()

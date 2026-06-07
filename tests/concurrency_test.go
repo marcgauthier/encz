@@ -378,6 +378,13 @@ func TestBusyTimeout(t *testing.T) {
 
 // TC-CON-005: TestReaderThreadContention runs multiple readers and writers concurrently.
 func TestReaderThreadContention(t *testing.T) {
+	const (
+		readerCount = 30
+		readerOps   = 250
+		writerCount = 5
+		writerOps   = 75
+	)
+
 	dbPath := filepath.Join(t.TempDir(), "contention.db")
 	key := "ContentionSecret"
 
@@ -410,77 +417,86 @@ func TestReaderThreadContention(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	// Launch 30 concurrent readers
-	for i := 0; i < 30; i++ {
+	// Run a bounded workload so race-mode slowdown does not trip transaction cleanup.
+	for i := 0; i < readerCount; i++ {
 		wg.Add(1)
 		go func(readerId int) {
 			defer wg.Done()
-			for {
+			for op := 0; op < readerOps; op++ {
 				select {
 				case <-ctx.Done():
 					return
 				default:
-					// Run read queries
-					var count int
-					row := db.QueryRowContext(ctx, `SELECT count(*) FROM log_data WHERE category = ?`, fmt.Sprintf("cat_%d", readerId%5))
-					if err := row.Scan(&count); err != nil && err != context.DeadlineExceeded && err != context.Canceled {
+				}
+
+				var count int
+				row := db.QueryRowContext(ctx, `SELECT count(*) FROM log_data WHERE category = ?`, fmt.Sprintf("cat_%d", readerId%5))
+				if err := row.Scan(&count); err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					if err != context.DeadlineExceeded && err != context.Canceled {
 						t.Errorf("reader %d query failed: %v", readerId, err)
 						return
 					}
-					time.Sleep(2 * time.Millisecond)
 				}
+				time.Sleep(2 * time.Millisecond)
 			}
 		}(i)
 	}
 
-	// Launch 5 concurrent writers
-	for i := 0; i < 5; i++ {
+	for i := 0; i < writerCount; i++ {
 		wg.Add(1)
 		go func(writerId int) {
 			defer wg.Done()
-			counter := 0
-			for {
+			for counter := 0; counter < writerOps; counter++ {
 				select {
 				case <-ctx.Done():
 					return
 				default:
-					tx, err := db.BeginTx(ctx, nil)
-					if err != nil {
-						if err != context.DeadlineExceeded && err != context.Canceled {
-							t.Errorf("writer %d begin tx failed: %v", writerId, err)
-						}
-						return
-					}
-					_, err = tx.ExecContext(ctx, `INSERT INTO log_data (category, payload) VALUES (?, ?)`,
-						fmt.Sprintf("cat_%d", writerId), fmt.Sprintf("writer_%d_counter_%d", writerId, counter))
-					if err != nil {
-						tx.Rollback()
-						if err != context.DeadlineExceeded && err != context.Canceled {
-							t.Errorf("writer %d insert failed: %v", writerId, err)
-						}
-						return
-					}
-					err = tx.Commit()
-					if err != nil {
-						if err != context.DeadlineExceeded && err != context.Canceled {
-							t.Errorf("writer %d commit failed: %v", writerId, err)
-						}
-						return
-					}
-					counter++
-					time.Sleep(10 * time.Millisecond)
 				}
+
+				tx, err := db.BeginTx(context.Background(), nil)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					t.Errorf("writer %d begin tx failed: %v", writerId, err)
+					return
+				}
+
+				_, err = tx.ExecContext(context.Background(), `INSERT INTO log_data (category, payload) VALUES (?, ?)`,
+					fmt.Sprintf("cat_%d", writerId), fmt.Sprintf("writer_%d_counter_%d", writerId, counter))
+				if err != nil {
+					_ = tx.Rollback()
+					if ctx.Err() != nil {
+						return
+					}
+					t.Errorf("writer %d insert failed: %v", writerId, err)
+					return
+				}
+
+				err = tx.Commit()
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					t.Errorf("writer %d commit failed: %v", writerId, err)
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
 		}(i)
 	}
 
-	// Wait for readers and writers to finish
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("contention workload timed out: %v", err)
+	}
 
-	// Verify database integrity
 	var integrity string
 	err = db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
 	if err != nil || integrity != "ok" {

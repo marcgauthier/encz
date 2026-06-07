@@ -3,10 +3,12 @@ package tests
 import (
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/marcgauthier/encz"
@@ -19,6 +21,14 @@ func init() {
 	}
 	if os.Getenv("GO_TEST_EXIT_ZERO_HELPER") == "1" {
 		runExitZeroHelper()
+		os.Exit(0)
+	}
+	if os.Getenv("GO_TEST_WAL_HELPER") == "1" {
+		runWALHelper()
+		os.Exit(0)
+	}
+	if os.Getenv("GO_TEST_ROLLBACK_HELPER") == "1" {
+		runRollbackJournalHelper()
 		os.Exit(0)
 	}
 }
@@ -135,6 +145,7 @@ func TestCrashRecovery(t *testing.T) {
 	}
 	cmd := exec.Command(exe, "-test.run=TestCrashRecovery")
 	cmd.Env = append(os.Environ(), "GO_TEST_CRASH_HELPER=1", "CRASH_DB_PATH="+dbPath)
+	setDeathSig(cmd)
 	err = cmd.Run()
 	// The helper terminates itself using SIGKILL, so cmd.Run must fail
 	t.Logf("crash helper exited, error: %v", err)
@@ -294,6 +305,645 @@ func TestCorruptionTampering(t *testing.T) {
 	}
 }
 
+// TC-FLT-005: TestManifestTamperAuthFails verifies manifest tampering is rejected directly.
+func TestManifestTamperAuthFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "manifest-corrupt.db")
+	key := "ManifestCorruptKey"
+
+	db, err := encz.OpenEncz(dbPath, key)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE secure (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		db.Close()
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO secure (val) VALUES ("manifest-ok")`); err != nil {
+		db.Close()
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	manifestPath := dbPath + ".encz"
+	tamperByte(t, manifestPath, 32)
+
+	_, err = encz.OpenEncz(dbPath, key)
+	if err == nil {
+		t.Fatal("expected open to fail after manifest tampering")
+	}
+	if !errors.Is(err, encz.ErrManifestAuthFailed) && !errors.Is(err, encz.ErrManifestInvalid) {
+		t.Fatalf("expected ErrManifestAuthFailed or ErrManifestInvalid, got %v", err)
+	}
+}
+
+// TC-FLT-006: TestDBPageTrailerBitFlipFails verifies page trailer authentication detects a single-byte flip.
+func TestDBPageTrailerBitFlipFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "page-trailer-corrupt.db")
+	key := "TrailerCorruptKey"
+
+	pageSize := createLargeEncryptedDB(t, dbPath, key)
+	tamperByte(t, dbPath, int64(pageSize-1))
+
+	assertEncryptedReadFails(t, dbPath, key)
+}
+
+// TC-FLT-007: TestMidFilePageCorruptionFails verifies corruption away from page 1 is detected.
+func TestMidFilePageCorruptionFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mid-file-corrupt.db")
+	key := "MidFileCorruptKey"
+
+	pageSize := createLargeEncryptedDB(t, dbPath, key)
+	tamperByte(t, dbPath, int64(pageSize*2+128))
+
+	assertEncryptedReadFails(t, dbPath, key)
+}
+
+// TC-FLT-009: TestMainDBTruncationFails verifies truncating the encrypted main database is detected.
+func TestMainDBTruncationFails(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		truncateBy int64
+	}{
+		{name: "OneAndHalfPages", truncateBy: 6144},
+		{name: "TwoPages", truncateBy: 8192},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "main-truncate.db")
+			key := "MainTruncateKey"
+			createLargeEncryptedDB(t, dbPath, key)
+
+			truncateTail(t, dbPath, tc.truncateBy)
+			assertEncryptedReadFails(t, dbPath, key)
+		})
+	}
+}
+
+// TC-FLT-010: TestManifestTruncationFails verifies truncated manifests are rejected.
+func TestManifestTruncationFails(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		truncateTo int64
+	}{
+		{name: "HeaderOnly", truncateTo: 16},
+		{name: "ShortCiphertext", truncateTo: 48},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "manifest-truncate.db")
+			key := "ManifestTruncateKey"
+			createLargeEncryptedDB(t, dbPath, key)
+
+			manifestPath := dbPath + ".encz"
+			truncateToSize(t, manifestPath, tc.truncateTo)
+
+			_, err := encz.OpenEncz(dbPath, key)
+			if err == nil {
+				t.Fatal("expected open to fail after manifest truncation")
+			}
+			if !errors.Is(err, encz.ErrManifestInvalid) && !errors.Is(err, encz.ErrManifestAuthFailed) {
+				t.Fatalf("expected ErrManifestInvalid or ErrManifestAuthFailed, got %v", err)
+			}
+		})
+	}
+}
+
+// TC-FLT-011: TestSidecarMismatchDetected verifies swapping manifests between databases is rejected.
+func TestSidecarMismatchDetected(t *testing.T) {
+	tempDir := t.TempDir()
+	key := "MismatchKey"
+	dbPathA := filepath.Join(tempDir, "db-a.db")
+	dbPathB := filepath.Join(tempDir, "db-b.db")
+
+	createLargeEncryptedDB(t, dbPathA, key)
+	createLargeEncryptedDB(t, dbPathB, key)
+
+	manifestAPath := dbPathA + ".encz"
+	manifestBPath := dbPathB + ".encz"
+	manifestB, err := os.ReadFile(manifestBPath)
+	if err != nil {
+		t.Fatalf("read manifest B: %v", err)
+	}
+	if err := os.WriteFile(manifestAPath, manifestB, 0600); err != nil {
+		t.Fatalf("overwrite manifest A: %v", err)
+	}
+
+	_, err = encz.OpenEncz(dbPathA, key)
+	if err == nil {
+		t.Fatal("expected open to fail after manifest swap")
+	}
+	if !errors.Is(err, encz.ErrManifestMismatch) && !corruptionError(err) {
+		t.Fatalf("expected ErrManifestMismatch or another corruption-class failure, got %v", err)
+	}
+}
+
+// TC-FLT-013: TestRollbackJournalBitFlipDetected verifies a corrupted hot rollback journal is surfaced on recovery.
+func TestRollbackJournalBitFlipDetected(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rollback-bitflip.db")
+	key := "RollbackCorruptKey"
+
+	createRollbackRecoveryBase(t, dbPath, key)
+	spawnRollbackJournalHelper(t, dbPath)
+
+	journalPath := dbPath + "-journal"
+	info, err := os.Stat(journalPath)
+	if err != nil {
+		t.Fatalf("stat rollback journal: %v", err)
+	}
+	if info.Size() <= 64 {
+		t.Fatalf("expected rollback journal larger than 64 bytes, got %d", info.Size())
+	}
+	tamperByte(t, journalPath, 32)
+
+	assertRollbackRecoveryDegraded(t, dbPath, key)
+}
+
+// TC-FLT-014: TestRollbackJournalTruncationDetected verifies a truncated hot rollback journal is surfaced on recovery.
+func TestRollbackJournalTruncationDetected(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rollback-truncate.db")
+	key := "RollbackCorruptKey"
+
+	createRollbackRecoveryBase(t, dbPath, key)
+	spawnRollbackJournalHelper(t, dbPath)
+
+	journalPath := dbPath + "-journal"
+	info, err := os.Stat(journalPath)
+	if err != nil {
+		t.Fatalf("stat rollback journal: %v", err)
+	}
+	if info.Size() <= 128 {
+		t.Fatalf("expected rollback journal larger than 128 bytes, got %d", info.Size())
+	}
+	truncateTail(t, journalPath, 128)
+
+	assertRollbackRecoveryDegraded(t, dbPath, key)
+}
+
+// TC-FLT-015: TestCorruptionDoesNotReturnWrongData verifies page corruption never yields silently altered plaintext.
+func TestCorruptionDoesNotReturnWrongData(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "silent-corruption.db")
+	key := "SilentCorruptionKey"
+	expected := []string{
+		"alpha-record-000",
+		"beta-record-111",
+		"gamma-record-222",
+		"delta-record-333",
+		"epsilon-record-444",
+	}
+
+	db, err := encz.OpenEncz(dbPath, key)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE secure (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		db.Close()
+		t.Fatalf("create: %v", err)
+	}
+	for _, val := range expected {
+		if _, err := db.Exec(`INSERT INTO secure (val) VALUES (?)`, val); err != nil {
+			db.Close()
+			t.Fatalf("insert %q: %v", val, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	pageSize := readPageSize(t, dbPath, key)
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat db file: %v", err)
+	}
+	if info.Size() <= int64(pageSize)+256 {
+		t.Fatalf("expected database larger than one page, got %d bytes", info.Size())
+	}
+	offset := info.Size() - int64(pageSize/2)
+	tamperByte(t, dbPath, offset)
+
+	reopened, err := encz.OpenEncz(dbPath, key)
+	if err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("expected corruption-class error, got %v", err)
+	}
+	defer reopened.Close()
+
+	rows, err := reopened.Query(`SELECT val FROM secure ORDER BY id`)
+	if err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var val string
+		if err := rows.Scan(&val); err != nil {
+			if corruptionError(err) {
+				return
+			}
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, val)
+	}
+	if err := rows.Err(); err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("rows: %v", err)
+	}
+	if len(got) != len(expected) {
+		return
+	}
+	for i := range expected {
+		if got[i] != expected[i] {
+			t.Fatalf("silent corruption detected: row %d expected %q, got %q", i, expected[i], got[i])
+		}
+	}
+}
+
+// TC-FLT-012: TestWALTruncationDetected verifies a truncated WAL file is rejected or discarded during fresh recovery.
+func TestWALTruncationDetected(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		truncateBy int64
+	}{
+		{name: "MidFrame", truncateBy: 128},
+		{name: "TailFrame", truncateBy: 4096},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "wal-truncate.db")
+			key := "WALCorruptKey"
+
+			spawnWALHelper(t, dbPath)
+			walPath := dbPath + "-wal"
+			shmPath := dbPath + "-shm"
+			if err := os.Remove(shmPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("remove shm file: %v", err)
+			}
+			truncateTail(t, walPath, tc.truncateBy)
+
+			assertWALRecoveryDegraded(t, dbPath, key)
+		})
+	}
+}
+
+// TC-FLT-008: TestWALCorruptionDetected verifies a persisted WAL file is rejected or truncated during fresh recovery after tampering.
+func TestWALCorruptionDetected(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wal-corrupt.db")
+	key := "WALCorruptKey"
+
+	spawnWALHelper(t, dbPath)
+
+	walPath := dbPath + "-wal"
+	info, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat wal file: %v", err)
+	}
+	if info.Size() <= 56 {
+		t.Fatalf("expected wal file larger than 56 bytes, got %d", info.Size())
+	}
+	shmPath := dbPath + "-shm"
+	if err := os.Remove(shmPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("remove shm file: %v", err)
+	}
+	tamperByte(t, walPath, 48)
+
+	assertWALRecoveryDegraded(t, dbPath, key)
+}
+
+func createRollbackRecoveryBase(t *testing.T, dbPath, key string) {
+	t.Helper()
+
+	db, err := encz.OpenWithOptions(dbPath, encz.Options{Key: key, JournalMode: "DELETE"})
+	if err != nil {
+		t.Fatalf("open base db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE baseline (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		t.Fatalf("create baseline: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO baseline (val) VALUES ("before-crash")`); err != nil {
+		t.Fatalf("insert baseline: %v", err)
+	}
+}
+
+func spawnRollbackJournalHelper(t *testing.T, dbPath string) {
+	t.Helper()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("failed to find executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestRollbackJournalBitFlipDetected")
+	cmd.Env = append(os.Environ(), "GO_TEST_ROLLBACK_HELPER=1", "CRASH_DB_PATH="+dbPath)
+	setDeathSig(cmd)
+	if err := cmd.Run(); err == nil {
+		t.Fatal("expected rollback helper to be killed, but it exited cleanly")
+	}
+}
+
+func assertRollbackRecoveryDegraded(t *testing.T, dbPath, key string) {
+	t.Helper()
+
+	db, err := encz.OpenWithOptions(dbPath, encz.Options{Key: key, JournalMode: "DELETE"})
+	if err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("expected rollback corruption failure, got %v", err)
+	}
+	defer db.Close()
+
+	var val string
+	err = db.QueryRow(`SELECT val FROM baseline LIMIT 1`).Scan(&val)
+	if err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("read baseline: %v", err)
+	}
+	if val != "before-crash" {
+		t.Fatalf("expected preserved baseline row, got %q", val)
+	}
+
+	var count int
+	err = db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='rollback_pending'`).Scan(&count)
+	if err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("query rollback_pending existence: %v", err)
+	}
+	if count != 0 {
+		t.Fatal("expected uncommitted rollback_pending table to be absent after recovery")
+	}
+
+	var integrity string
+	err = db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
+	if err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("integrity_check: %v", err)
+	}
+	if integrity != "ok" {
+		return
+	}
+}
+
+func readPageSize(t *testing.T, dbPath, key string) int {
+	t.Helper()
+
+	db, err := encz.OpenEncz(dbPath, key)
+	if err != nil {
+		t.Fatalf("open for page size: %v", err)
+	}
+	defer db.Close()
+
+	var pageSize int
+	if err := db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		t.Fatalf("read page size: %v", err)
+	}
+	return pageSize
+}
+
+func spawnWALHelper(t *testing.T, dbPath string) {
+	t.Helper()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("failed to find executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestWALCorruptionDetected")
+	cmd.Env = append(os.Environ(), "GO_TEST_WAL_HELPER=1", "CRASH_DB_PATH="+dbPath)
+	setDeathSig(cmd)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("wal helper failed to run: %v", err)
+	}
+}
+
+func truncateTail(t *testing.T, path string, by int64) {
+	t.Helper()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if by <= 0 || by >= info.Size() {
+		t.Fatalf("invalid truncate amount %d for %s (%d bytes)", by, path, info.Size())
+	}
+	truncateToSize(t, path, info.Size()-by)
+}
+
+func truncateToSize(t *testing.T, path string, size int64) {
+	t.Helper()
+
+	if size < 0 {
+		t.Fatalf("invalid truncate target for %s: %d", path, size)
+	}
+	if err := os.Truncate(path, size); err != nil {
+		t.Fatalf("truncate %s to %d: %v", path, size, err)
+	}
+}
+
+func assertWALRecoveryDegraded(t *testing.T, dbPath, key string) {
+	t.Helper()
+
+	reader, err := encz.OpenWithOptions(dbPath, encz.Options{
+		Key:         key,
+		JournalMode: "WAL",
+	})
+	if err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("expected WAL corruption failure, got %v", err)
+	}
+	defer reader.Close()
+
+	var count int
+	err = reader.QueryRow(`SELECT count(*) FROM secure`).Scan(&count)
+	if err != nil {
+		if corruptionError(err) || strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return
+		}
+		t.Fatalf("expected corruption-class WAL error, got %v", err)
+	}
+	if count != 8 {
+		return
+	}
+
+	var integrity string
+	err = reader.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
+	if err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("expected corruption-class WAL error, got %v", err)
+	}
+	if integrity != "ok" {
+		return
+	}
+
+	t.Fatal("expected WAL corruption to cause a recovery failure, dropped frames, or a failed integrity check, but all rows remained readable")
+}
+
+func createLargeEncryptedDB(t *testing.T, dbPath, key string) int {
+	t.Helper()
+
+	db, err := encz.OpenEncz(dbPath, key)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`PRAGMA page_size = 4096`); err != nil {
+		t.Fatalf("set page size: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE secure (id INTEGER PRIMARY KEY, payload BLOB)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	payload := strings.Repeat("p", 3000)
+	for i := 0; i < 10; i++ {
+		if _, err := db.Exec(`INSERT INTO secure (payload) VALUES (?)`, fmt.Sprintf("%s-%d", payload, i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	var pageSize int
+	if err := db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		t.Fatalf("read page size: %v", err)
+	}
+	return pageSize
+}
+
+func tamperByte(t *testing.T, path string, offset int64) {
+	t.Helper()
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if offset < 0 || offset >= info.Size() {
+		t.Fatalf("offset %d out of bounds for %s (%d bytes)", offset, path, info.Size())
+	}
+
+	buf := make([]byte, 1)
+	if _, err := file.ReadAt(buf, offset); err != nil {
+		t.Fatalf("read byte %s@%d: %v", path, offset, err)
+	}
+	buf[0] ^= 0x01
+	if _, err := file.WriteAt(buf, offset); err != nil {
+		t.Fatalf("write byte %s@%d: %v", path, offset, err)
+	}
+}
+
+func assertEncryptedReadFails(t *testing.T, dbPath, key string) {
+	t.Helper()
+
+	db, err := encz.OpenEncz(dbPath, key)
+	if err != nil {
+		if corruptionError(err) {
+			return
+		}
+		t.Fatalf("expected corruption failure, got %v", err)
+	}
+	defer db.Close()
+
+	var count int
+	err = db.QueryRow(`SELECT count(*) FROM secure`).Scan(&count)
+	if err == nil {
+		var integrity string
+		err = db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
+	}
+	if err == nil {
+		t.Fatal("expected open or query to fail on corrupted database, but reads succeeded")
+	}
+	if !corruptionError(err) {
+		t.Fatalf("expected corruption-class error, got %v", err)
+	}
+}
+
+func corruptionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, encz.ErrManifestAuthFailed) || errors.Is(err, encz.ErrManifestInvalid) || errors.Is(err, encz.ErrManifestMismatch) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "corrupt") ||
+		strings.Contains(msg, "malformed") ||
+		strings.Contains(msg, "not a database") ||
+		strings.Contains(msg, "authentication") ||
+		strings.Contains(msg, "encrypt") ||
+		strings.Contains(msg, "decrypt")
+}
+
+func runRollbackJournalHelper() {
+	dbPath := os.Getenv("CRASH_DB_PATH")
+	if dbPath == "" {
+		return
+	}
+	key := "RollbackCorruptKey"
+	db, err := encz.OpenWithOptions(dbPath, encz.Options{Key: key, JournalMode: "DELETE"})
+	if err != nil {
+		os.Exit(2)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		os.Exit(3)
+	}
+	if _, err := tx.Exec(`CREATE TABLE rollback_pending (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		os.Exit(4)
+	}
+	payload := strings.Repeat("r", 3000)
+	for i := 0; i < 8; i++ {
+		if _, err := tx.Exec(`INSERT INTO rollback_pending (val) VALUES (?)`, fmt.Sprintf("%s-%d", payload, i)); err != nil {
+			os.Exit(5)
+		}
+	}
+	p, _ := os.FindProcess(os.Getpid())
+	_ = p.Kill()
+}
+
+func runWALHelper() {
+	dbPath := os.Getenv("CRASH_DB_PATH")
+	if dbPath == "" {
+		return
+	}
+	key := "WALCorruptKey"
+	db, err := encz.OpenWithOptions(dbPath, encz.Options{Key: key, JournalMode: "WAL"})
+	if err != nil {
+		os.Exit(2)
+	}
+	if _, err := db.Exec(`PRAGMA wal_autocheckpoint = 1000000`); err != nil {
+		os.Exit(3)
+	}
+	if _, err := db.Exec(`CREATE TABLE secure (id INTEGER PRIMARY KEY, payload BLOB)`); err != nil {
+		os.Exit(4)
+	}
+	payload := strings.Repeat("w", 3000)
+	for i := 0; i < 8; i++ {
+		if _, err := db.Exec(`INSERT INTO secure (payload) VALUES (?)`, fmt.Sprintf("%s-%d", payload, i)); err != nil {
+			os.Exit(5)
+		}
+	}
+	os.Exit(0)
+}
+
 func runExitZeroHelper() {
 	dbPath := os.Getenv("CRASH_DB_PATH")
 	if dbPath == "" {
@@ -339,6 +989,7 @@ func TestAbruptExitGrace(t *testing.T) {
 	}
 	cmd := exec.Command(exe, "-test.run=TestAbruptExitGrace")
 	cmd.Env = append(os.Environ(), "GO_TEST_EXIT_ZERO_HELPER=1", "CRASH_DB_PATH="+dbPath)
+	setDeathSig(cmd)
 	err = cmd.Run()
 	if err != nil {
 		t.Fatalf("helper process failed to run: %v", err)

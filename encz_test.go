@@ -402,6 +402,23 @@ func TestBackupCreatesArchiveAndRestores(t *testing.T) {
 			if err := TestBackup(archivePath, key, extractDir); err != nil {
 				t.Fatalf("testBackup: %v", err)
 			}
+
+			// Test RestoreBackup
+			restoreDir := filepath.Join(tempDir, "restore_backup_func")
+			if err := RestoreBackup(archivePath, key, restoreDir, false); err != nil {
+				t.Fatalf("RestoreBackup (overwrite=false, new dir) failed: %v", err)
+			}
+
+			// Should fail when trying to restore again to the same folder with overwrite=false
+			if err := RestoreBackup(archivePath, key, restoreDir, false); err == nil {
+				t.Fatalf("RestoreBackup (overwrite=false, existing dir) expected error but succeeded")
+			}
+
+			// Should succeed when trying to restore again to the same folder with overwrite=true
+			if err := RestoreBackup(archivePath, key, restoreDir, true); err != nil {
+				t.Fatalf("RestoreBackup (overwrite=true, existing dir) failed: %v", err)
+			}
+
 			restoredDBPath := filepath.Join(extractDir, expectedDBName)
 			reopened, err := OpenEncz(restoredDBPath, key)
 			if err != nil {
