@@ -1,0 +1,9 @@
+encz-sqlite.db
+encz-sqlite.db-shm
+encz-sqlite.db-wal
+encz-sqlite.db.encz
+plain-sqlite.db
+plain-sqlite.db-shm
+plain-sqlite.db-wal
+encz-vs-sqlite.log
+test-encz-vs-sqlite

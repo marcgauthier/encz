@@ -1,0 +1,76 @@
+# Path to the ENCZ encrypted database file
+encz_db_path: ./encz-sqlite.db
+
+# Path to the plain SQLite database file used as the comparison baseline
+sqlite_db_path: ./plain-sqlite.db
+
+# Encryption password used by ENCZ to secure the encrypted database
+encz_password: ENCzTestPassword123!
+
+# SQLite journal mode to use (e.g. DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF)
+journal_mode: WAL
+
+# Maximum duration to run the overall test session (e.g. 5h, 30m)
+max_run_time: 5h
+
+# Interval at which concurrent workers schedule SQL actions (select, insert, update, delete)
+action_interval: 50ms
+
+# Interval at which the runner pauses workers to perform a full database comparison
+compare_interval: 10m
+
+# Interval at which the runner closes and reconnects to the databases (restart simulation)
+reopen_interval: 15m
+
+# Interval at which the runner pauses workers to perform a backup/restore integrity verification
+backup_interval: 90m
+
+# Interval at which the runner pauses workers to perform a database rekey validation
+rekey_interval: 45m
+
+# Interval at which the runner pauses workers to perform a complex SQL queries validation
+complex_query_interval: 60m
+
+# Interval at which the runner pauses workers to perform a large transaction commit validation
+large_tx_interval: 60m
+
+# Number of concurrent worker goroutines executing database actions
+worker_count: 8
+
+# Path to the log file where all runner events, queries, and mismatch errors are logged
+log_file: ./encz-vs-sqlite.log
+
+# Seed used to initialize the pseudorandom generator (ensures reproducible fake data generation)
+seed: 1337
+
+# Percentage of write operations (inserts/updates) generated with invalid/constraint-violating values
+invalid_write_pct: 2
+
+# Interval at which the runner pauses workers to perform a random schema change (add/drop tables, columns, indexes)
+schema_change_interval: 1h
+
+# Maximum database file size on disk. If exceeded, 50% of deletable items are pruned and VACUUM is run (e.g. 1GB, 500MB)
+max_db_size: 1GB
+
+
+# Key rotation settings for the ENCZ encrypted database engine
+rotation_policy:
+  # Interval in days after which the Key Encryption Key (KEK) is rotated
+  kek_rotation_days: 7
+  # Interval after which the Data Encryption Key (DEK) is rotated (must be multiples of 1h)
+  dek_rotation: 1h
+  # If true, automatically re-encrypts metadata and keys when keys are rotated
+  auto_rewrap: true
+  # If true, keeps previous keys active in memory to decrypt older pages
+  keep_previous_key: true
+
+# The distribution percentage of operations executed by the workers (must sum to 100)
+workload_mix:
+  # Percentage of select operations
+  select_pct: 60
+  # Percentage of insert operations
+  insert_pct: 10
+  # Percentage of update operations
+  update_pct: 20
+  # Percentage of delete operations
+  delete_pct: 10
