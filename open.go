@@ -11,30 +11,33 @@ import (
 type DB struct {
 	*sql.DB
 
-	mu           sync.RWMutex
-	path         string
-	manifestPath string
-	key          *memguard.LockedBuffer
-	closed       bool
+	mu             sync.RWMutex
+	path           string
+	manifestPath   string
+	key            *memguard.LockedBuffer
+	registryHandle uint64
+	closed         bool
 }
 
 func OpenWithOptions(path string, opts Options) (*DB, error) {
 	if err := mustRegister(); err != nil {
 		return nil, err
 	}
-	resolved, manifestPath, err := resolveOpenOptions(path, opts)
+	resolved, manifestPath, registryHandle, err := resolveOpenOptions(path, opts)
 	if err != nil {
 		return nil, err
 	}
 	sqlDB, err := openSQLDB(BuildDSN(path, resolved))
 	if err != nil {
+		destroyKeyRegistry(registryHandle)
 		return nil, err
 	}
 	return &DB{
-		DB:           sqlDB,
-		path:         path,
-		manifestPath: manifestPath,
-		key:          memguard.NewBufferFromBytes([]byte(opts.Key)),
+		DB:             sqlDB,
+		path:           path,
+		manifestPath:   manifestPath,
+		key:            memguard.NewBufferFromBytes([]byte(opts.Key)),
+		registryHandle: registryHandle,
 	}, nil
 }
 
@@ -64,8 +67,14 @@ func (db *DB) Close() error {
 		db.key = nil
 	}
 	sqlDB := db.DB
+	registryHandle := db.registryHandle
+	db.registryHandle = 0
 	db.mu.Unlock()
-	return sqlDB.Close()
+	err := sqlDB.Close()
+	if registryHandle != 0 {
+		destroyKeyRegistry(registryHandle)
+	}
+	return err
 }
 
 func (db *DB) ReKey(oldKey, newKey string) error {
@@ -98,6 +107,7 @@ func (db *DB) ReKey(oldKey, newKey string) error {
 		db.key.Destroy()
 	}
 	db.key = memguard.NewBufferFromBytes([]byte(newKey))
+	updateKeyRegistryMasterKey(db.registryHandle, db.key)
 	return nil
 }
 
@@ -119,7 +129,7 @@ func (db *DB) SetRotationPolicy(policy RotationPolicy) error {
 	if err := saveManifest(db.manifestPath, db.key, payload); err != nil {
 		return err
 	}
-	return nil
+	return updateKeyRegistryManifest(db.registryHandle, payload, policy)
 }
 
 func (db *DB) RotationStatus() (RotationInfo, error) {

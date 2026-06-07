@@ -72,7 +72,7 @@ func (db *DB) Backup(toFile string, opts BackupOptions) (err error) {
 		return ErrManifestMissing
 	}
 
-	payload, _, err := loadManifest(db.manifestPath, db.key)
+	payload, policy, err := loadManifest(db.manifestPath, db.key)
 	if err != nil {
 		return err
 	}
@@ -113,10 +113,12 @@ func (db *DB) Backup(toFile string, opts BackupOptions) (err error) {
 		}
 	}
 
-	backupDSN := BuildDSN(backupDBPath, Options{URIParameters: map[string]string{
-		"vfs":            "encz",
-		"crypto_key_hex": payload.ActiveDEKHex,
-	}})
+	backupHandle, err := registerKeyRegistry(backupManifestPath, db.key, payload, policy, false)
+	if err != nil {
+		return err
+	}
+	defer destroyKeyRegistry(backupHandle)
+	backupDSN := BuildDSN(backupDBPath, applyRegistryToOptions(Options{}, backupHandle))
 	destDB, err := openSQLDB(backupDSN)
 	if err != nil {
 		return err
@@ -166,7 +168,10 @@ func backupTempDBPath(dbPath, archivePath string) string {
 	return filepath.Join(filepath.Dir(dbPath), name+".bak")
 }
 
-func testBackup(file, masterKey, tempFolder string) error {
+// TestBackup decrypts an encrypted backup container, extracts its contents into
+// tempFolder, and verifies the extracted backup opens successfully with the
+// DEK recovered from the manifest using masterKey.
+func TestBackup(file, masterKey, tempFolder string) error {
 	if strings.TrimSpace(file) == "" {
 		return ErrBackupTargetRequired
 	}
@@ -190,15 +195,17 @@ func testBackup(file, masterKey, tempFolder string) error {
 	keyBuf := memguard.NewBufferFromBytes([]byte(masterKey))
 	defer keyBuf.Destroy()
 
-	payload, _, err := loadManifest(manifestPath, keyBuf)
+	payload, policy, err := loadManifest(manifestPath, keyBuf)
 	if err != nil {
 		return err
 	}
 
-	backupDSN := BuildDSN(dbPath, Options{URIParameters: map[string]string{
-		"vfs":            "encz",
-		"crypto_key_hex": payload.ActiveDEKHex,
-	}})
+	handle, err := registerKeyRegistry(manifestPath, keyBuf, payload, policy, false)
+	if err != nil {
+		return err
+	}
+	defer destroyKeyRegistry(handle)
+	backupDSN := BuildDSN(dbPath, applyRegistryToOptions(Options{}, handle))
 	opened, err := openSQLDB(backupDSN)
 	if err != nil {
 		return err

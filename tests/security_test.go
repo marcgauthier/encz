@@ -125,8 +125,8 @@ func TestHeaderSecrecy(t *testing.T) {
 	if !bytes.Equal(data[:len(sqliteMagic)], sqliteMagic) {
 		t.Fatal("expected SQLite header magic string to remain present on disk")
 	}
-	if len(data) <= 20 || data[20] != 32 {
-		t.Fatalf("expected reserved-byte header field to be 32, got %d", data[20])
+	if len(data) <= 20 || data[20] != 36 {
+		t.Fatalf("expected reserved-byte header field to be 36, got %d", data[20])
 	}
 }
 

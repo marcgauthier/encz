@@ -12,7 +12,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/awnumar/memguard"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -238,6 +240,79 @@ func TestSetRotationPolicyPersists(t *testing.T) {
 	}
 }
 
+func TestDEKRotationAppendsManifestKey(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "dek-rotation.db")
+	masterKey := "RotateDEKPass123"
+
+	db, err := OpenEncz(dbPath, masterKey)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`); err != nil {
+		db.Close()
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO items(name) VALUES (?)`, "before-rotation"); err != nil {
+		db.Close()
+		t.Fatalf("insert row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	keyBuf := memguard.NewBufferFromBytes([]byte(masterKey))
+	defer keyBuf.Destroy()
+	manifestPath := dbPath + ".encz"
+	payload, _, err := loadManifest(manifestPath, keyBuf)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	payload.LastDEKRotationAt = payload.CreatedAt.Add(-48 * time.Hour)
+	payload.NextDEKRotationDueAt = timeNowUTC().Add(-time.Hour)
+	if err := saveManifest(manifestPath, keyBuf, payload); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+
+	reopened, err := OpenEncz(dbPath, masterKey)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, err := reopened.Exec(`INSERT INTO items(name) VALUES (?)`, "after-rotation"); err != nil {
+		reopened.Close()
+		t.Fatalf("insert after rotation: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened: %v", err)
+	}
+
+	updatedPayload, _, err := loadManifest(manifestPath, keyBuf)
+	if err != nil {
+		t.Fatalf("reload manifest: %v", err)
+	}
+	if len(updatedPayload.DEKs) != 2 {
+		t.Fatalf("expected 2 DEKs after rotation, got %d", len(updatedPayload.DEKs))
+	}
+	if updatedPayload.ActiveDEKKeyID != 1 {
+		t.Fatalf("expected active DEK key id 1, got %d", updatedPayload.ActiveDEKKeyID)
+	}
+	if !updatedPayload.LastDEKRotationAt.After(payload.LastDEKRotationAt) {
+		t.Fatal("expected LastDEKRotationAt to advance")
+	}
+
+	verify, err := OpenEncz(dbPath, masterKey)
+	if err != nil {
+		t.Fatalf("open for verify: %v", err)
+	}
+	defer verify.Close()
+	var count int
+	if err := verify.QueryRow(`SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 rows after DEK rotation, got %d", count)
+	}
+}
+
 func TestHandleMethodsFailAfterClose(t *testing.T) {
 	db, err := OpenEncz(filepath.Join(t.TempDir(), "closed.db"), "ClosedPass")
 	if err != nil {
@@ -324,7 +399,7 @@ func TestBackupCreatesArchiveAndRestores(t *testing.T) {
 			}
 
 			extractDir := filepath.Join(tempDir, "restore")
-			if err := testBackup(archivePath, key, extractDir); err != nil {
+			if err := TestBackup(archivePath, key, extractDir); err != nil {
 				t.Fatalf("testBackup: %v", err)
 			}
 			restoredDBPath := filepath.Join(extractDir, expectedDBName)

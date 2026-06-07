@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -19,15 +20,16 @@ import (
 )
 
 const (
-	manifestMagic                 = "ENCZK1"
-	manifestVersion               = 1
-	manifestSaltSize              = 16
-	manifestNonceSize             = 12
-	manifestKEKSize               = 32
-	defaultKEKRotationDays        = 7
-	defaultArgonTime       uint32 = 3
-	defaultArgonMemory     uint32 = 64 * 1024
-	defaultArgonThreads    uint8  = 4
+	manifestMagic                  = "ENCZK1"
+	manifestVersion                = 1
+	manifestSaltSize               = 16
+	manifestNonceSize              = 12
+	manifestKEKSize                = 32
+	defaultKEKRotationDays         = 7
+	defaultDEKRotationHours        = 24
+	defaultArgonTime        uint32 = 3
+	defaultArgonMemory      uint32 = 64 * 1024
+	defaultArgonThreads     uint8  = 4
 )
 
 var (
@@ -44,19 +46,25 @@ var (
 )
 
 type RotationPolicy struct {
-	KEKRotationDays int
-	AutoRewrap      bool
-	KeepPreviousKey bool
+	KEKRotationDays  int
+	DEKRotationHours int
+	AutoRewrap       bool
+	KeepPreviousKey  bool
 }
 
 type RotationInfo struct {
 	ManifestPath         string
 	Exists               bool
 	KEKRotationDue       bool
+	DEKRotationDue       bool
 	LastKEKRotationAt    time.Time
 	NextKEKRotationDueAt time.Time
 	KEKRotationDays      int
-	ActiveDEKID          string
+	LastDEKRotationAt    time.Time
+	NextDEKRotationDueAt time.Time
+	DEKRotationHours     int
+	ActiveDEKKeyID       uint32
+	DEKCount             int
 	HasPreviousKey       bool
 	AutoRewrap           bool
 	KeepPreviousKey      bool
@@ -72,85 +80,104 @@ type manifestHeader struct {
 }
 
 type manifestKeySlot struct {
-	DEKID    string    `json:"dek_id"`
+	KeyID    uint32    `json:"key_id"`
 	DEKHex   string    `json:"dek_hex"`
 	StoredAt time.Time `json:"stored_at"`
 }
 
+type manifestDEK struct {
+	KeyID     uint32    `json:"key_id"`
+	DEKHex    string    `json:"dek_hex"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type manifestPayload struct {
 	DBUUID               string           `json:"db_uuid"`
-	ActiveDEKID          string           `json:"active_dek_id"`
-	ActiveDEKHex         string           `json:"active_dek_hex"`
+	ActiveDEKKeyID       uint32           `json:"active_dek_key_id"`
+	DEKs                 []manifestDEK    `json:"deks"`
 	CreatedAt            time.Time        `json:"created_at"`
 	LastKEKRotationAt    time.Time        `json:"last_kek_rotation_at"`
 	NextKEKRotationDueAt time.Time        `json:"next_kek_rotation_due_at"`
+	LastDEKRotationAt    time.Time        `json:"last_dek_rotation_at"`
+	NextDEKRotationDueAt time.Time        `json:"next_dek_rotation_due_at"`
 	KEKRotationDays      int              `json:"kek_rotation_days"`
+	DEKRotationHours     int              `json:"dek_rotation_hours"`
 	AutoRewrap           *bool            `json:"auto_rewrap,omitempty"`
 	KeepPreviousKey      *bool            `json:"keep_previous_key,omitempty"`
 	PreviousKeySlot      *manifestKeySlot `json:"previous_key_slot,omitempty"`
 }
 
-func resolveOpenOptions(path string, opts Options) (Options, string, error) {
+func resolveOpenOptions(path string, opts Options) (Options, string, uint64, error) {
 	if opts.Key == "" {
-		return Options{}, "", ErrKeyRequired
+		return Options{}, "", 0, ErrKeyRequired
 	}
 	if hasDirectKeyConfig(opts) {
-		return Options{}, "", ErrDirectKeyUnsupported
+		return Options{}, "", 0, ErrDirectKeyUnsupported
 	}
 	if isMemoryPath(path, opts) {
-		return Options{}, "", ErrFileBackedRequired
+		return Options{}, "", 0, ErrFileBackedRequired
 	}
 
 	manifestPath := manifestPathFor(path, opts)
 	dbExists, err := fileExists(path)
 	if err != nil {
-		return Options{}, "", err
+		return Options{}, "", 0, err
 	}
 	manifestExists, err := fileExists(manifestPath)
 	if err != nil {
-		return Options{}, "", err
+		return Options{}, "", 0, err
 	}
 	createAllowed := modeAllowsCreate(opts)
 
 	keyBuf := memguard.NewBufferFromBytes([]byte(opts.Key))
 	defer keyBuf.Destroy()
 
+	var (
+		payload manifestPayload
+		policy  RotationPolicy
+	)
+
 	if !dbExists && !manifestExists {
 		if !createAllowed {
-			return Options{}, "", os.ErrNotExist
+			return Options{}, "", 0, os.ErrNotExist
 		}
-		policy, err := normalizeCreateRotationPolicy(opts.RotationPolicy)
+		policy, err = normalizeCreateRotationPolicy(opts.RotationPolicy)
 		if err != nil {
-			return Options{}, "", err
+			return Options{}, "", 0, err
 		}
-		payload, err := newManifestPayload(policy, timeNowUTC())
+		payload, err = newManifestPayload(policy, timeNowUTC())
 		if err != nil {
-			return Options{}, "", err
+			return Options{}, "", 0, err
 		}
 		if err := saveManifest(manifestPath, keyBuf, payload); err != nil {
-			return Options{}, "", err
+			return Options{}, "", 0, err
 		}
-		return applyDEKToOptions(opts, payload.ActiveDEKHex), manifestPath, nil
-	}
-	if dbExists && !manifestExists {
-		return Options{}, "", ErrManifestMissing
-	}
-	if !dbExists && manifestExists {
-		return Options{}, "", ErrManifestMismatch
+	} else {
+		if dbExists && !manifestExists {
+			return Options{}, "", 0, ErrManifestMissing
+		}
+		if !dbExists && manifestExists {
+			return Options{}, "", 0, ErrManifestMismatch
+		}
+
+		payload, policy, err = loadManifest(manifestPath, keyBuf)
+		if err != nil {
+			return Options{}, "", 0, err
+		}
+		now := timeNowUTC()
+		if policy.AutoRewrap && rotationDue(payload, now) {
+			applyKEKRotation(&payload, policy, now)
+			if err := saveManifest(manifestPath, keyBuf, payload); err != nil {
+				return Options{}, "", 0, err
+			}
+		}
 	}
 
-	payload, policy, err := loadManifest(manifestPath, keyBuf)
+	handle, err := registerKeyRegistry(manifestPath, keyBuf, payload, policy, true)
 	if err != nil {
-		return Options{}, "", err
+		return Options{}, "", 0, err
 	}
-	now := timeNowUTC()
-	if policy.AutoRewrap && rotationDue(payload, now) {
-		applyKEKRotation(&payload, policy, now)
-		if err := saveManifest(manifestPath, keyBuf, payload); err != nil {
-			return Options{}, "", err
-		}
-	}
-	return applyDEKToOptions(opts, payload.ActiveDEKHex), manifestPath, nil
+	return applyRegistryToOptions(opts, handle), manifestPath, handle, nil
 }
 
 func fileExists(path string) (bool, error) {
@@ -206,22 +233,24 @@ func cloneURIParameters(src map[string]string) map[string]string {
 	return out
 }
 
-func applyDEKToOptions(opts Options, dekHex string) Options {
+func applyRegistryToOptions(opts Options, handle uint64) Options {
 	resolved := opts
 	resolved.Key = ""
 	resolved.URIParameters = cloneURIParameters(opts.URIParameters)
 	resolved.URIParameters["vfs"] = "encz"
-	resolved.URIParameters["crypto_key_hex"] = dekHex
+	resolved.URIParameters["encz_registry"] = strconv.FormatUint(handle, 10)
 	delete(resolved.URIParameters, "crypto_key")
+	delete(resolved.URIParameters, "crypto_key_hex")
 	delete(resolved.URIParameters, "crypto_key_env")
 	return resolved
 }
 
 func defaultRotationPolicy() RotationPolicy {
 	return RotationPolicy{
-		KEKRotationDays: defaultKEKRotationDays,
-		AutoRewrap:      true,
-		KeepPreviousKey: true,
+		KEKRotationDays:  defaultKEKRotationDays,
+		DEKRotationHours: defaultDEKRotationHours,
+		AutoRewrap:       true,
+		KeepPreviousKey:  true,
 	}
 }
 
@@ -230,20 +259,30 @@ func normalizeCreateRotationPolicy(policy *RotationPolicy) (RotationPolicy, erro
 	if policy == nil {
 		return out, nil
 	}
-	if policy.KEKRotationDays <= 0 {
+	if policy.KEKRotationDays > 0 {
+		out.KEKRotationDays = policy.KEKRotationDays
+	} else if policy.KEKRotationDays < 0 {
 		return RotationPolicy{}, fmt.Errorf("%w: KEKRotationDays must be greater than zero", ErrRotationPolicyInvalid)
 	}
-	out.KEKRotationDays = policy.KEKRotationDays
+	if policy.DEKRotationHours > 0 {
+		out.DEKRotationHours = policy.DEKRotationHours
+	} else if policy.DEKRotationHours < 0 {
+		return RotationPolicy{}, fmt.Errorf("%w: DEKRotationHours must be greater than zero", ErrRotationPolicyInvalid)
+	}
 	out.AutoRewrap = policy.AutoRewrap
 	out.KeepPreviousKey = policy.KeepPreviousKey
 	return out, nil
 }
 
 func validateRotationPolicy(policy RotationPolicy) (RotationPolicy, error) {
-	if policy.KEKRotationDays <= 0 {
+	out := policy
+	if out.KEKRotationDays <= 0 {
 		return RotationPolicy{}, fmt.Errorf("%w: KEKRotationDays must be greater than zero", ErrRotationPolicyInvalid)
 	}
-	return policy, nil
+	if out.DEKRotationHours <= 0 {
+		out.DEKRotationHours = defaultDEKRotationHours
+	}
+	return out, nil
 }
 
 func newManifestPayload(policy RotationPolicy, now time.Time) (manifestPayload, error) {
@@ -257,12 +296,15 @@ func newManifestPayload(policy RotationPolicy, now time.Time) (manifestPayload, 
 	}
 	payload := manifestPayload{
 		DBUUID:               dbUUID,
-		ActiveDEKID:          "dek-" + now.UTC().Format("20060102T150405Z"),
-		ActiveDEKHex:         dekHex,
+		ActiveDEKKeyID:       0,
+		DEKs:                 []manifestDEK{{KeyID: 0, DEKHex: dekHex, CreatedAt: now}},
 		CreatedAt:            now,
 		LastKEKRotationAt:    now,
 		NextKEKRotationDueAt: now.Add(time.Duration(policy.KEKRotationDays) * 24 * time.Hour),
+		LastDEKRotationAt:    now,
+		NextDEKRotationDueAt: now.Add(time.Duration(policy.DEKRotationHours) * time.Hour),
 		KEKRotationDays:      policy.KEKRotationDays,
+		DEKRotationHours:     policy.DEKRotationHours,
 	}
 	applyRotationPolicy(&payload, policy)
 	return payload, nil
@@ -270,6 +312,7 @@ func newManifestPayload(policy RotationPolicy, now time.Time) (manifestPayload, 
 
 func applyRotationPolicy(payload *manifestPayload, policy RotationPolicy) {
 	payload.KEKRotationDays = policy.KEKRotationDays
+	payload.DEKRotationHours = policy.DEKRotationHours
 	payload.AutoRewrap = boolPtr(policy.AutoRewrap)
 	payload.KeepPreviousKey = boolPtr(policy.KeepPreviousKey)
 	if !policy.KeepPreviousKey {
@@ -278,15 +321,19 @@ func applyRotationPolicy(payload *manifestPayload, policy RotationPolicy) {
 	if !payload.LastKEKRotationAt.IsZero() {
 		payload.NextKEKRotationDueAt = payload.LastKEKRotationAt.Add(time.Duration(policy.KEKRotationDays) * 24 * time.Hour)
 	}
+	if !payload.LastDEKRotationAt.IsZero() {
+		payload.NextDEKRotationDueAt = payload.LastDEKRotationAt.Add(time.Duration(policy.DEKRotationHours) * time.Hour)
+	}
 }
 
 func applyKEKRotation(payload *manifestPayload, policy RotationPolicy, now time.Time) {
 	applyRotationPolicy(payload, policy)
 	if policy.KeepPreviousKey {
-		payload.PreviousKeySlot = &manifestKeySlot{
-			DEKID:    payload.ActiveDEKID,
-			DEKHex:   payload.ActiveDEKHex,
-			StoredAt: payload.LastKEKRotationAt,
+		active, ok := activeDEKFromPayload(payload)
+		if ok {
+			payload.PreviousKeySlot = &manifestKeySlot{KeyID: active.KeyID, DEKHex: active.DEKHex, StoredAt: payload.LastKEKRotationAt}
+		} else {
+			payload.PreviousKeySlot = nil
 		}
 	} else {
 		payload.PreviousKeySlot = nil
@@ -313,15 +360,24 @@ func loadManifest(path string, passphrase *memguard.LockedBuffer) (manifestPaylo
 	if err := json.Unmarshal(plain, &payload); err != nil {
 		return payload, RotationPolicy{}, ErrManifestInvalid
 	}
-	if payload.ActiveDEKHex == "" || payload.ActiveDEKID == "" || payload.KEKRotationDays <= 0 {
+	if len(payload.DEKs) == 0 || payload.KEKRotationDays <= 0 {
 		return payload, RotationPolicy{}, ErrManifestInvalid
 	}
 	policy := policyFromPayload(payload)
+	if _, ok := activeDEKFromPayload(&payload); !ok {
+		return payload, RotationPolicy{}, ErrManifestInvalid
+	}
 	if payload.LastKEKRotationAt.IsZero() {
 		payload.LastKEKRotationAt = payload.CreatedAt
 	}
 	if payload.NextKEKRotationDueAt.IsZero() {
 		payload.NextKEKRotationDueAt = payload.LastKEKRotationAt.Add(time.Duration(policy.KEKRotationDays) * 24 * time.Hour)
+	}
+	if payload.LastDEKRotationAt.IsZero() {
+		payload.LastDEKRotationAt = payload.CreatedAt
+	}
+	if payload.NextDEKRotationDueAt.IsZero() {
+		payload.NextDEKRotationDueAt = payload.LastDEKRotationAt.Add(time.Duration(policy.DEKRotationHours) * time.Hour)
 	}
 	return payload, policy, nil
 }
@@ -450,6 +506,25 @@ func randomID() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
+func activeDEKFromPayload(payload *manifestPayload) (manifestDEK, bool) {
+	for _, dek := range payload.DEKs {
+		if dek.KeyID == payload.ActiveDEKKeyID {
+			return dek, true
+		}
+	}
+	return manifestDEK{}, false
+}
+
+func nextManifestKeyID(payload manifestPayload) uint32 {
+	var maxID uint32
+	for _, dek := range payload.DEKs {
+		if dek.KeyID > maxID {
+			maxID = dek.KeyID
+		}
+	}
+	return maxID + 1
+}
+
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -497,6 +572,9 @@ func syncParentDir(dir string) error {
 func policyFromPayload(payload manifestPayload) RotationPolicy {
 	policy := defaultRotationPolicy()
 	policy.KEKRotationDays = payload.KEKRotationDays
+	if payload.DEKRotationHours > 0 {
+		policy.DEKRotationHours = payload.DEKRotationHours
+	}
 	policy.AutoRewrap = storedBool(payload.AutoRewrap, policy.AutoRewrap)
 	policy.KeepPreviousKey = storedBool(payload.KeepPreviousKey, payload.PreviousKeySlot != nil || policy.KeepPreviousKey)
 	return policy
@@ -517,16 +595,25 @@ func rotationDue(payload manifestPayload, now time.Time) bool {
 	return now.After(payload.NextKEKRotationDueAt) || now.Equal(payload.NextKEKRotationDueAt)
 }
 
+func dekRotationDue(payload manifestPayload, now time.Time) bool {
+	return now.After(payload.NextDEKRotationDueAt) || now.Equal(payload.NextDEKRotationDueAt)
+}
+
 func rotationInfoFromPayload(manifestPath string, payload manifestPayload, policy RotationPolicy) RotationInfo {
 	now := timeNowUTC()
 	return RotationInfo{
 		ManifestPath:         manifestPath,
 		Exists:               true,
 		KEKRotationDue:       rotationDue(payload, now),
+		DEKRotationDue:       dekRotationDue(payload, now),
 		LastKEKRotationAt:    payload.LastKEKRotationAt,
 		NextKEKRotationDueAt: payload.NextKEKRotationDueAt,
 		KEKRotationDays:      payload.KEKRotationDays,
-		ActiveDEKID:          payload.ActiveDEKID,
+		LastDEKRotationAt:    payload.LastDEKRotationAt,
+		NextDEKRotationDueAt: payload.NextDEKRotationDueAt,
+		DEKRotationHours:     payload.DEKRotationHours,
+		ActiveDEKKeyID:       payload.ActiveDEKKeyID,
+		DEKCount:             len(payload.DEKs),
 		HasPreviousKey:       payload.PreviousKeySlot != nil,
 		AutoRewrap:           policy.AutoRewrap,
 		KeepPreviousKey:      policy.KeepPreviousKey,
