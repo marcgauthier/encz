@@ -263,8 +263,8 @@ type dbState struct {
 }
 
 type tableRows struct {
-	IDs  []int64
-	Rows map[int64]map[string]any
+	IDs  []string
+	Rows map[string]map[string]any
 }
 
 func newDBState(tables []*tableSpec) *dbState {
@@ -273,7 +273,7 @@ func newDBState(tables []*tableSpec) *dbState {
 		specs:  tables,
 	}
 	for _, table := range tables {
-		out.tables[table.Name] = &tableRows{Rows: make(map[int64]map[string]any)}
+		out.tables[table.Name] = &tableRows{Rows: make(map[string]map[string]any)}
 	}
 	return out
 }
@@ -286,7 +286,7 @@ func cloneRow(src map[string]any) map[string]any {
 	return out
 }
 
-func (s *dbState) AddRow(table string, id int64, row map[string]any) {
+func (s *dbState) AddRow(table string, id string, row map[string]any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ts := s.tables[table]
@@ -296,7 +296,7 @@ func (s *dbState) AddRow(table string, id int64, row map[string]any) {
 	ts.Rows[id] = cloneRow(row)
 }
 
-func (s *dbState) UpdateRow(table string, id int64, changes map[string]any) {
+func (s *dbState) UpdateRow(table string, id string, changes map[string]any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ts := s.tables[table]
@@ -309,13 +309,13 @@ func (s *dbState) UpdateRow(table string, id int64, changes map[string]any) {
 	}
 }
 
-func (s *dbState) DeleteRow(table string, id int64) {
+func (s *dbState) DeleteRow(table string, id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deleteRowLocked(table, id)
 }
 
-func (s *dbState) deleteRowLocked(tableName string, id int64) {
+func (s *dbState) deleteRowLocked(tableName string, id string) {
 	ts := s.tables[tableName]
 	if ts == nil {
 		return
@@ -338,22 +338,11 @@ func (s *dbState) deleteRowLocked(tableName string, id int64) {
 				if childTable == nil {
 					continue
 				}
-				var childIDsToDelete []int64
+				var childIDsToDelete []string
 				for childID, row := range childTable.Rows {
 					val, ok := row[col.Name]
 					if ok {
-						var valInt64 int64
-						switch v := val.(type) {
-						case int:
-							valInt64 = int64(v)
-						case int64:
-							valInt64 = v
-						case float64:
-							valInt64 = int64(v)
-						default:
-							continue
-						}
-						if valInt64 == id {
+						if normalizeValue(val) == normalizeValue(id) {
 							childIDsToDelete = append(childIDsToDelete, childID)
 						}
 					}
@@ -366,22 +355,22 @@ func (s *dbState) deleteRowLocked(tableName string, id int64) {
 	}
 }
 
-func (s *dbState) RandomID(table string, rnd *rand.Rand) (int64, bool) {
+func (s *dbState) RandomID(table string, rnd *rand.Rand) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ts := s.tables[table]
 	if len(ts.IDs) == 0 {
-		return 0, false
+		return "", false
 	}
 	return ts.IDs[rnd.Intn(len(ts.IDs))], true
 }
 
-func (s *dbState) RandomRow(table string, rnd *rand.Rand) (int64, map[string]any, bool) {
+func (s *dbState) RandomRow(table string, rnd *rand.Rand) (string, map[string]any, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ts := s.tables[table]
 	if len(ts.IDs) == 0 {
-		return 0, nil, false
+		return "", nil, false
 	}
 	id := ts.IDs[rnd.Intn(len(ts.IDs))]
 	return id, cloneRow(ts.Rows[id]), true
@@ -462,6 +451,8 @@ type runner struct {
 	actionNo         atomic.Uint64
 	paused           atomic.Bool
 	phaseMu          sync.RWMutex
+	tableLocksMu     sync.Mutex
+	tableLocks       map[string]*sync.RWMutex
 	sem              chan struct{}
 	nextCompare      time.Time
 	nextReopen       time.Time
@@ -474,6 +465,96 @@ type runner struct {
 	runDeadline      time.Time
 	shutdownOnce     sync.Once
 	dynamicIndexes   map[string][]string
+}
+
+func (r *runner) ensureTableLock(table string) *sync.RWMutex {
+	r.tableLocksMu.Lock()
+	defer r.tableLocksMu.Unlock()
+	lock := r.tableLocks[table]
+	if lock == nil {
+		lock = &sync.RWMutex{}
+		r.tableLocks[table] = lock
+	}
+	return lock
+}
+
+func (r *runner) dropTableLock(table string) {
+	r.tableLocksMu.Lock()
+	defer r.tableLocksMu.Unlock()
+	delete(r.tableLocks, table)
+}
+
+func uniqueSorted(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(names))
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (r *runner) withTableLocks(writeTables, readTables []string, fn func()) {
+	writeSet := make(map[string]struct{}, len(writeTables))
+	for _, table := range writeTables {
+		writeSet[table] = struct{}{}
+	}
+	all := append(append([]string{}, writeTables...), readTables...)
+	for _, table := range uniqueSorted(all) {
+		lock := r.ensureTableLock(table)
+		if _, ok := writeSet[table]; ok {
+			lock.Lock()
+		} else {
+			lock.RLock()
+		}
+	}
+	defer func() {
+		for i := len(uniqueSorted(all)) - 1; i >= 0; i-- {
+			table := uniqueSorted(all)[i]
+			lock := r.ensureTableLock(table)
+			if _, ok := writeSet[table]; ok {
+				lock.Unlock()
+			} else {
+				lock.RUnlock()
+			}
+		}
+	}()
+	fn()
+}
+
+func (r *runner) tablesAffectedByDelete(tableName string) []string {
+	seen := map[string]struct{}{tableName: {}}
+	queue := []string{tableName}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, spec := range r.tables {
+			for _, col := range spec.Columns {
+				if col.RefTable != current {
+					continue
+				}
+				if _, ok := seen[spec.Name]; ok {
+					continue
+				}
+				seen[spec.Name] = struct{}{}
+				queue = append(queue, spec.Name)
+				break
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	slices.Sort(out)
+	return out
 }
 
 type compareQueryer interface {
@@ -520,6 +601,7 @@ func main() {
 		ctx:              ctx,
 		cancel:           cancel,
 		sem:              make(chan struct{}, cfg.WorkerCount),
+		tableLocks:       make(map[string]*sync.RWMutex),
 		nextCompare:      time.Now().Add(cfg.CompareEvery),
 		nextReopen:       time.Now().Add(cfg.ReopenEvery),
 		nextBackup:       time.Now().Add(cfg.BackupEvery),
@@ -533,6 +615,7 @@ func main() {
 	}
 	for _, table := range r.tables {
 		r.tableByName[table.Name] = table
+		r.ensureTableLock(table.Name)
 	}
 	r.state = newDBState(r.tables)
 
@@ -553,7 +636,7 @@ func main() {
 	if status, err := r.enczDB.RotationStatus(); err != nil {
 		logger.Error("rotation status failed: %v", err)
 	} else {
-		logger.Info("ENCZ rotation status: KEK every %d days, DEK every %d hours, active DEK key id=%d", status.KEKRotationDays, status.DEKRotationHours, status.ActiveDEKKeyID)
+		logger.Info("ENCZ rotation status: KEK every %d days, DEK every %d hours, active DEK key id=%s", status.KEKRotationDays, status.DEKRotationHours, status.ActiveDEKKeyID)
 	}
 
 	logger.Info("runner started: action_interval=%s compare_interval=%s reopen_interval=%s schema_change_interval=%s complex_query_interval=%s large_tx_interval=%s max_db_size=%s max_run_time=%s workers=%d invalid_write_pct=%d", cfg.ActionEvery, cfg.CompareEvery, cfg.ReopenEvery, cfg.SchemaChangeEvery, cfg.ComplexQueryEvery, cfg.LargeTxEvery, cfg.MaxDBSize, cfg.MaxRunDuration, cfg.WorkerCount, cfg.InvalidWritePct)
@@ -958,26 +1041,29 @@ func (r *runner) executeSelect(actionNo uint64) {
 	if table == nil {
 		return
 	}
-	id, ok := r.randomID(table.Name)
-	if !ok {
-		return
-	}
-	r.logger.Record("action=%d op=SELECT table=%s id=%d starting", actionNo, table.Name, id)
-	sqliteRows, sqliteErr := queryRowsNormalized(r.ctx, r.sqliteDB, table.SelectByIDSQL, id)
-	enczRows, enczErr := queryRowsNormalized(r.ctx, r.enczDB.SQLDB(), table.SelectByIDSQL, id)
-	if sqliteErr != nil || enczErr != nil {
-		if (sqliteErr == nil) != (enczErr == nil) {
-			r.logger.Fatal("action=%d op=SELECT table=%s id=%d split_outcome sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
-		} else if sqliteErr.Error() != enczErr.Error() {
-			r.logger.Fatal("action=%d op=SELECT table=%s id=%d error_outcome mismatch sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
-		} else {
-			r.logger.Record("action=%d op=SELECT table=%s id=%d db=sqlite/encz match_error error=%v", actionNo, table.Name, id, sqliteErr)
+
+	r.withTableLocks(nil, []string{table.Name}, func() {
+		id, ok := r.randomID(table.Name)
+		if !ok {
+			return
 		}
-		return
-	}
-	if !reflect.DeepEqual(sqliteRows, enczRows) {
-		r.logger.Fatal("action=%d op=SELECT table=%s id=%d mismatch sqlite=%v encz=%v", actionNo, table.Name, id, sqliteRows, enczRows)
-	}
+		r.logger.Record("action=%d op=SELECT table=%s id=%s starting", actionNo, table.Name, id)
+		sqliteRows, sqliteErr := queryRowsNormalized(r.ctx, r.sqliteDB, table.SelectByIDSQL, id)
+		enczRows, enczErr := queryRowsNormalized(r.ctx, r.enczDB.SQLDB(), table.SelectByIDSQL, id)
+		if sqliteErr != nil || enczErr != nil {
+			if (sqliteErr == nil) != (enczErr == nil) {
+				r.logger.Fatal("action=%d op=SELECT table=%s id=%s split_outcome sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
+			} else if sqliteErr.Error() != enczErr.Error() {
+				r.logger.Fatal("action=%d op=SELECT table=%s id=%s error_outcome mismatch sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
+			} else {
+				r.logger.Record("action=%d op=SELECT table=%s id=%s db=sqlite/encz match_error error=%v", actionNo, table.Name, id, sqliteErr)
+			}
+			return
+		}
+		if !reflect.DeepEqual(sqliteRows, enczRows) {
+			r.logger.Fatal("action=%d op=SELECT table=%s id=%s mismatch sqlite=%v encz=%v", actionNo, table.Name, id, sqliteRows, enczRows)
+		}
+	})
 }
 
 func (r *runner) executeInsert(actionNo uint64) {
@@ -985,16 +1071,19 @@ func (r *runner) executeInsert(actionNo uint64) {
 	if table == nil {
 		return
 	}
-	invalid := r.shouldUseInvalidWrite()
-	r.logger.Record("action=%d op=INSERT table=%s invalid=%t starting", actionNo, table.Name, invalid)
-	row, reason, err := r.buildInsertRow(table, invalid)
-	if err != nil {
-		r.logger.Record("action=%d op=INSERT table=%s build error=%v", actionNo, table.Name, err)
-		return
-	}
-	if err := r.performInsert(table, row, invalid, actionNo); err != nil {
-		r.logger.Record("action=%d op=INSERT table=%s invalid=%t reason=%s error=%v", actionNo, table.Name, invalid, reason, err)
-	}
+
+	r.withTableLocks([]string{table.Name}, nil, func() {
+		invalid := r.shouldUseInvalidWrite()
+		r.logger.Record("action=%d op=INSERT table=%s invalid=%t starting", actionNo, table.Name, invalid)
+		row, reason, err := r.buildInsertRow(table, invalid)
+		if err != nil {
+			r.logger.Record("action=%d op=INSERT table=%s build error=%v", actionNo, table.Name, err)
+			return
+		}
+		if err := r.performInsert(table, row, invalid, actionNo); err != nil {
+			r.logger.Record("action=%d op=INSERT table=%s invalid=%t reason=%s error=%v", actionNo, table.Name, invalid, reason, err)
+		}
+	})
 }
 
 func (r *runner) executeUpdate(actionNo uint64) {
@@ -1004,20 +1093,23 @@ func (r *runner) executeUpdate(actionNo uint64) {
 	if table == nil {
 		return
 	}
-	id, current, ok := r.randomRow(table.Name)
-	if !ok {
-		return
-	}
-	invalid := r.shouldUseInvalidWrite()
-	r.logger.Record("action=%d op=UPDATE table=%s id=%d invalid=%t starting", actionNo, table.Name, id, invalid)
-	changes, reason, err := r.buildUpdateChanges(table, id, current, invalid)
-	if err != nil {
-		r.logger.Record("action=%d op=UPDATE table=%s id=%d build error=%v", actionNo, table.Name, id, err)
-		return
-	}
-	if err := r.performUpdate(table, id, changes, invalid, reason, actionNo); err != nil {
-		r.logger.Record("action=%d op=UPDATE table=%s id=%d invalid=%t reason=%s error=%v", actionNo, table.Name, id, invalid, reason, err)
-	}
+
+	r.withTableLocks([]string{table.Name}, nil, func() {
+		id, current, ok := r.randomRow(table.Name)
+		if !ok {
+			return
+		}
+		invalid := r.shouldUseInvalidWrite()
+		r.logger.Record("action=%d op=UPDATE table=%s id=%s invalid=%t starting", actionNo, table.Name, id, invalid)
+		changes, reason, err := r.buildUpdateChanges(table, id, current, invalid)
+		if err != nil {
+			r.logger.Record("action=%d op=UPDATE table=%s id=%s build error=%v", actionNo, table.Name, id, err)
+			return
+		}
+		if err := r.performUpdate(table, id, changes, invalid, reason, actionNo); err != nil {
+			r.logger.Record("action=%d op=UPDATE table=%s id=%s invalid=%t reason=%s error=%v", actionNo, table.Name, id, invalid, reason, err)
+		}
+	})
 }
 
 func (r *runner) executeDelete(actionNo uint64) {
@@ -1025,38 +1117,43 @@ func (r *runner) executeDelete(actionNo uint64) {
 	if table == nil {
 		return
 	}
-	id, ok := r.randomID(table.Name)
-	if !ok {
-		return
-	}
-	r.logger.Record("action=%d op=DELETE table=%s id=%d starting", actionNo, table.Name, id)
-	sqlText := fmt.Sprintf("DELETE FROM %s WHERE id = ?", table.Name)
-	sqliteResult, sqliteErr := r.sqliteDB.ExecContext(r.ctx, sqlText, id)
-	enczResult, enczErr := r.enczDB.ExecContext(r.ctx, sqlText, id)
-	if sqliteErr != nil || enczErr != nil {
-		if (sqliteErr == nil) != (enczErr == nil) {
-			r.logger.Fatal("action=%d op=DELETE table=%s id=%d split_outcome sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
-		} else if sqliteErr.Error() != enczErr.Error() {
-			r.logger.Fatal("action=%d op=DELETE table=%s id=%d error_outcome mismatch sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
-		} else {
-			r.logger.Record("action=%d op=DELETE table=%s id=%d db=sqlite/encz match_error error=%v", actionNo, table.Name, id, sqliteErr)
+
+	r.withTableLocks(r.tablesAffectedByDelete(table.Name), nil, func() {
+		id, ok := r.randomID(table.Name)
+		if !ok {
+			return
 		}
-		return
-	}
-	sqliteRows, _ := sqliteResult.RowsAffected()
-	enczRows, _ := enczResult.RowsAffected()
-	if sqliteRows != enczRows {
-		r.logger.Fatal("action=%d op=DELETE table=%s id=%d rows_affected mismatch sqlite=%d encz=%d", actionNo, table.Name, id, sqliteRows, enczRows)
-	}
-	if sqliteRows > 0 && enczRows > 0 {
-		r.state.DeleteRow(table.Name, id)
-	}
+		r.logger.Record("action=%d op=DELETE table=%s id=%s starting", actionNo, table.Name, id)
+		sqlText := fmt.Sprintf("DELETE FROM %s WHERE id = ?", table.Name)
+		sqliteResult, sqliteErr := r.sqliteDB.ExecContext(r.ctx, sqlText, id)
+		enczResult, enczErr := r.enczDB.ExecContext(r.ctx, sqlText, id)
+		if sqliteErr != nil || enczErr != nil {
+			if (sqliteErr == nil) != (enczErr == nil) {
+				r.logger.Fatal("action=%d op=DELETE table=%s id=%s split_outcome sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
+			} else if sqliteErr.Error() != enczErr.Error() {
+				r.logger.Fatal("action=%d op=DELETE table=%s id=%s error_outcome mismatch sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
+			} else {
+				r.logger.Record("action=%d op=DELETE table=%s id=%s db=sqlite/encz match_error error=%v", actionNo, table.Name, id, sqliteErr)
+			}
+			return
+		}
+		sqliteRows, _ := sqliteResult.RowsAffected()
+		enczRows, _ := enczResult.RowsAffected()
+		if sqliteRows != enczRows {
+			r.logger.Fatal("action=%d op=DELETE table=%s id=%s rows_affected mismatch sqlite=%d encz=%d", actionNo, table.Name, id, sqliteRows, enczRows)
+		}
+		if sqliteRows > 0 && enczRows > 0 {
+			r.state.DeleteRow(table.Name, id)
+		}
+	})
 }
 
 func (r *runner) performInsert(table *tableSpec, row map[string]any, invalid bool, actionNo uint64) error {
 	args := valuesForColumns(table.Columns, row)
 	sqliteResult, sqliteErr := r.sqliteDB.ExecContext(r.ctx, table.InsertSQL, args...)
 	enczResult, enczErr := r.enczDB.ExecContext(r.ctx, table.InsertSQL, args...)
+	_ = sqliteResult
+	_ = enczResult
 
 	if sqliteErr != nil || enczErr != nil {
 		if (sqliteErr == nil) != (enczErr == nil) {
@@ -1071,16 +1168,14 @@ func (r *runner) performInsert(table *tableSpec, row map[string]any, invalid boo
 		return nil
 	}
 
-	sqliteID, _ := sqliteResult.LastInsertId()
-	enczID, _ := enczResult.LastInsertId()
-	if sqliteID != enczID {
-		r.logger.Fatal("action=%d op=INSERT table=%s last_insert_id mismatch sqlite=%d encz=%d", actionNo, table.Name, sqliteID, enczID)
-		return errors.New("last_insert_id mismatch")
+	rowID, _ := row["id"].(string)
+	if rowID == "" {
+		return errors.New("missing row id")
 	}
 
 	// Inline validation: select the inserted row back from both databases and verify they are identical
-	sqliteRows, sqliteSelectErr := queryRowsNormalized(r.ctx, r.sqliteDB, table.SelectByIDSQL, sqliteID)
-	enczRows, enczSelectErr := queryRowsNormalized(r.ctx, r.enczDB.SQLDB(), table.SelectByIDSQL, enczID)
+	sqliteRows, sqliteSelectErr := queryRowsNormalized(r.ctx, r.sqliteDB, table.SelectByIDSQL, rowID)
+	enczRows, enczSelectErr := queryRowsNormalized(r.ctx, r.enczDB.SQLDB(), table.SelectByIDSQL, rowID)
 
 	if sqliteSelectErr != nil || enczSelectErr != nil {
 		if (sqliteSelectErr == nil) != (enczSelectErr == nil) {
@@ -1096,11 +1191,11 @@ func (r *runner) performInsert(table *tableSpec, row map[string]any, invalid boo
 		return errors.New("insert inline_verify data mismatch")
 	}
 
-	r.state.AddRow(table.Name, sqliteID, row)
+	r.state.AddRow(table.Name, rowID, row)
 	return nil
 }
 
-func (r *runner) performUpdate(table *tableSpec, id int64, changes map[string]any, invalid bool, reason string, actionNo uint64) error {
+func (r *runner) performUpdate(table *tableSpec, id string, changes map[string]any, invalid bool, reason string, actionNo uint64) error {
 	cols := sortedKeys(changes)
 	assignments := make([]string, 0, len(cols))
 	args := make([]any, 0, len(cols)+1)
@@ -1115,20 +1210,20 @@ func (r *runner) performUpdate(table *tableSpec, id int64, changes map[string]an
 
 	if sqliteErr != nil || enczErr != nil {
 		if (sqliteErr == nil) != (enczErr == nil) {
-			r.logger.Fatal("action=%d op=UPDATE table=%s id=%d split_outcome sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
+			r.logger.Fatal("action=%d op=UPDATE table=%s id=%s split_outcome sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
 			return errors.New("update mismatch")
 		}
 		if sqliteErr.Error() != enczErr.Error() {
-			r.logger.Fatal("action=%d op=UPDATE table=%s id=%d error_outcome mismatch sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
+			r.logger.Fatal("action=%d op=UPDATE table=%s id=%s error_outcome mismatch sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteErr, enczErr)
 			return errors.New("update mismatch")
 		}
-		r.logger.Record("action=%d op=UPDATE table=%s id=%d db=sqlite/encz match_error error=%v", actionNo, table.Name, id, sqliteErr)
+		r.logger.Record("action=%d op=UPDATE table=%s id=%s db=sqlite/encz match_error error=%v", actionNo, table.Name, id, sqliteErr)
 		return nil
 	}
 	sqliteRows, _ := sqliteResult.RowsAffected()
 	enczRows, _ := enczResult.RowsAffected()
 	if sqliteRows != enczRows {
-		r.logger.Fatal("action=%d op=UPDATE table=%s id=%d rows_affected mismatch sqlite=%d encz=%d", actionNo, table.Name, id, sqliteRows, enczRows)
+		r.logger.Fatal("action=%d op=UPDATE table=%s id=%s rows_affected mismatch sqlite=%d encz=%d", actionNo, table.Name, id, sqliteRows, enczRows)
 	}
 
 	// Inline validation: select the updated row back from both databases and verify they are identical
@@ -1137,15 +1232,15 @@ func (r *runner) performUpdate(table *tableSpec, id int64, changes map[string]an
 
 	if sqliteSelectErr != nil || enczSelectErr != nil {
 		if (sqliteSelectErr == nil) != (enczSelectErr == nil) {
-			r.logger.Fatal("action=%d op=UPDATE table=%s id=%d inline_verify split_outcome sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteSelectErr, enczSelectErr)
+			r.logger.Fatal("action=%d op=UPDATE table=%s id=%s inline_verify split_outcome sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteSelectErr, enczSelectErr)
 			return errors.New("update inline_verify mismatch")
 		}
 		if sqliteSelectErr.Error() != enczSelectErr.Error() {
-			r.logger.Fatal("action=%d op=UPDATE table=%s id=%d inline_verify error_outcome mismatch sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteSelectErr, enczSelectErr)
+			r.logger.Fatal("action=%d op=UPDATE table=%s id=%s inline_verify error_outcome mismatch sqlite_err=%v encz_err=%v", actionNo, table.Name, id, sqliteSelectErr, enczSelectErr)
 			return errors.New("update inline_verify mismatch")
 		}
 	} else if !reflect.DeepEqual(sqliteRowsSelect, enczRowsSelect) {
-		r.logger.Fatal("action=%d op=UPDATE table=%s id=%d inline_verify data mismatch sqlite=%v encz=%v", actionNo, table.Name, sqliteRowsSelect, enczRowsSelect)
+		r.logger.Fatal("action=%d op=UPDATE table=%s id=%s inline_verify data mismatch sqlite=%v encz=%v", actionNo, table.Name, sqliteRowsSelect, enczRowsSelect)
 		return errors.New("update inline_verify data mismatch")
 	}
 
@@ -1766,9 +1861,9 @@ func (r *runner) validateLargeTransaction() error {
 	)
 
 	tableName := fmt.Sprintf("large_tx_validation_%s", strings.ReplaceAll(r.fake.uniqueSuffix(), "-", ""))
-	createSQL := fmt.Sprintf("CREATE TABLE %s (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)", tableName)
+	createSQL := fmt.Sprintf("CREATE TABLE %s (id TEXT PRIMARY KEY, payload BLOB NOT NULL)", tableName)
 	dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)
-	insertSQL := fmt.Sprintf("INSERT INTO %s (payload) VALUES (?)", tableName)
+	insertSQL := fmt.Sprintf("INSERT INTO %s (id, payload) VALUES (?, ?)", tableName)
 	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)
 
 	cleanup := func() error {
@@ -1815,7 +1910,8 @@ func (r *runner) validateLargeTransaction() error {
 		}
 
 		for i := 0; i < rowCount; i++ {
-			if _, err := stmt.ExecContext(r.ctx, payload); err != nil {
+			rowID := r.fake.WithLock(func(_ *rand.Rand, fake *gofakeit.Faker) any { return fake.UUID() }).(string)
+			if _, err := stmt.ExecContext(r.ctx, rowID, payload); err != nil {
 				_ = stmt.Close()
 				_ = tx.Rollback()
 				return fmt.Errorf("%s insert %d: %w", label, i, err)
@@ -1912,27 +2008,30 @@ func (r *runner) randomTable(filter func(*tableSpec) bool) *tableSpec {
 	}).(*tableSpec)
 }
 
-func (r *runner) randomID(table string) (int64, bool) {
+func (r *runner) randomID(table string) (string, bool) {
 	res := r.fake.WithLock(func(rnd *rand.Rand, _ *gofakeit.Faker) any {
 		id, ok := r.state.RandomID(table, rnd)
 		return []any{id, ok}
 	}).([]any)
-	return res[0].(int64), res[1].(bool)
+	return res[0].(string), res[1].(bool)
 }
 
-func (r *runner) randomRow(table string) (int64, map[string]any, bool) {
+func (r *runner) randomRow(table string) (string, map[string]any, bool) {
 	res := r.fake.WithLock(func(rnd *rand.Rand, _ *gofakeit.Faker) any {
 		id, row, ok := r.state.RandomRow(table, rnd)
 		return []any{id, row, ok}
 	}).([]any)
 	if !res[2].(bool) {
-		return 0, nil, false
+		return "", nil, false
 	}
-	return res[0].(int64), res[1].(map[string]any), true
+	return res[0].(string), res[1].(map[string]any), true
 }
 
 func (r *runner) buildInsertRow(table *tableSpec, invalid bool) (map[string]any, string, error) {
-	row := make(map[string]any, len(table.Columns))
+	row := make(map[string]any, len(table.Columns)+1)
+	row["id"] = r.fake.WithLock(func(_ *rand.Rand, fake *gofakeit.Faker) any {
+		return fake.UUID()
+	}).(string)
 	for _, col := range table.Columns {
 		val, err := r.generateValidValue(table, col)
 		if err != nil {
@@ -1980,7 +2079,7 @@ func (r *runner) buildInsertRow(table *tableSpec, invalid bool) (map[string]any,
 	return row, fmt.Sprintf("%s:%s", col.Name, reason), nil
 }
 
-func (r *runner) buildUpdateChanges(table *tableSpec, id int64, current map[string]any, invalid bool) (map[string]any, string, error) {
+func (r *runner) buildUpdateChanges(table *tableSpec, id string, current map[string]any, invalid bool) (map[string]any, string, error) {
 	if len(table.UpdateableCols) == 0 {
 		return nil, "", errors.New("no updateable columns")
 	}
@@ -2161,7 +2260,7 @@ func (r *runner) applyInvalidValue(table *tableSpec, row map[string]any) (column
 func (r *runner) setInvalidValue(table *tableSpec, col columnSpec, values map[string]any) (string, error) {
 	switch col.Kind {
 	case kindFK:
-		values[col.Name] = int64(9_999_999)
+		values[col.Name] = "00000000-0000-0000-0000-invalidfk0001"
 		return "fk_violation", nil
 	case kindBool:
 		values[col.Name] = 7
@@ -2216,7 +2315,7 @@ func (r *runner) generateValidValue(table *tableSpec, col columnSpec) (any, erro
 			id, ok := r.state.RandomID(col.RefTable, rnd)
 			return []any{id, ok}
 		}).([]any)
-		id, ok := res[0].(int64), res[1].(bool)
+		id, ok := res[0].(string), res[1].(bool)
 		if !ok {
 			return nil, fmt.Errorf("no parent rows for %s.%s -> %s", table.Name, col.Name, col.RefTable)
 		}
@@ -2304,7 +2403,7 @@ func (r *runner) generateValidValue(table *tableSpec, col columnSpec) (any, erro
 }
 
 func tableDDL(table *tableSpec) []string {
-	defs := []string{"id INTEGER PRIMARY KEY"}
+	defs := []string{"id TEXT PRIMARY KEY"}
 	for _, col := range table.Columns {
 		defs = append(defs, columnDDL(col))
 	}
@@ -2338,8 +2437,10 @@ func columnDDL(col columnSpec) string {
 
 func columnType(col columnSpec) string {
 	switch col.Kind {
-	case kindBool, kindInt, kindFK:
+	case kindBool, kindInt:
 		return "INTEGER"
+	case kindFK:
+		return "TEXT"
 	case kindReal:
 		return "REAL"
 	case kindBlob:
@@ -2362,7 +2463,7 @@ func columnChecks(col columnSpec) []string {
 	switch col.Kind {
 	case kindBool:
 		checks = append(checks, guard(fmt.Sprintf("%s IN (0,1)", name)))
-	case kindInt, kindFK:
+	case kindInt:
 		if col.MinInt != 0 {
 			checks = append(checks, guard(fmt.Sprintf("%s >= %d", name, col.MinInt)))
 		}
@@ -2612,8 +2713,10 @@ func buildTableSpecs() []*tableSpec {
 
 	for _, spec := range specs {
 		spec.AllColumnNames = append(spec.AllColumnNames, "id")
-		insertCols := make([]string, 0, len(spec.Columns))
-		placeholders := make([]string, 0, len(spec.Columns))
+		insertCols := make([]string, 0, len(spec.Columns)+1)
+		placeholders := make([]string, 0, len(spec.Columns)+1)
+		insertCols = append(insertCols, "id")
+		placeholders = append(placeholders, "?")
 		for _, col := range spec.Columns {
 			insertCols = append(insertCols, col.Name)
 			placeholders = append(placeholders, "?")
@@ -2670,7 +2773,8 @@ func findColumn(table *tableSpec, name string) columnSpec {
 }
 
 func valuesForColumns(cols []columnSpec, row map[string]any) []any {
-	out := make([]any, 0, len(cols))
+	out := make([]any, 0, len(cols)+1)
+	out = append(out, row["id"])
 	for _, col := range cols {
 		out = append(out, row[col.Name])
 	}
@@ -2749,8 +2853,10 @@ func max(a, b int) int {
 func (r *runner) refreshTableSQL(spec *tableSpec) {
 	spec.AllColumnNames = []string{"id"}
 	spec.UpdateableCols = nil
-	insertCols := make([]string, 0, len(spec.Columns))
-	placeholders := make([]string, 0, len(spec.Columns))
+	insertCols := make([]string, 0, len(spec.Columns)+1)
+	placeholders := make([]string, 0, len(spec.Columns)+1)
+	insertCols = append(insertCols, "id")
+	placeholders = append(placeholders, "?")
 	for _, col := range spec.Columns {
 		insertCols = append(insertCols, col.Name)
 		placeholders = append(placeholders, "?")
@@ -2818,9 +2924,10 @@ func (r *runner) schemaAddTable() error {
 
 	r.tables = append(r.tables, spec)
 	r.tableByName[tableName] = spec
+	r.ensureTableLock(tableName)
 
 	r.state.mu.Lock()
-	r.state.tables[tableName] = &tableRows{Rows: make(map[int64]map[string]any)}
+	r.state.tables[tableName] = &tableRows{Rows: make(map[string]map[string]any)}
 	r.state.mu.Unlock()
 
 	for i := 0; i < spec.SeedRows; i++ {
@@ -2875,6 +2982,7 @@ func (r *runner) schemaDropTable() error {
 		}
 	}
 	delete(r.tableByName, tableName)
+	r.dropTableLock(tableName)
 	delete(r.dynamicIndexes, tableName)
 
 	r.state.mu.Lock()
@@ -3162,7 +3270,7 @@ func (r *runner) checkDatabaseSize() error {
 			}
 
 			r.state.mu.RLock()
-			var ids []int64
+			var ids []string
 			if tRows, ok := r.state.tables[table.Name]; ok {
 				ids = append(ids, tRows.IDs...)
 			}
@@ -3194,10 +3302,10 @@ func (r *runner) checkDatabaseSize() error {
 					r.state.DeleteRow(table.Name, id)
 				} else {
 					if sqliteErr != nil {
-						r.logger.Error("prune DELETE table=%s id=%d sqlite error=%v", table.Name, id, sqliteErr)
+						r.logger.Error("prune DELETE table=%s id=%s sqlite error=%v", table.Name, id, sqliteErr)
 					}
 					if enczErr != nil {
-						r.logger.Error("prune DELETE table=%s id=%d encz error=%v", table.Name, id, enczErr)
+						r.logger.Error("prune DELETE table=%s id=%s encz error=%v", table.Name, id, enczErr)
 					}
 				}
 			}
