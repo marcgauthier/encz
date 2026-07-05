@@ -166,8 +166,9 @@ func (r *keyRegistry) fillActiveKey(out []byte) (uint32, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.allowDEKRotation && dekRotationDue(r.payload, timeNowUTC()) {
-		if err := r.rotateActiveDEKLocked(timeNowUTC()); err != nil {
+	now := timeNowUTC()
+	if r.allowDEKRotation && dekRotationDue(r.payload, now) {
+		if err := r.rotateActiveDEKLocked(now); err != nil {
 			return 0, false
 		}
 	}
