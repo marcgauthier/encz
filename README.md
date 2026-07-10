@@ -8,10 +8,10 @@
 
 - **Storage format**: Standard SQLite database and WAL files on disk, plus an encrypted `db.encz` sidecar manifest.
 - **Reserved bytes**: `encz` reserves 36 bytes on each SQLite page.
-- **Encryption**: Page payloads are encrypted with **AES-256-GCM**.
+- **Encryption**: Page payloads are encrypted with **ChaCha20-Poly1305**.
 - **Per-page metadata**: The final 36 reserved bytes hold 4 bytes of flags, a 4-byte DEK key ID, a 12-byte nonce, and a 16-byte authentication tag.
 - **Nonce generation**: Each page encryption generates a fresh random 96-bit nonce using the operating system's secure random number generator (via Go's crypto/rand). This provides probabilistic nonce uniqueness per DEK rather than a deterministic counter-based guarantee.
-- **Authentication binding**: The GCM tag is computed with additional authenticated data (AAD) that binds the ciphertext to the database UUID, page number, file offset, and WAL/main-file context. This protects page identity and location, but it is separate from nonce uniqueness.
+- **Authentication binding**: The Poly1305 authentication tag is computed with additional authenticated data (AAD) that binds the ciphertext to the database UUID, page number, file offset, and WAL/main-file context. This protects page identity and location, but it is separate from nonce uniqueness.
 - **Multi-DEK model**: Every page stores the DEK key ID used to encrypt it. Older DEKs remain in the manifest forever, so a single database can contain pages encrypted under different DEKs.
 - **Encrypted-only API**: `encz` only supports file-backed encrypted databases. Plain SQLite files, in-memory databases, and direct-key compatibility paths are rejected by the package helpers.
 
@@ -22,7 +22,7 @@
          Custom SQLite VFS Extension (encz)
                       |
                       v
-             AES-256-GCM encryption
+             ChaCha20-Poly1305 encryption
                       |
                       v
            Flat SQLite database / WAL files
@@ -105,7 +105,7 @@ err := db.Backup("backup.zip", encz.BackupOptions{
 })
 ```
 
-- **Encryption**: The archive is sealed using AES-256-GCM. A secondary key is derived from the active master key using a unique salt, separate from the primary database's KEK.
+- **Encryption**: The archive is sealed using ChaCha20-Poly1305. A secondary key is derived from the active master key using a unique salt, separate from the primary database's KEK.
 - **Payload**: Contains the database page-encrypted files and the manifest containing all historical DEKs.
 
 ### Testing Backups
