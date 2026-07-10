@@ -11,7 +11,7 @@ encz_password: ENCzTestPassword123!
 journal_mode: WAL
 
 # Maximum duration to run the overall test session (e.g. 5h, 30m)
-max_run_time: 5h
+max_run_time: 48h
 
 # Interval at which concurrent workers schedule SQL actions (select, insert, update, delete)
 action_interval: 50ms

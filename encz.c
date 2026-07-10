@@ -24,9 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-#include <openssl/sha.h>
+#include "monocypher.h"
 
 typedef sqlite3_int64 i64;
 typedef unsigned char u8;
@@ -215,7 +213,7 @@ static int enczIsValidPageSize(int sz){
 
 static int enczSetKeyPassphrase(EnczFile *p, const char *z){
   if( z==0 ) return SQLITE_ERROR;
-  SHA256((const unsigned char*)z, strlen(z), p->key);
+  crypto_blake2b(p->key, 32, (const uint8_t*)z, strlen(z));
   p->hasKey = 1;
   return SQLITE_OK;
 }
@@ -231,6 +229,7 @@ extern void enczGoLog(const char *zMsg);
 extern int enczGoFillKey(unsigned long long handle, unsigned int keyId, unsigned char *aOut);
 extern int enczGoFillActiveKey(unsigned long long handle, unsigned int *pKeyId, unsigned char *aOut);
 extern int enczGoFillDBUUID(unsigned long long handle, unsigned char *aOut);
+extern void enczGoRandomBytes(unsigned char *out, int n);
 
 static int enczSetKeyHex(EnczFile *p, const char *z){
   size_t n;
@@ -432,13 +431,6 @@ static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) 
     return SQLITE_NOMEM;
   }
   
-  EVP_CIPHER_CTX *pCtx = EVP_CIPHER_CTX_new();
-  if( pCtx==0 ){
-    sqlite3_free(aBuf);
-    sqlite3_free(aTmp);
-    return SQLITE_NOMEM;
-  }
-  
   u8 aDbUuid[16];
   memset(aDbUuid, 0, 16);
   if( p->registryHandle ){
@@ -459,36 +451,19 @@ static int enczDecryptAndReadPage(EnczFile *p, u8 *aPlain, u32 pgno, i64 iOfst) 
   aAAD[28] = p->isWal ? 1 : 0;
   memset(aAAD + 29, 0, 3);
 
-  int nOut = 0, nDec = 0;
-  if( EVP_DecryptInit_ex(pCtx, EVP_aes_256_gcm(), 0, 0, 0)!=1
-   || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_SET_IVLEN, 12, 0)!=1
-   || EVP_DecryptInit_ex(pCtx, 0, 0, aKey, aNonce)!=1
-   || EVP_DecryptUpdate(pCtx, 0, &nOut, aAAD, sizeof(aAAD))!=1
-   || EVP_DecryptUpdate(pCtx, aTmp, &nOut, aBuf + H, nCipher)!=1
-   || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_SET_TAG, 16, aTag)!=1
-  ){
-    enczLog("[encz] READ EVP init/update/ctrl failed\n");
-    rc = SQLITE_ERROR;
-  } else {
-    if( EVP_DecryptFinal_ex(pCtx, aTmp + nOut, &nDec)!=1 ){
-      enczLog("[encz] READ DecryptFinal (MAC check failed) for pgno=%u\n", pgno);
-      rc = SQLITE_CORRUPT;
-    } else {
-      nDec += nOut;
-      memset(aPlain, 0, P);
-      if( pgno == 1 ){
-        memcpy(aPlain, aBuf, 100);
-      }
-      
-      if( nDec != nPlain ){
-        rc = SQLITE_CORRUPT;
-      } else {
-        memcpy(aPlain + H, aTmp, nPlain);
-      }
-    }
-  }
+  crypto_aead_ctx ctx;
+  crypto_aead_init_ietf(&ctx, aKey, aNonce);
   
-  EVP_CIPHER_CTX_free(pCtx);
+  if( crypto_aead_read(&ctx, aTmp, aTag, aAAD, sizeof(aAAD), aBuf + H, nCipher) ){
+    enczLog("[encz] READ DecryptFinal (MAC check failed) for pgno=%u\n", pgno);
+    rc = SQLITE_CORRUPT;
+  } else {
+    memset(aPlain, 0, P);
+    if( pgno == 1 ){
+      memcpy(aPlain, aBuf, 100);
+    }
+    memcpy(aPlain + H, aTmp, nPlain);
+  }
   sqlite3_free(aBuf);
   sqlite3_free(aTmp);
   return rc;
@@ -525,18 +500,7 @@ static int enczEncryptAndWritePageAtOffset(EnczFile *p, const u8 *aPlain, u32 pg
     return SQLITE_AUTH;
   }
 
-  if( RAND_bytes(aNonce, 12) != 1 ){
-    sqlite3_free(aBuf);
-    sqlite3_free(aCipher);
-    return SQLITE_ERROR;
-  }
-  
-  EVP_CIPHER_CTX *pCtx = EVP_CIPHER_CTX_new();
-  if( pCtx==0 ){
-    sqlite3_free(aBuf);
-    sqlite3_free(aCipher);
-    return SQLITE_NOMEM;
-  }
+  enczGoRandomBytes(aNonce, 12);
   
   u8 aDbUuid[16];
   memset(aDbUuid, 0, 16);
@@ -558,34 +522,22 @@ static int enczEncryptAndWritePageAtOffset(EnczFile *p, const u8 *aPlain, u32 pg
   aAAD[28] = p->isWal ? 1 : 0;
   memset(aAAD + 29, 0, 3);
 
-  int nOut = 0, nCipher = 0;
-  if( EVP_EncryptInit_ex(pCtx, EVP_aes_256_gcm(), 0, 0, 0)!=1
-   || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_SET_IVLEN, 12, 0)!=1
-   || EVP_EncryptInit_ex(pCtx, 0, 0, aKey, aNonce)!=1
-   || EVP_EncryptUpdate(pCtx, 0, &nOut, aAAD, sizeof(aAAD))!=1
-   || EVP_EncryptUpdate(pCtx, aCipher, &nOut, aPlain + H, nPlain)!=1
-   || EVP_EncryptFinal_ex(pCtx, aCipher + nOut, &nCipher)!=1
-   || EVP_CIPHER_CTX_ctrl(pCtx, EVP_CTRL_GCM_GET_TAG, 16, aTag)!=1
-  ){
-    enczLog("[encz] WRITE EVP init/update/ctrl/tag failed for pgno=%u\n", pgno);
-    rc = SQLITE_ERROR;
-  } else {
-    nCipher += nOut;
-    memcpy(aBuf + H, aCipher, nCipher);
-    memset(aBuf + H + nCipher, 0, P - ENCZ_RESERVED_SZ - H - nCipher);
-    enczPut32(aBuf + P - ENCZ_RESERVED_SZ, flags);
-    enczPut32(aBuf + P - 32, keyId);
-    memcpy(aBuf + P - 28, aNonce, 12);
-    memcpy(aBuf + P - 16, aTag, 16);
-    
-    // fprintf(stderr, "[encz] WRITE pgno=%u, iOfst=%lld, nCipher=%d, flags=%08x\n", pgno, (long long)iOfst, nCipher, flags);
-    rc = p->pSubFile->pMethods->xWrite(p->pSubFile, aBuf, P, iOfst);
-    if( rc!=SQLITE_OK ){
-      enczLog("[encz] WRITE xWrite failed, rc=%d\n", rc);
-    }
-  }
+  crypto_aead_ctx ctx;
+  crypto_aead_init_ietf(&ctx, aKey, aNonce);
+  crypto_aead_write(&ctx, aCipher, aTag, aAAD, sizeof(aAAD), aPlain + H, nPlain);
   
-  EVP_CIPHER_CTX_free(pCtx);
+  int final_cipher_len = nPlain;
+  memcpy(aBuf + H, aCipher, final_cipher_len);
+  memset(aBuf + H + final_cipher_len, 0, P - ENCZ_RESERVED_SZ - H - final_cipher_len);
+  enczPut32(aBuf + P - ENCZ_RESERVED_SZ, flags);
+  enczPut32(aBuf + P - 32, keyId);
+  memcpy(aBuf + P - 28, aNonce, 12);
+  memcpy(aBuf + P - 16, aTag, 16);
+  
+  rc = p->pSubFile->pMethods->xWrite(p->pSubFile, aBuf, P, iOfst);
+  if( rc!=SQLITE_OK ){
+    enczLog("[encz] WRITE xWrite failed, rc=%d\n", rc);
+  }
   sqlite3_free(aBuf);
   sqlite3_free(aCipher);
   return rc;
@@ -1136,7 +1088,6 @@ int sqlite3_encz_init(
   (void)db;
   (void)pzErrMsg;
   SQLITE_EXTENSION_INIT2(pApi);
-  OpenSSL_add_all_algorithms();
   rc = enczRegister();
   if( rc==SQLITE_OK ) rc = SQLITE_OK_LOAD_PERMANENTLY;
   return rc;

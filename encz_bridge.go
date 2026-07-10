@@ -12,8 +12,10 @@ static int encz_register_once(void) {
 import "C"
 
 import (
+	"crypto/rand"
 	"fmt"
 	"sync"
+	"unsafe"
 )
 
 var (
@@ -29,4 +31,10 @@ func registerEncz() error {
 		}
 	})
 	return registerEnczErr
+}
+
+//export enczGoRandomBytes
+func enczGoRandomBytes(out *C.uchar, n C.int) {
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(out)), n)
+	_, _ = rand.Read(buf)
 }

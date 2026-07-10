@@ -10,6 +10,8 @@
 - **Reserved bytes**: `encz` reserves 36 bytes on each SQLite page.
 - **Encryption**: Page payloads are encrypted with **AES-256-GCM**.
 - **Per-page metadata**: The final 36 reserved bytes hold 4 bytes of flags, a 4-byte DEK key ID, a 12-byte nonce, and a 16-byte authentication tag.
+- **Nonce generation**: Each page encryption generates a fresh random 96-bit nonce using the operating system's secure random number generator (via Go's crypto/rand). This provides probabilistic nonce uniqueness per DEK rather than a deterministic counter-based guarantee.
+- **Authentication binding**: The GCM tag is computed with additional authenticated data (AAD) that binds the ciphertext to the database UUID, page number, file offset, and WAL/main-file context. This protects page identity and location, but it is separate from nonce uniqueness.
 - **Multi-DEK model**: Every page stores the DEK key ID used to encrypt it. Older DEKs remain in the manifest forever, so a single database can contain pages encrypted under different DEKs.
 - **Encrypted-only API**: `encz` only supports file-backed encrypted databases. Plain SQLite files, in-memory databases, and direct-key compatibility paths are rejected by the package helpers.
 
@@ -30,9 +32,7 @@
 
 - Go 1.25+
 - CGO enabled
-- OpenSSL development/runtime support
-- On Linux AMD64 and Windows AMD64, this repository includes bundled native libraries under `lib/`
-- On other platforms, the native dependencies must be available to the Go toolchain
+- Zero external C library dependencies (uses Monocypher)
 
 ## Install
 
@@ -219,6 +219,37 @@ Defaults for newly created databases:
 
 * `db.SetRotationPolicy(...)` persists new rotation settings into the encrypted manifest.
 * `db.RotationStatus()` returns a `RotationInfo` struct containing the active policy, the current active DEK Key ID, the total count of DEKs in the manifest, and the next due times for KEK and DEK rotation.
+
+Example:
+
+```go
+db, err := encz.OpenEncz("app.db", "master-passphrase")
+if err != nil {
+	return err
+}
+defer db.Close()
+
+status, err := db.RotationStatus()
+if err != nil {
+	return err
+}
+
+fmt.Printf("KEK rotation: every %d days\n", status.KEKRotationDays)
+fmt.Printf("DEK rotation: every %d hours\n", status.DEKRotationHours)
+fmt.Printf("Auto rewrap: %t\n", status.AutoRewrap)
+fmt.Printf("Keep previous key: %t\n", status.KeepPreviousKey)
+fmt.Printf("Active DEK Key ID: %d\n", status.ActiveDEKKeyID)
+
+err = db.SetRotationPolicy(encz.RotationPolicy{
+	KEKRotationDays:  30,
+	DEKRotationHours: 12,
+	AutoRewrap:       true,
+	KeepPreviousKey:  true,
+})
+if err != nil {
+	return err
+}
+```
 
 ## Compatibility
 
