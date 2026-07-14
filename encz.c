@@ -2,7 +2,7 @@
 ** 2026-06-06
 **
 ** Custom SQLite VFS that encrypts and decrypts flat database file pages
-** in-place using AES-256-GCM, utilizing SQLite's reserved bytes.
+** in-place using ChaCha20-Poly1305, utilizing SQLite's reserved bytes.
 */
 #if defined(SQLITE_AMALGAMATION) && !defined(SQLITE_CRYPTOVFS_STATIC)
 # define SQLITE_CRYPTOVFS_STATIC
@@ -31,7 +31,7 @@ typedef unsigned char u8;
 typedef unsigned int u32;
 
 #define ENCZ_VFS_NAME              "encz"
-#define ENCZ_CIPHER_AES_256_GCM    1
+#define ENCZ_CIPHER_CHACHA20_POLY1305    1
 
 #define ENCZ_WAL_HDR_SZ            32
 #define ENCZ_WAL_FRAME_HDR_SZ      24
@@ -783,7 +783,7 @@ static char *enczStatusString(EnczFile *p){
   u32 pageCount = p->logicalPageSize > 0 ? (u32)(nSize / p->logicalPageSize) : 0;
   return sqlite3_mprintf(
     "cipher=%s,key=%s,pages=%u,page_size=%d,container=%d",
-    p->cipher==ENCZ_CIPHER_AES_256_GCM ? "aes-256-gcm" : "unknown",
+    p->cipher==ENCZ_CIPHER_CHACHA20_POLY1305 ? "chacha20-poly1305" : "unknown",
     (p->hasKey || p->registryHandle) ? "set" : "unset",
     pageCount,
     p->logicalPageSize,
@@ -955,7 +955,7 @@ static int enczOpen(
   memset(p, 0, sizeof(*p));
   p->pSubFile = pSubFile;
   p->zFName = zName;
-  p->cipher = ENCZ_CIPHER_AES_256_GCM;
+  p->cipher = ENCZ_CIPHER_CHACHA20_POLY1305;
   p->isMainDb = (flags & SQLITE_OPEN_MAIN_DB)!=0;
   p->isWal = (flags & SQLITE_OPEN_WAL)!=0;
   p->isReadonly = (flags & SQLITE_OPEN_READONLY)!=0;

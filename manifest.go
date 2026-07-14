@@ -1,8 +1,6 @@
 package encz
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -18,11 +16,12 @@ import (
 
 	"github.com/awnumar/memguard"
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
-	manifestMagic                  = "ENCZK1"
-	manifestVersion                = 1
+	manifestMagic                  = "ENCZK2"
+	manifestVersion                = 2
 	manifestSaltSize               = 16
 	manifestNonceSize              = 12
 	manifestKEKSize                = 32
@@ -461,11 +460,7 @@ func deriveKEK(passphrase *memguard.LockedBuffer, hdr manifestHeader) []byte {
 }
 
 func encryptManifestPayload(kek []byte, hdr manifestHeader, plain []byte) ([]byte, error) {
-	block, err := aes.NewCipher(kek)
-	if err != nil {
-		return nil, err
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := chacha20poly1305.New(kek)
 	if err != nil {
 		return nil, err
 	}
@@ -473,11 +468,7 @@ func encryptManifestPayload(kek []byte, hdr manifestHeader, plain []byte) ([]byt
 }
 
 func decryptManifestPayload(kek []byte, hdr manifestHeader, ciphertext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(kek)
-	if err != nil {
-		return nil, err
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := chacha20poly1305.New(kek)
 	if err != nil {
 		return nil, err
 	}

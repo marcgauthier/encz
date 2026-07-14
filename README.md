@@ -8,9 +8,9 @@
 
 - **Storage format**: Standard SQLite database and WAL files on disk, plus an encrypted `db.encz` sidecar manifest.
 - **Reserved bytes**: `encz` reserves 36 bytes on each SQLite page.
-- **Encryption**: Page payloads are encrypted with **ChaCha20-Poly1305**.
+- **Encryption**: Database pages, manifests, and backup archives are encrypted with **ChaCha20-Poly1305**.
 - **Per-page metadata**: The final 36 reserved bytes hold 4 bytes of flags, a 4-byte DEK key ID, a 12-byte nonce, and a 16-byte authentication tag.
-- **Nonce generation**: Each page encryption generates a fresh random 96-bit nonce using the operating system's secure random number generator (via Go's crypto/rand). This provides probabilistic nonce uniqueness per DEK rather than a deterministic counter-based guarantee.
+- **Nonce generation**: Each encrypted container uses a fresh random 96-bit nonce from the operating system's secure random number generator. For pages, this provides probabilistic nonce uniqueness per DEK rather than a deterministic counter-based guarantee.
 - **Authentication binding**: The Poly1305 authentication tag is computed with additional authenticated data (AAD) that binds the ciphertext to the database UUID, page number, file offset, and WAL/main-file context. This protects page identity and location, but it is separate from nonce uniqueness.
 - **Multi-DEK model**: Every page stores the DEK key ID used to encrypt it. Older DEKs remain in the manifest forever, so a single database can contain pages encrypted under different DEKs.
 - **Encrypted-only API**: `encz` only supports file-backed encrypted databases. Plain SQLite files, in-memory databases, and direct-key compatibility paths are rejected by the package helpers.
@@ -253,11 +253,12 @@ if err != nil {
 
 ## Compatibility
 
-This release changes the page trailer format from 32 reserved bytes to 36 reserved bytes and changes the manifest schema from a single-DEK model to a multi-DEK model.
+This release uses ChaCha20-Poly1305 consistently across pages, manifests, and backup archives. It also changes the page trailer format from 32 reserved bytes to 36 reserved bytes and changes the manifest schema from a single-DEK model to a multi-DEK model.
 
 Release scope:
 
 - This version is intended for newly created `encz` databases only.
-- Existing databases created with the older format are not supported by this release.
-- This package does not provide automatic migration, in-place upgrade, or compatibility fallback for older database files.
+- Existing manifests and backup archives created with the older AES-based container format are not supported by this release.
+- Existing databases created with the older page/manifest format are not supported by this release.
+- This package does not provide automatic migration, in-place upgrade, or compatibility fallback for older database files or encrypted backup containers.
 - Existing deployments must keep using the previous format until a separate migration path is introduced.

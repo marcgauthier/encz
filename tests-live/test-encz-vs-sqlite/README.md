@@ -63,4 +63,4 @@ To further improve the test coverage, the following enhancements are planned:
 2. **Power Failure Simulation:**
    - Emulate abrupt power failures by corrupting random database pages mid-write and checking that standard SQLite WAL journal recovery handles decryption of recovered frames correctly.
 3. **Resilience & Corruption Harness:**
-   - Add abrupt process crash (`SIGKILL`), out-of-disk-space, and byte-level on-disk corruption scenarios to verify the GCM authentication tag flags decryption failures outside the steady-state live runner process.
+   - Add abrupt process crash (`SIGKILL`), out-of-disk-space, and byte-level on-disk corruption scenarios to verify the ChaCha20-Poly1305 authentication tag flags decryption failures outside the steady-state live runner process.

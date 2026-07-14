@@ -6,7 +6,7 @@ This directory contains integration tests verifying encryption key management, k
 - **Key Rotation (ReKey)**: Validates that `db.ReKey` successfully updates the encryption key of an existing database, such that the old key is rejected and the new key is required to decrypt/read data.
 - **Rotation Policy Configuration**: Verifies that setting and reading rotation policies via `SetRotationPolicy` and `RotationStatus` persists correctly and rejects invalid policy values (e.g., non-positive rotation days).
 - **PRAGMA crypto_key**: Asserts that the database encryption key can be configured via standard raw SQL execution (`PRAGMA crypto_key = '...'`) before any database I/O starts.
-- **PRAGMA crypto_status**: Asserts that `PRAGMA crypto_status` returns correct status strings identifying the encryption cipher (AES-256-GCM) and key configuration state.
+- **PRAGMA crypto_status**: Asserts that `PRAGMA crypto_status` returns correct status strings identifying the encryption cipher (ChaCha20-Poly1305) and key configuration state.
 - **Lazy Key Configuration Rejection**: Asserts that attempting to set `PRAGMA crypto_key` after database reads/writes have occurred results in a validation error.
 
 ## Future Improvements

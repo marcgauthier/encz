@@ -64,7 +64,7 @@ func TestCryptoPragmas(t *testing.T) {
 		db.Close()
 		t.Fatalf("PRAGMA crypto_status failed: %v", err)
 	}
-	if !strings.Contains(status, "cipher=aes-256-gcm") || !strings.Contains(status, "key=set") {
+	if !strings.Contains(status, "cipher=chacha20-poly1305") || !strings.Contains(status, "key=set") {
 		t.Errorf("crypto_status output does not contain expected values: %q", status)
 	}
 

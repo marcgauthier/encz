@@ -3,8 +3,6 @@ package encz
 import (
 	"archive/zip"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"database/sql"
 	"encoding/binary"
@@ -18,11 +16,12 @@ import (
 	"github.com/awnumar/memguard"
 	sqlite3 "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
-	backupArchiveMagic     = "ENCZB1"
-	backupArchiveVersion   = 1
+	backupArchiveMagic     = "ENCZB2"
+	backupArchiveVersion   = 2
 	backupArchiveSaltSize  = 16
 	backupArchiveNonceSize = 12
 	backupArchiveKeySize   = 32
@@ -496,11 +495,7 @@ func deriveBackupArchiveKey(key *memguard.LockedBuffer, hdr backupArchiveHeader)
 }
 
 func sealBackupArchive(kek []byte, hdr backupArchiveHeader, plain []byte) ([]byte, error) {
-	block, err := aes.NewCipher(kek)
-	if err != nil {
-		return nil, err
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := chacha20poly1305.New(kek)
 	if err != nil {
 		return nil, err
 	}
@@ -508,11 +503,7 @@ func sealBackupArchive(kek []byte, hdr backupArchiveHeader, plain []byte) ([]byt
 }
 
 func openBackupArchive(kek []byte, hdr backupArchiveHeader, ciphertext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(kek)
-	if err != nil {
-		return nil, err
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := chacha20poly1305.New(kek)
 	if err != nil {
 		return nil, err
 	}
