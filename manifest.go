@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -558,6 +559,12 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 }
 
 func syncParentDir(dir string) error {
+	// Windows does not support syncing directory handles. The manifest data has
+	// already been flushed and renamed atomically, so retain that behavior while
+	// skipping the Unix-specific directory metadata durability step.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	h, err := os.Open(dir)
 	if err != nil {
 		return err

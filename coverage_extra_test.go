@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -2060,6 +2061,10 @@ func TestEncryptDecryptManifestPayloadErrors(t *testing.T) {
 }
 
 func TestSyncParentDirOpenError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not sync directory handles")
+	}
+
 	tempDir := t.TempDir()
 	subDir := filepath.Join(tempDir, "noread_dir")
 	if err := os.Mkdir(subDir, 0755); err != nil {
@@ -2075,6 +2080,17 @@ func TestSyncParentDirOpenError(t *testing.T) {
 	err := syncParentDir(subDir)
 	if err == nil {
 		t.Fatal("expected syncParentDir to fail when directory cannot be opened")
+	}
+}
+
+func TestSyncParentDirWindowsIsNoop(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only behavior")
+	}
+
+	missingDir := filepath.Join(t.TempDir(), "does-not-exist")
+	if err := syncParentDir(missingDir); err != nil {
+		t.Fatalf("syncParentDir(%q): %v; Windows directory sync must be a no-op", missingDir, err)
 	}
 }
 
