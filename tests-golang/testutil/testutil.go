@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/marcgauthier/encz"
+	"github.com/marcgauthier/SQLiteSeal"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -35,7 +35,7 @@ func OpenTestDB(t *testing.T, encrypted bool, foreignKeys bool, journalMode stri
 		t.Cleanup(func() { db.Close() })
 		return db, dbPath
 	}
-	opts := encz.Options{Key: "TestSecretKey123"}
+	opts := sqliteseal.Options{Key: "TestSecretKey123"}
 	if journalMode != "" {
 		opts.JournalMode = journalMode
 	}
@@ -44,7 +44,7 @@ func OpenTestDB(t *testing.T, encrypted bool, foreignKeys bool, journalMode stri
 			"_foreign_keys": "1",
 		}
 	}
-	db, err := encz.OpenWithOptions(dbPath, opts)
+	db, err := sqliteseal.OpenWithOptions(dbPath, opts)
 	if err != nil {
 		t.Fatalf("failed to open database (encrypted=%v): %v", encrypted, err)
 	}

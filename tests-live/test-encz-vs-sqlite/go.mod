@@ -1,10 +1,10 @@
-module github.com/marcgauthier/encz/test-encz-vs-sqlite
+module github.com/marcgauthier/SQLiteSeal/test-encz-vs-sqlite
 
 go 1.25.0
 
 require (
 	github.com/brianvoe/gofakeit/v7 v7.9.0
-	github.com/marcgauthier/encz v0.0.0
+	github.com/marcgauthier/SQLiteSeal v0.0.0
 	github.com/mattn/go-sqlite3 v1.14.48
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -16,4 +16,4 @@ require (
 	golang.org/x/sys v0.45.0 // indirect
 )
 
-replace github.com/marcgauthier/encz => ../..
+replace github.com/marcgauthier/SQLiteSeal => ../..

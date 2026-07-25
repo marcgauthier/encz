@@ -1,6 +1,7 @@
-package encz
+package sqliteseal
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -20,6 +21,14 @@ type keyRegistry struct {
 	keys             map[uint32]*memguard.LockedBuffer
 	allowDEKRotation bool
 	dbUUID           [16]byte
+	aeads            map[uint32]*cachedAEAD
+	pageCache        *decryptedPageCache
+	readStats        *readStats
+}
+
+type registryRuntimeConfig struct {
+	cacheBytes   int64
+	statsEnabled bool
 }
 
 var (
@@ -35,7 +44,7 @@ func cloneLockedBuffer(src *memguard.LockedBuffer) *memguard.LockedBuffer {
 	return memguard.NewBufferFromBytes(dup)
 }
 
-func registerKeyRegistry(manifestPath string, masterKey *memguard.LockedBuffer, payload manifestPayload, policy RotationPolicy, allowDEKRotation bool) (uint64, error) {
+func registerKeyRegistry(manifestPath string, masterKey *memguard.LockedBuffer, payload manifestPayload, policy RotationPolicy, allowDEKRotation bool, configs ...registryRuntimeConfig) (uint64, error) {
 	keys, err := buildRegistryKeyBuffers(payload)
 	if err != nil {
 		return 0, err
@@ -44,6 +53,11 @@ func registerKeyRegistry(manifestPath string, masterKey *memguard.LockedBuffer, 
 	if decoded, err := hex.DecodeString(payload.DBUUID); err == nil && len(decoded) == 16 {
 		copy(dbUUID[:], decoded)
 	}
+	cfg := registryRuntimeConfig{cacheBytes: DefaultDecryptedPageCacheBytes}
+	if len(configs) > 0 {
+		cfg = configs[0]
+	}
+	stats := &readStats{enabled: cfg.statsEnabled}
 	reg := &keyRegistry{
 		manifestPath:     manifestPath,
 		masterKey:        cloneLockedBuffer(masterKey),
@@ -52,7 +66,10 @@ func registerKeyRegistry(manifestPath string, masterKey *memguard.LockedBuffer, 
 		keys:             keys,
 		allowDEKRotation: allowDEKRotation,
 		dbUUID:           dbUUID,
+		aeads:            make(map[uint32]*cachedAEAD),
+		readStats:        stats,
 	}
+	reg.pageCache = newDecryptedPageCache(cfg.cacheBytes, stats)
 	for {
 		var capability [8]byte
 		if _, err := rand.Read(capability[:]); err != nil {
@@ -95,6 +112,11 @@ func destroyKeyRegistry(handle uint64) {
 	}
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
+	if reg.pageCache != nil {
+		reg.pageCache.clear()
+		reg.pageCache = nil
+	}
+	reg.aeads = nil
 	if reg.masterKey != nil {
 		reg.masterKey.Destroy()
 		reg.masterKey = nil
@@ -137,8 +159,12 @@ func updateKeyRegistryManifest(handle uint64, payload manifestPayload, policy Ro
 		}
 	}
 	reg.keys = keys
+	reg.aeads = make(map[uint32]*cachedAEAD)
 	reg.payload = payload
 	reg.policy = policy
+	if reg.pageCache != nil {
+		reg.pageCache.clear()
+	}
 	return nil
 }
 
@@ -182,6 +208,36 @@ func (r *keyRegistry) fillKey(keyID uint32, out []byte) bool {
 	}
 	copy(out, buf.Bytes())
 	return true
+}
+
+func (r *keyRegistry) acquirePageAEAD(keyID uint32) (cipher.AEAD, *cachedAEAD, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry := r.aeads[keyID]
+	if entry != nil {
+		if value := entry.pool.Get(); value != nil {
+			return value.(cipher.AEAD), entry, true
+		}
+	}
+	key, ok := r.keys[keyID]
+	if !ok && r.masterKey != nil {
+		if err := r.refreshManifestLocked(); err == nil {
+			key, ok = r.keys[keyID]
+			entry = r.aeads[keyID]
+		}
+	}
+	if !ok || key == nil {
+		return nil, nil, false
+	}
+	aead, err := newCipherAEAD(r.payload.Cipher, key.Bytes())
+	if err != nil {
+		return nil, nil, false
+	}
+	if entry == nil {
+		entry = &cachedAEAD{}
+		r.aeads[keyID] = entry
+	}
+	return aead, entry, true
 }
 
 func (r *keyRegistry) fillActiveKey(out []byte) (uint32, bool) {
@@ -230,8 +286,12 @@ func (r *keyRegistry) refreshManifestLocked() error {
 		}
 	}
 	r.keys = keys
+	r.aeads = make(map[uint32]*cachedAEAD)
 	r.payload = payload
 	r.policy = policy
+	if r.pageCache != nil {
+		r.pageCache.clear()
+	}
 	return nil
 }
 

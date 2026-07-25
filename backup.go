@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"archive/zip"
@@ -27,11 +27,11 @@ const (
 )
 
 var (
-	ErrBackupTargetRequired         = errors.New("encz: backup target path is required")
-	ErrBackupOutputExists           = errors.New("encz: backup output already exists")
-	ErrBackupCompressionUnsupported = errors.New("encz: backup compression is unsupported")
-	ErrBackupArchiveInvalid         = errors.New("encz: backup archive is invalid")
-	ErrBackupAuthFailed             = errors.New("encz: backup archive authentication failed")
+	ErrBackupTargetRequired         = errors.New("sqliteseal: backup target path is required")
+	ErrBackupOutputExists           = errors.New("sqliteseal: backup output already exists")
+	ErrBackupCompressionUnsupported = errors.New("sqliteseal: backup compression is unsupported")
+	ErrBackupArchiveInvalid         = errors.New("sqliteseal: backup archive is invalid")
+	ErrBackupAuthFailed             = errors.New("sqliteseal: backup archive authentication failed")
 )
 
 type BackupOptions struct {
@@ -166,7 +166,7 @@ func normalizeBackupCompression(mode BackupCompression) (BackupCompression, erro
 
 func sanitizeZipEntryPath(base, entryName string) (string, error) {
 	if filepath.IsAbs(entryName) {
-		return "", fmt.Errorf("encz: absolute path in backup archive: %s", entryName)
+		return "", fmt.Errorf("sqliteseal: absolute path in backup archive: %s", entryName)
 	}
 	target := filepath.Join(base, entryName)
 	absBase, err := filepath.Abs(base)
@@ -178,7 +178,7 @@ func sanitizeZipEntryPath(base, entryName string) (string, error) {
 		return "", err
 	}
 	if !strings.HasPrefix(absTarget, absBase+string(os.PathSeparator)) && absTarget != absBase {
-		return "", fmt.Errorf("encz: path escapes target directory: %s", entryName)
+		return "", fmt.Errorf("sqliteseal: path escapes target directory: %s", entryName)
 	}
 	return target, nil
 }
@@ -233,7 +233,7 @@ func TestBackup(file, masterKey, tempFolder string) error {
 		return ErrKeyRequired
 	}
 	if strings.TrimSpace(tempFolder) == "" {
-		return fmt.Errorf("encz: backup temp folder is required")
+		return fmt.Errorf("sqliteseal: backup temp folder is required")
 	}
 
 	zipPath, err := decryptBackupArchive(file, masterKey, tempFolder)
@@ -271,7 +271,7 @@ func TestBackup(file, masterKey, tempFolder string) error {
 		return err
 	}
 	if integrity != "ok" {
-		return fmt.Errorf("encz: backup integrity check failed: %s", integrity)
+		return fmt.Errorf("sqliteseal: backup integrity check failed: %s", integrity)
 	}
 	return nil
 }
@@ -312,7 +312,7 @@ func extractBackupArchive(file, tempFolder string) (dbPath string, manifestPath 
 	}
 
 	if dbPath == "" {
-		return "", "", fmt.Errorf("encz: backup archive missing .bak database")
+		return "", "", fmt.Errorf("sqliteseal: backup archive missing .bak database")
 	}
 	if manifestPath == "" {
 		return "", "", ErrManifestMissing
@@ -339,7 +339,7 @@ func extractZipEntry(f *zip.File, target string) error {
 
 func decryptBackupArchive(file, masterKey, tempFolder string) (string, error) {
 	if strings.TrimSpace(tempFolder) == "" {
-		return "", fmt.Errorf("encz: backup temp folder is required")
+		return "", fmt.Errorf("sqliteseal: backup temp folder is required")
 	}
 	if err := os.MkdirAll(tempFolder, 0o755); err != nil {
 		return "", err
@@ -536,12 +536,12 @@ func copyDatabasePages(ctx context.Context, srcDB, destDB *sql.DB) error {
 	return srcConn.Raw(func(srcRaw any) error {
 		srcSQLiteConn, ok := srcRaw.(*sqlite3.SQLiteConn)
 		if !ok {
-			return fmt.Errorf("encz: unexpected source SQLite connection type %T", srcRaw)
+			return fmt.Errorf("sqliteseal: unexpected source SQLite connection type %T", srcRaw)
 		}
 		return destConn.Raw(func(destRaw any) error {
 			destSQLiteConn, ok := destRaw.(*sqlite3.SQLiteConn)
 			if !ok {
-				return fmt.Errorf("encz: unexpected destination SQLite connection type %T", destRaw)
+				return fmt.Errorf("sqliteseal: unexpected destination SQLite connection type %T", destRaw)
 			}
 			backup, err := destSQLiteConn.Backup("main", srcSQLiteConn, "main")
 			if err != nil {
@@ -554,7 +554,7 @@ func copyDatabasePages(ctx context.Context, srcDB, destDB *sql.DB) error {
 				return err
 			}
 			if !done {
-				return errors.New("encz: backup did not complete")
+				return errors.New("sqliteseal: backup did not complete")
 			}
 			return nil
 		})

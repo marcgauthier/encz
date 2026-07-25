@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"crypto/subtle"
@@ -41,8 +41,16 @@ func OpenWithOptions(path string, opts Options) (*DB, error) {
 	}, nil
 }
 
-func OpenEncz(path, key string) (*DB, error) {
+// OpenSQLiteSeal opens or creates an encrypted SQLiteSeal database using the
+// default options.
+func OpenSQLiteSeal(path, key string) (*DB, error) {
 	return OpenWithOptions(path, Options{Key: key})
+}
+
+// OpenEncz is retained for source compatibility.
+// Deprecated: use OpenSQLiteSeal.
+func OpenEncz(path, key string) (*DB, error) {
+	return OpenSQLiteSeal(path, key)
 }
 
 func (db *DB) SQLDB() *sql.DB {
@@ -50,6 +58,40 @@ func (db *DB) SQLDB() *sql.DB {
 		return nil
 	}
 	return db.DB
+}
+
+// ReadPerformanceStats returns a point-in-time snapshot of encrypted page-read metrics.
+func (db *DB) ReadPerformanceStats() ReadPerformanceStats {
+	if db == nil {
+		return ReadPerformanceStats{}
+	}
+	db.mu.RLock()
+	handle, closed := db.registryHandle, db.closed
+	db.mu.RUnlock()
+	if closed {
+		return ReadPerformanceStats{}
+	}
+	reg, ok := getKeyRegistry(handle)
+	if !ok {
+		return ReadPerformanceStats{}
+	}
+	return reg.readStats.snapshot()
+}
+
+// ResetReadPerformanceStats clears all encrypted page-read metrics.
+func (db *DB) ResetReadPerformanceStats() {
+	if db == nil {
+		return
+	}
+	db.mu.RLock()
+	handle, closed := db.registryHandle, db.closed
+	db.mu.RUnlock()
+	if closed {
+		return
+	}
+	if reg, ok := getKeyRegistry(handle); ok {
+		reg.readStats.reset()
+	}
 }
 
 func (db *DB) Close() error {

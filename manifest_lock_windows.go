@@ -1,6 +1,6 @@
 //go:build windows
 
-package encz
+package sqliteseal
 
 import (
 	"os"

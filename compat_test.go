@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"database/sql"

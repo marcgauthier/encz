@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"archive/zip"
@@ -63,9 +63,9 @@ func TestOpenCloseNilDB(t *testing.T) {
 
 func TestDoubleCloseDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "double_close.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
-		t.Fatalf("OpenEncz failed: %v", err)
+		t.Fatalf("OpenSQLiteSeal failed: %v", err)
 	}
 	if err := db.Close(); err != nil {
 		t.Errorf("first Close failed: %v", err)
@@ -147,7 +147,7 @@ func TestManifestMismatchAndMissing(t *testing.T) {
 		t.Fatalf("failed to write fake manifest: %v", err)
 	}
 
-	_, err := OpenEncz(dbPath, "Pass123")
+	_, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if !errors.Is(err, ErrManifestMismatch) {
 		t.Errorf("expected ErrManifestMismatch, got %v", err)
 	}
@@ -160,7 +160,7 @@ func TestManifestMismatchAndMissing(t *testing.T) {
 		t.Fatalf("failed to write fake db: %v", err)
 	}
 
-	_, err = OpenEncz(dbPath, "Pass123")
+	_, err = OpenSQLiteSeal(dbPath, "Pass123")
 	if !errors.Is(err, ErrManifestMissing) {
 		t.Errorf("expected ErrManifestMissing, got %v", err)
 	}
@@ -172,7 +172,7 @@ func TestAutoRewrapKekRotationOnOpen(t *testing.T) {
 	key := "Pass123"
 
 	// Create DB
-	db, err := OpenEncz(dbPath, key)
+	db, err := OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestParseManifestErrors(t *testing.T) {
 func TestDecryptManifestPayloadAuthFailed(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "auth_failed.db")
-	db, err := OpenEncz(dbPath, "CorrectKey123")
+	db, err := OpenSQLiteSeal(dbPath, "CorrectKey123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestDecryptManifestPayloadAuthFailed(t *testing.T) {
 func TestRotationStatusDeletedOrCorruptedManifest(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "rot_status.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -506,7 +506,7 @@ func TestEnczKeysExportedFunctions(t *testing.T) {
 
 func TestBackupTargetRequiredAndClosed(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "backup_test.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -526,7 +526,7 @@ func TestBackupTargetRequiredAndClosed(t *testing.T) {
 func TestBackupManifestErrors(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "backup_manifest.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -553,7 +553,7 @@ func TestBackupManifestErrors(t *testing.T) {
 func TestBackupDirCreationAndFileExistsErrors(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "backup_dir.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -579,7 +579,7 @@ func TestBackupOutputExistsPreTemp(t *testing.T) {
 func TestBackupOpenSQLDBFailure(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "backup_sql.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1147,7 +1147,7 @@ func TestEnczKeysExportedFunctionsActiveKeyNotFound(t *testing.T) {
 func TestReKeySaveManifestError(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "rekey_save_err.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1164,7 +1164,7 @@ func TestReKeySaveManifestError(t *testing.T) {
 func TestSetRotationPolicyErrors(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "policy_errs.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1182,7 +1182,7 @@ func TestSetRotationPolicyErrors(t *testing.T) {
 	// 2. saveManifest failure
 	// Re-create a valid DB first
 	dbPath2 := filepath.Join(tempDir, "policy_errs2.db")
-	db2, err := OpenEncz(dbPath2, "Pass123")
+	db2, err := OpenSQLiteSeal(dbPath2, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1235,7 +1235,7 @@ func TestDriverRegisterErrors(t *testing.T) {
 func TestReKeyEdgeCases(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "rekey_edge.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1342,7 +1342,7 @@ func TestBackupInternalErrors(t *testing.T) {
 	t.Run("CopyPagesError", func(t *testing.T) {
 		tempDir := t.TempDir()
 		dbPath := filepath.Join(tempDir, "copy_pages.db")
-		db, err := OpenEncz(dbPath, "Pass123")
+		db, err := OpenSQLiteSeal(dbPath, "Pass123")
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -1359,7 +1359,7 @@ func TestBackupInternalErrors(t *testing.T) {
 	t.Run("VacuumError", func(t *testing.T) {
 		tempDir := t.TempDir()
 		dbPath := filepath.Join(tempDir, "vacuum.db")
-		db, err := OpenEncz(dbPath, "Pass123")
+		db, err := OpenSQLiteSeal(dbPath, "Pass123")
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -1424,7 +1424,7 @@ func TestBackupInternalErrors(t *testing.T) {
 	t.Run("ReadManifestError", func(t *testing.T) {
 		tempDir := t.TempDir()
 		dbPath := filepath.Join(tempDir, "read_manifest.db")
-		db, err := OpenEncz(dbPath, "Pass123")
+		db, err := OpenSQLiteSeal(dbPath, "Pass123")
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -1457,7 +1457,7 @@ func TestBackupInternalErrors(t *testing.T) {
 	t.Run("WriteManifestError", func(t *testing.T) {
 		tempDir := t.TempDir()
 		dbPath := filepath.Join(tempDir, "write_manifest.db")
-		db, err := OpenEncz(dbPath, "Pass123")
+		db, err := OpenSQLiteSeal(dbPath, "Pass123")
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -1495,7 +1495,7 @@ func TestBackupInternalErrors(t *testing.T) {
 	t.Run("OpenSQLDBFailure", func(t *testing.T) {
 		tempDir := t.TempDir()
 		dbPath := filepath.Join(tempDir, "backup_sql_fail.db")
-		db, err := OpenEncz(dbPath, "Pass123")
+		db, err := OpenSQLiteSeal(dbPath, "Pass123")
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -1518,7 +1518,7 @@ func TestAutoRewrapSaveManifestError(t *testing.T) {
 	dbPath := filepath.Join(tempDir, "autorewrap_err.db")
 	key := "Pass123"
 
-	db, err := OpenEncz(dbPath, key)
+	db, err := OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1563,7 +1563,7 @@ func TestResolveOpenOptionsRegisterKeyRegistryError(t *testing.T) {
 	key := "Pass123"
 
 	// Create valid DB
-	db, err := OpenEncz(dbPath, key)
+	db, err := OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1578,7 +1578,7 @@ func TestResolveOpenOptionsRegisterKeyRegistryError(t *testing.T) {
 		p.DEKs[0].DEKHex = "invalid-hex-chars!!"
 	})
 
-	_, err = OpenEncz(dbPath, key)
+	_, err = OpenSQLiteSeal(dbPath, key)
 	if !errors.Is(err, ErrManifestInvalid) {
 		t.Errorf("expected ErrManifestInvalid, got %v", err)
 	}
@@ -1614,7 +1614,7 @@ func TestTestBackupHelperMoreErrors(t *testing.T) {
 
 	// Create a real manifest
 	dbPath := filepath.Join(tempDir, "src.db")
-	db, _ := OpenEncz(dbPath, key)
+	db, _ := OpenSQLiteSeal(dbPath, key)
 	db.Exec("CREATE TABLE t(x)")
 	db.Close()
 
@@ -1651,7 +1651,7 @@ func TestTestBackupHelperMoreErrors(t *testing.T) {
 func TestBackupNullByteDbPath(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "null_db.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1670,7 +1670,7 @@ func TestBackupRegisterKeyRegistryError(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "reg_fail_backup.db")
 	key := "Pass123"
-	db, err := OpenEncz(dbPath, key)
+	db, err := OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1898,9 +1898,9 @@ func TestBuildDSNAllOptions(t *testing.T) {
 
 func TestSQLDBNonNil(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "sql_db_non_nil.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
-		t.Fatalf("OpenEncz failed: %v", err)
+		t.Fatalf("OpenSQLiteSeal failed: %v", err)
 	}
 	defer db.Close()
 	if db.SQLDB() == nil {
@@ -1911,7 +1911,7 @@ func TestSQLDBNonNil(t *testing.T) {
 func TestReKeySaveManifestErrorCorrected(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "rekey_save_err_corr.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1930,7 +1930,7 @@ func TestReKeySaveManifestErrorCorrected(t *testing.T) {
 
 func TestSetRotationPolicyInvalid(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "set_policy_inv.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1945,7 +1945,7 @@ func TestSetRotationPolicyInvalid(t *testing.T) {
 func TestSetRotationPolicySaveManifestErrorCorrected(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "set_policy_save_err.db")
-	db, err := OpenEncz(dbPath, "Pass123")
+	db, err := OpenSQLiteSeal(dbPath, "Pass123")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

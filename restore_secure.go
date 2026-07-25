@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"archive/zip"
@@ -34,11 +34,11 @@ func RestoreBackup(file, masterKey, toFolder string, overwriteExistingFile bool)
 		return ErrKeyRequired
 	}
 	if strings.TrimSpace(toFolder) == "" {
-		return fmt.Errorf("encz: restore target folder is required")
+		return fmt.Errorf("sqliteseal: restore target folder is required")
 	}
 	if info, err := os.Lstat(toFolder); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return fmt.Errorf("encz: restore target must be a real directory: %s", toFolder)
+			return fmt.Errorf("sqliteseal: restore target must be a real directory: %s", toFolder)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -179,7 +179,7 @@ func validateBackupDatabase(dbPath, manifestPath, masterKey string) error {
 		return closeErr
 	}
 	if integrity != "ok" {
-		return fmt.Errorf("encz: backup integrity check failed: %s", integrity)
+		return fmt.Errorf("sqliteseal: backup integrity check failed: %s", integrity)
 	}
 	return nil
 }
@@ -191,10 +191,10 @@ func commitRestoredFiles(toFolder, stageDir string, sources []string, overwrite 
 		info, err := os.Lstat(target)
 		if err == nil {
 			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-				return fmt.Errorf("encz: restore target is not a regular file: %s", target)
+				return fmt.Errorf("sqliteseal: restore target is not a regular file: %s", target)
 			}
 			if !overwrite {
-				return fmt.Errorf("encz: restore target file already exists: %s", target)
+				return fmt.Errorf("sqliteseal: restore target file already exists: %s", target)
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -10,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,8 +20,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/marcgauthier/encz"
+	"github.com/marcgauthier/SQLiteSeal"
 	_ "github.com/mattn/go-sqlite3"
+	_ "turso.tech/database/tursogo"
 )
 
 const (
@@ -75,6 +79,9 @@ type config struct {
 	dbPath                  string
 	plainPath               string
 	password                string
+	tursoPath               string
+	tursoHexKey             string
+	enczReadCacheBytes      int64
 	rowCount                int
 	writeBenchmarkRows      int
 	singleInsertRows        int
@@ -90,9 +97,12 @@ type config struct {
 
 func main() {
 	var cfg config
-	flag.StringVar(&cfg.dbPath, "db", filepath.Join(".", "encz-benchmark.db"), "path to the encz database file")
+	flag.StringVar(&cfg.dbPath, "db", filepath.Join(".", "sqliteseal-benchmark.db"), "path to the encz database file")
 	flag.StringVar(&cfg.plainPath, "plain", filepath.Join(".", "plain-benchmark.db"), "path to the plain SQLite database file")
-	flag.StringVar(&cfg.password, "key", defaultPassword, "encz encryption key")
+	flag.StringVar(&cfg.tursoPath, "turso", filepath.Join(".", "turso-aes256gcm-benchmark.db"), "path to the Turso AES-256-GCM database file")
+	flag.StringVar(&cfg.password, "key", defaultPassword, "SQLiteSeal encryption key")
+	flag.StringVar(&cfg.tursoHexKey, "turso-hex-key", "", "32-byte AES-256-GCM key in hex for Turso (defaults to SHA-256 of -key)")
+	flag.Int64Var(&cfg.enczReadCacheBytes, "sqliteseal-read-cache-bytes", sqliteseal.DefaultDecryptedPageCacheBytes, "SQLiteSeal decrypted-page LRU budget in bytes (-1 disables)")
 	flag.IntVar(&cfg.rowCount, "rows", defaultRowCount, "number of validation rows to persist before reopen")
 	flag.IntVar(&cfg.writeBenchmarkRows, "write-rows", defaultWriteBenchmarkRowCount, "number of rows to insert during the write benchmark")
 	flag.IntVar(&cfg.singleInsertRows, "single-rows", 100, "number of rows to insert individually (unbatched)")
@@ -105,6 +115,9 @@ func main() {
 	flag.IntVar(&cfg.concurrentPerGoroutine, "concurrent-per-goroutine", defaultConcurrentInsertPerGoroutine, "number of inserts per concurrent goroutine")
 	flag.BoolVar(&cfg.realLiveTest, "real-live-test", false, "run the 2-minute real-live-test instead of the standard benchmarks")
 	flag.Parse()
+	if cfg.tursoHexKey == "" {
+		cfg.tursoHexKey = deriveTursoHexKey(cfg.password)
+	}
 
 	if err := cfg.validate(); err != nil {
 		log.Fatal(err)
@@ -137,17 +150,20 @@ func main() {
 	}
 	orders := generateOrders(seedUsers)
 
-	// 2. ENCZ Benchmark
-	log.Println("Running encz (encrypted SQLite VFS) benchmark...")
+	// 2. SQLiteSeal AES-256-GCM benchmark.
+	log.Println("Running encz (AES-256-GCM encrypted SQLite VFS) benchmark...")
 	if err := cleanupDatabaseArtifacts(cfg.dbPath); err != nil {
 		log.Fatal(err)
 	}
 
 	busyTimeout := 5000
-	enczDb, err := encz.OpenWithOptions(cfg.dbPath, encz.Options{
-		Key:               cfg.password,
-		JournalMode:       "WAL",
-		BusyTimeoutMillis: &busyTimeout,
+	enczDb, err := sqliteseal.OpenWithOptions(cfg.dbPath, sqliteseal.Options{
+		Key:                        cfg.password,
+		Cipher:                     sqliteseal.CipherAES256GCM,
+		JournalMode:                "WAL",
+		BusyTimeoutMillis:          &busyTimeout,
+		DecryptedPageCacheBytes:    cfg.enczReadCacheBytes,
+		EnableReadPerformanceStats: true,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -176,6 +192,7 @@ func main() {
 		_ = enczDb.Close()
 		log.Fatal(err)
 	}
+	enczReadStats := enczDb.ReadPerformanceStats()
 	if err := enczDb.Close(); err != nil {
 		log.Fatal(err)
 	}
@@ -185,14 +202,68 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Measure ENCZ size on disk
+	// Measure SQLiteSeal size on disk
 	enczSize, err := getDatabaseSize(cfg.dbPath, true)
 	if err != nil {
 		log.Fatal(err)
 	}
 	enczBench.DatabaseSize = enczSize
+	if err := assertEncryptedOnDisk(cfg.dbPath, seedUsers[0].Username); err != nil {
+		log.Fatal(fmt.Errorf("encz encryption check: %w", err))
+	}
 
-	// 3. Plain SQLite Benchmark
+	// 3. Turso AES-256-GCM benchmark. Its encryption support is experimental.
+	log.Println("Running Turso embedded (AES-256-GCM) benchmark...")
+	if err := cleanupDatabaseArtifacts(cfg.tursoPath); err != nil {
+		log.Fatal(err)
+	}
+	tursoDB, err := sql.Open("turso", tursoDSN(cfg))
+	if err != nil {
+		log.Fatal(err)
+	}
+	tursoDB.SetMaxOpenConns(1)
+	if err := tursoDB.PingContext(context.Background()); err != nil {
+		_ = tursoDB.Close()
+		log.Fatal(fmt.Errorf("open Turso AES-256-GCM database: %w", err))
+	}
+	if err := createSchema(tursoDB); err != nil {
+		_ = tursoDB.Close()
+		log.Fatal(err)
+	}
+	if err := insertUsers(context.Background(), tursoDB, "users", seedUsers, 0); err != nil {
+		_ = tursoDB.Close()
+		log.Fatal(err)
+	}
+	if err := insertOrders(context.Background(), tursoDB, orders); err != nil {
+		_ = tursoDB.Close()
+		log.Fatal(err)
+	}
+	tursoBench, err := runBenchmarks(context.Background(), tursoDB, seedUsers, benchmarkUsers, singleUsers, concurrentUsers, cfg)
+	if err != nil {
+		_ = tursoDB.Close()
+		log.Fatal(err)
+	}
+	if _, err := tursoDB.ExecContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		_ = tursoDB.Close()
+		log.Fatal(err)
+	}
+	if err := tursoDB.Close(); err != nil {
+		log.Fatal(err)
+	}
+	tursoVal, err := validateTursoReopen(cfg, seedUsers, benchmarkUsers, singleUsers, concurrentUsers)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tursoSize, err := getDatabaseSize(cfg.tursoPath, false)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tursoBench.DatabaseSize = tursoSize
+	if err := assertEncryptedOnDisk(cfg.tursoPath, seedUsers[0].Username); err != nil {
+		log.Fatal(fmt.Errorf("Turso encryption check: %w", err))
+	}
+
+	// 4. Plain SQLite Benchmark
 	log.Println("Running plain SQLite benchmark...")
 	if err := cleanupDatabaseArtifacts(cfg.plainPath); err != nil {
 		log.Fatal(err)
@@ -238,28 +309,35 @@ func main() {
 	}
 	plainBench.DatabaseSize = plainSize
 
-	// 4. Output Comparison Results
+	// 5. Output Comparison Results
 	fmt.Println()
 	fmt.Println("================================================================================")
 	fmt.Println("                            BENCHMARK COMPARISON REPORT                         ")
 	fmt.Println("================================================================================")
 	fmt.Printf("Seed Rows Persisted:  %d\n", cfg.rowCount)
-	fmt.Printf("Reopen Validation:    Encz Persisted Users=%d, Batch=%d, Single=%d, Concurrent=%d, Orders=%d, Payload Verified=%t, Sample=%s\n",
+	fmt.Printf("SQLiteSeal reopen validation:  Users=%d, Batch=%d, Single=%d, Concurrent=%d, Orders=%d, Payload Verified=%t, Sample=%s\n",
 		enczVal.userCount, enczVal.benchmarkWriteCount, enczVal.singleWriteCount, enczVal.concurrentWriteCount, enczVal.orderCount, enczVal.payloadVerified, enczVal.sampleUsername)
+	fmt.Printf("Turso reopen validation: Users=%d, Batch=%d, Single=%d, Concurrent=%d, Orders=%d, Payload Verified=%t, Sample=%s\n",
+		tursoVal.userCount, tursoVal.benchmarkWriteCount, tursoVal.singleWriteCount, tursoVal.concurrentWriteCount, tursoVal.orderCount, tursoVal.payloadVerified, tursoVal.sampleUsername)
+	fmt.Println("Encryption: SQLiteSeal AES-256-GCM; Turso AES-256-GCM (experimental).")
+	fmt.Printf("SQLiteSeal read path:         Cache=%s, Requests=%d, Hits=%d, Misses=%d, AEAD=%d (%v), Physical=%d/%s (%v), ScratchAllocs=%d, Copies=%s\n",
+		formatCacheBytes(cfg.enczReadCacheBytes), enczReadStats.PageRequests, enczReadStats.CacheHits, enczReadStats.CacheMisses,
+		enczReadStats.AEADOpenCalls, enczReadStats.AEADOpenTime, enczReadStats.PhysicalReads, formatBytes(int64(enczReadStats.PhysicalReadBytes)),
+		enczReadStats.PhysicalReadTime, enczReadStats.ScratchAllocations, formatBytes(int64(enczReadStats.CopyBytes)))
 	fmt.Println("--------------------------------------------------------------------------------")
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', tabwriter.Debug)
-	fmt.Fprintln(w, " Benchmark Step\t encz (SQLite VFS)\t Plain SQLite")
-	fmt.Fprintln(w, " ----\t ----\t ----")
-	fmt.Fprintf(w, " Insert Batch (%d rows)\t %v\t %v\n", cfg.writeBenchmarkRows, enczBench.InsertBatch, plainBench.InsertBatch)
-	fmt.Fprintf(w, " Insert Single (%d rows)\t %v\t %v\n", cfg.singleInsertRows, enczBench.InsertSingle, plainBench.InsertSingle)
-	fmt.Fprintf(w, " Insert Concurrent (%d goroutines x %d)\t %v\t %v\n", cfg.concurrentGoroutines, cfg.concurrentPerGoroutine, enczBench.InsertConcurrent, plainBench.InsertConcurrent)
-	fmt.Fprintf(w, " Indexed Select (%d lookups)\t %v\t %v\n", cfg.indexedSelectIterations, enczBench.IndexedSelect, plainBench.IndexedSelect)
-	fmt.Fprintf(w, " Plain Select (%d scans)\t %v\t %v\n", cfg.plainSelectIterations, enczBench.PlainSelect, plainBench.PlainSelect)
-	fmt.Fprintf(w, " Aggregation (%d queries)\t %v\t %v\n", cfg.aggregationIterations, enczBench.AggregationQuery, plainBench.AggregationQuery)
-	fmt.Fprintf(w, " Join Indexed (%d lookups)\t %v\t %v\n", cfg.joinIndexedIterations, enczBench.JoinIndexed, plainBench.JoinIndexed)
-	fmt.Fprintf(w, " Join Plain (%d scans)\t %v\t %v\n", cfg.joinPlainIterations, enczBench.JoinPlain, plainBench.JoinPlain)
-	fmt.Fprintf(w, " Database Size on Disk\t %s\t %s\n", formatBytes(enczBench.DatabaseSize), formatBytes(plainBench.DatabaseSize))
+	fmt.Fprintln(w, " Benchmark Step\t SQLiteSeal AES-256-GCM\t Turso AES-256-GCM\t Plain SQLite")
+	fmt.Fprintln(w, " ----\t ----\t ----\t ----")
+	fmt.Fprintf(w, " Insert Batch (%d rows)\t %v\t %v\t %v\n", cfg.writeBenchmarkRows, enczBench.InsertBatch, tursoBench.InsertBatch, plainBench.InsertBatch)
+	fmt.Fprintf(w, " Insert Single (%d rows)\t %v\t %v\t %v\n", cfg.singleInsertRows, enczBench.InsertSingle, tursoBench.InsertSingle, plainBench.InsertSingle)
+	fmt.Fprintf(w, " Insert Concurrent (%d goroutines x %d)\t %v\t %v\t %v\n", cfg.concurrentGoroutines, cfg.concurrentPerGoroutine, enczBench.InsertConcurrent, tursoBench.InsertConcurrent, plainBench.InsertConcurrent)
+	fmt.Fprintf(w, " Indexed Select (%d lookups)\t %v\t %v\t %v\n", cfg.indexedSelectIterations, enczBench.IndexedSelect, tursoBench.IndexedSelect, plainBench.IndexedSelect)
+	fmt.Fprintf(w, " Plain Select (%d scans)\t %v\t %v\t %v\n", cfg.plainSelectIterations, enczBench.PlainSelect, tursoBench.PlainSelect, plainBench.PlainSelect)
+	fmt.Fprintf(w, " Aggregation (%d queries)\t %v\t %v\t %v\n", cfg.aggregationIterations, enczBench.AggregationQuery, tursoBench.AggregationQuery, plainBench.AggregationQuery)
+	fmt.Fprintf(w, " Join Indexed (%d lookups)\t %v\t %v\t %v\n", cfg.joinIndexedIterations, enczBench.JoinIndexed, tursoBench.JoinIndexed, plainBench.JoinIndexed)
+	fmt.Fprintf(w, " Join Plain (%d scans)\t %v\t %v\t %v\n", cfg.joinPlainIterations, enczBench.JoinPlain, tursoBench.JoinPlain, plainBench.JoinPlain)
+	fmt.Fprintf(w, " Database Size on Disk\t %s\t %s\t %s\n", formatBytes(enczBench.DatabaseSize), formatBytes(tursoBench.DatabaseSize), formatBytes(plainBench.DatabaseSize))
 	w.Flush()
 	fmt.Println("================================================================================")
 }
@@ -271,8 +349,14 @@ func (c config) validate() error {
 	if c.plainPath == "" {
 		return errors.New("plain path is required")
 	}
+	if c.tursoPath == "" {
+		return errors.New("turso path is required")
+	}
 	if c.password == "" {
 		return errors.New("key is required")
+	}
+	if key, err := hex.DecodeString(c.tursoHexKey); err != nil || len(key) != 32 {
+		return errors.New("turso-hex-key must encode exactly 32 bytes")
 	}
 	if c.rowCount <= 0 {
 		return errors.New("rows must be > 0")
@@ -311,7 +395,7 @@ func cleanupDatabaseArtifacts(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	for _, suffix := range []string{"-wal", "-shm", "-wal.cvmeta", ".wal", ".tmp", ".encz"} {
+	for _, suffix := range []string{"-wal", "-shm", "-wal.cvmeta", ".wal", ".tmp", ".encz", ".encz.lock", ".twal", ".tshm"} {
 		_ = os.Remove(path + suffix)
 	}
 	return nil
@@ -710,7 +794,7 @@ func exhaustRows(rows *sql.Rows) error {
 }
 
 func validateReopen(cfg config, seedUsers, writeUsers, singleUsers, concurrentUsers []userRecord, orders []orderRecord) (validationResult, error) {
-	db, err := encz.OpenWithOptions(cfg.dbPath, encz.Options{
+	db, err := sqliteseal.OpenWithOptions(cfg.dbPath, sqliteseal.Options{
 		Key:         cfg.password,
 		JournalMode: "WAL",
 	})
@@ -752,6 +836,77 @@ func validateReopen(cfg config, seedUsers, writeUsers, singleUsers, concurrentUs
 	}
 	if err := verifyUsers(context.Background(), db.DB, "concurrent_writes", concurrentUsers); err != nil {
 		return out, err
+	}
+	out.payloadVerified = true
+	return out, nil
+}
+
+func deriveTursoHexKey(password string) string {
+	sum := sha256.Sum256([]byte(password))
+	return hex.EncodeToString(sum[:])
+}
+
+func tursoDSN(cfg config) string {
+	values := url.Values{}
+	values.Set("experimental", "encryption")
+	values.Set("encryption_cipher", "aes256gcm")
+	values.Set("encryption_hexkey", cfg.tursoHexKey)
+	values.Set("_busy_timeout", "5000")
+	return cfg.tursoPath + "?" + values.Encode()
+}
+
+func assertEncryptedOnDisk(path, plaintext string) error {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if len(contents) == 0 {
+		return errors.New("database file is empty")
+	}
+	if bytes.Contains(contents, []byte(plaintext)) {
+		return errors.New("known plaintext was found in database file")
+	}
+	return nil
+}
+
+func validateTursoReopen(cfg config, seedUsers, writeUsers, singleUsers, concurrentUsers []userRecord) (validationResult, error) {
+	db, err := sql.Open("turso", tursoDSN(cfg))
+	if err != nil {
+		return validationResult{}, err
+	}
+	defer db.Close()
+	if err := db.PingContext(context.Background()); err != nil {
+		return validationResult{}, err
+	}
+	var out validationResult
+	queries := []struct {
+		query string
+		dest  *int
+	}{
+		{"SELECT count(*) FROM users", &out.userCount},
+		{"SELECT count(*) FROM benchmark_writes", &out.benchmarkWriteCount},
+		{"SELECT count(*) FROM single_writes", &out.singleWriteCount},
+		{"SELECT count(*) FROM concurrent_writes", &out.concurrentWriteCount},
+		{"SELECT count(*) FROM user_orders", &out.orderCount},
+	}
+	for _, q := range queries {
+		if err := db.QueryRowContext(context.Background(), q.query).Scan(q.dest); err != nil {
+			return out, err
+		}
+	}
+	if err := db.QueryRowContext(context.Background(), "SELECT username FROM users WHERE email = ?", seedUsers[0].Email).Scan(&out.sampleUsername); err != nil {
+		return out, err
+	}
+	if out.sampleUsername != seedUsers[0].Username {
+		return out, fmt.Errorf("sample mismatch: got %q want %q", out.sampleUsername, seedUsers[0].Username)
+	}
+	for _, check := range []struct {
+		table string
+		users []userRecord
+	}{{"users", seedUsers}, {"benchmark_writes", writeUsers}, {"single_writes", singleUsers}, {"concurrent_writes", concurrentUsers}} {
+		if err := verifyUsers(context.Background(), db, check.table, check.users); err != nil {
+			return out, err
+		}
 	}
 	out.payloadVerified = true
 	return out, nil
@@ -924,6 +1079,16 @@ func getDatabaseSize(dbPath string, isEncz bool) (int64, error) {
 	return totalSize, nil
 }
 
+func formatCacheBytes(b int64) string {
+	if b == sqliteseal.DisableDecryptedPageCache {
+		return "disabled"
+	}
+	if b == 0 {
+		b = sqliteseal.DefaultDecryptedPageCacheBytes
+	}
+	return formatBytes(b)
+}
+
 func formatBytes(b int64) string {
 	const unit = 1024
 	if b < unit {
@@ -977,7 +1142,7 @@ func (h *dbHolder) reopen() error {
 	}
 
 	busyTimeout := 5000
-	db, err := encz.OpenWithOptions(h.path, encz.Options{
+	db, err := sqliteseal.OpenWithOptions(h.path, sqliteseal.Options{
 		Key:               h.password,
 		JournalMode:       "WAL",
 		BusyTimeoutMillis: &busyTimeout,
@@ -999,13 +1164,13 @@ const liveSchema = `CREATE TABLE live_users (
 )`
 
 func runRealLiveTest(cfg config) error {
-	log.Println("Starting 2-minute real-live-test on encz...")
+	log.Println("Starting 2-minute real-live-test on sqliteseal...")
 	if err := cleanupDatabaseArtifacts(cfg.dbPath); err != nil {
 		return fmt.Errorf("cleanup database: %w", err)
 	}
 
 	busyTimeout := 5000
-	db, err := encz.OpenWithOptions(cfg.dbPath, encz.Options{
+	db, err := sqliteseal.OpenWithOptions(cfg.dbPath, sqliteseal.Options{
 		Key:               cfg.password,
 		JournalMode:       "WAL",
 		BusyTimeoutMillis: &busyTimeout,

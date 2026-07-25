@@ -1,22 +1,22 @@
-# ENCZ vs. SQLite Differential Test Runner
+# SQLiteSeal vs. SQLite Differential Test Runner
 
-This directory contains `test-encz-vs-sqlite`, a high-concurrency differential testing application that verifies the stability, correctness, and performance of `encz` (SQLite encrypted page VFS) relative to plain SQLite.
+This directory contains `test-encz-vs-sqlite`, a high-concurrency differential testing application that verifies the stability, correctness, and performance of `SQLiteSeal` (SQLite encrypted page VFS) relative to plain SQLite.
 
 ## Objective
-The core objective is to ensure that under extreme database stress, the behavior of `encz` matches SQLite identically. Any divergence in transaction behavior, return values, row data, schema structure, or database integrity is immediately detected, logged with 200-event diagnostics history, and halts execution.
+The core objective is to ensure that under extreme database stress, the behavior of `SQLiteSeal` matches SQLite identically. Any divergence in transaction behavior, return values, row data, schema structure, or database integrity is immediately detected, logged with 200-event diagnostics history, and halts execution.
 
 ---
 
 ## Stability & Correctness Verification Features
 
-The runner uses several techniques to prove the stability of the `encz` engine:
+The runner uses several techniques to prove the stability of the `SQLiteSeal` engine:
 
 ### 1. High-Concurrency Stress Testing
 - **Multi-Worker Execution:** Runs multiple concurrent worker goroutines (configurable via `worker_count`, default: 8) constantly performing database operations.
 - **Workload Mix:** Simulates realistic transaction workloads using a configurable mix of CRUD queries (e.g., 60% SELECT, 20% UPDATE, 10% INSERT, 10% DELETE).
 
 ### 2. Immediate Inline Validation
-- **Read Verification:** Every SELECT query retrieves rows by ID from both SQLite and `encz` and performs a deep structural comparison.
+- **Read Verification:** Every SELECT query retrieves rows by ID from both SQLite and `SQLiteSeal` and performs a deep structural comparison.
 - **Write Verification (Instant Detection):** Immediately following a successful `INSERT` or `UPDATE` transaction on both engines, the runner queries the modified row back by primary key (`id`) and verifies that their data payloads match perfectly. This ensures that:
   - Divergences are detected at the exact action number that caused them.
   - Verification is highly optimized ($O(1)$ complexity) and does not require scanning entire tables.
@@ -45,7 +45,7 @@ The runner uses several techniques to prove the stability of the `encz` engine:
 - **Disk Management:** If the database exceeds `max_db_size`, the runner automatically deletes 50% of the older rows and triggers a `VACUUM` transaction on both databases. This validates page re-allocation and structural compaction.
 
 ### 8. Invalid Write / Constraint Testing
-- **Error Matching:** The runner intentionally injects invalid values (nulls in non-nullable columns, wrong data types) on a small percentage of writes. It validates that both SQLite and `encz` return the **exact same error** (e.g., `UNIQUE constraint failed`, `NOT NULL constraint failed`).
+- **Error Matching:** The runner intentionally injects invalid values (nulls in non-nullable columns, wrong data types) on a small percentage of writes. It validates that both SQLite and `SQLiteSeal` return the **exact same error** (e.g., `UNIQUE constraint failed`, `NOT NULL constraint failed`).
 
 ### 9. Large Transaction Commit Validation
 - **Massive Single Transaction Boundary:** At `large_tx_interval`, the runner pauses workers and inserts 15,000 rows, each carrying a 3.5 KB payload, in one explicit transaction on both databases.

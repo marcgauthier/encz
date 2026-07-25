@@ -1,10 +1,10 @@
-# Path to the ENCZ encrypted database file
+# Path to the SQLiteSeal encrypted database file
 encz_db_path: ./encz-sqlite.db
 
 # Path to the plain SQLite database file used as the comparison baseline
 sqlite_db_path: ./plain-sqlite.db
 
-# Encryption password used by ENCZ to secure the encrypted database
+# Encryption password used by SQLiteSeal to secure the encrypted database
 encz_password: ENCzTestPassword123!
 
 # SQLite journal mode to use (e.g. DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF)
@@ -53,7 +53,7 @@ schema_change_interval: 1h
 max_db_size: 1GB
 
 
-# Key rotation settings for the ENCZ encrypted database engine
+# Key rotation settings for the SQLiteSeal encrypted database engine
 rotation_policy:
   # Interval in days after which the Key Encryption Key (KEK) is rotated
   kek_rotation_days: 7

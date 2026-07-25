@@ -1,4 +1,4 @@
-module github.com/marcgauthier/encz
+module github.com/marcgauthier/SQLiteSeal
 
 go 1.25.0
 

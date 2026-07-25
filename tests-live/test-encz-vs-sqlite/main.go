@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/brianvoe/gofakeit/v7"
-	"github.com/marcgauthier/encz"
+	"github.com/marcgauthier/SQLiteSeal"
 	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v3"
 )
@@ -81,7 +81,7 @@ type parsedConfig struct {
 	ComplexQueryEvery  time.Duration
 	LargeTxEvery       time.Duration
 	DEKRotationEvery   time.Duration
-	RotationPolicy     encz.RotationPolicy
+	RotationPolicy     sqliteseal.RotationPolicy
 	PlainDSN           string
 	DefaultConfigPath  string
 	PhaseResumeMessage string
@@ -446,7 +446,7 @@ type runner struct {
 	fake             *fakerSource
 	ctx              context.Context
 	cancel           context.CancelFunc
-	enczDB           *encz.DB
+	enczDB           *sqliteseal.DB
 	sqliteDB         *sql.DB
 	actionNo         atomic.Uint64
 	paused           atomic.Bool
@@ -636,7 +636,7 @@ func main() {
 	if status, err := r.enczDB.RotationStatus(); err != nil {
 		logger.Error("rotation status failed: %v", err)
 	} else {
-		logger.Info("ENCZ rotation status: KEK every %d days, DEK every %d hours, active DEK key id=%d", status.KEKRotationDays, status.DEKRotationHours, status.ActiveDEKKeyID)
+		logger.Info("SQLiteSeal rotation status: KEK every %d days, DEK every %d hours, active DEK key id=%d", status.KEKRotationDays, status.DEKRotationHours, status.ActiveDEKKeyID)
 	}
 
 	logger.Info("runner started: action_interval=%s compare_interval=%s reopen_interval=%s schema_change_interval=%s complex_query_interval=%s large_tx_interval=%s max_db_size=%s max_run_time=%s workers=%d invalid_write_pct=%d", cfg.ActionEvery, cfg.CompareEvery, cfg.ReopenEvery, cfg.SchemaChangeEvery, cfg.ComplexQueryEvery, cfg.LargeTxEvery, cfg.MaxDBSize, cfg.MaxRunDuration, cfg.WorkerCount, cfg.InvalidWritePct)
@@ -768,7 +768,7 @@ func loadConfig(path string) (parsedConfig, error) {
 		return parsedConfig{}, errors.New("rotation_policy.kek_rotation_days must be > 0")
 	}
 	if dekRotation%time.Hour != 0 {
-		return parsedConfig{}, fmt.Errorf("rotation_policy.dek_rotation=%s is unsupported by current ENCZ API; only whole-hour DEK rotation is supported", dekRotation)
+		return parsedConfig{}, fmt.Errorf("rotation_policy.dek_rotation=%s is unsupported by current SQLiteSeal API; only whole-hour DEK rotation is supported", dekRotation)
 	}
 	plainDSN := buildSQLiteDSN(raw.SQLiteDBPath, raw.JournalMode)
 	return parsedConfig{
@@ -783,7 +783,7 @@ func loadConfig(path string) (parsedConfig, error) {
 		ComplexQueryEvery: complexQueryEvery,
 		LargeTxEvery:      largeTxEvery,
 		DEKRotationEvery:  dekRotation,
-		RotationPolicy: encz.RotationPolicy{
+		RotationPolicy: sqliteseal.RotationPolicy{
 			KEKRotationDays:  raw.RotationPolicy.KEKRotationDays,
 			DEKRotationHours: int(dekRotation / time.Hour),
 			AutoRewrap:       raw.RotationPolicy.AutoRewrap,
@@ -838,7 +838,7 @@ func (r *runner) connectDatabases() error {
 		return err
 	}
 
-	opts := encz.Options{
+	opts := sqliteseal.Options{
 		Key:         r.cfg.EnczPassword,
 		JournalMode: r.cfg.JournalMode,
 		URIParameters: map[string]string{
@@ -846,7 +846,7 @@ func (r *runner) connectDatabases() error {
 			"_busy_timeout": "5000",
 		},
 	}
-	encDB, err := encz.OpenWithOptions(r.cfg.EnczDBPath, opts)
+	encDB, err := sqliteseal.OpenWithOptions(r.cfg.EnczDBPath, opts)
 	if err != nil {
 		_ = plainDB.Close()
 		return err
@@ -1346,8 +1346,8 @@ func (r *runner) validateBackupRestore() error {
 	_ = os.Remove(backupZipPath)
 
 	// 1. Create backup
-	opts := encz.BackupOptions{
-		Compression: encz.BackupCompressionDeflate,
+	opts := sqliteseal.BackupOptions{
+		Compression: sqliteseal.BackupCompressionDeflate,
 	}
 	r.logger.Record("creating database backup to %s", backupZipPath)
 	if err := r.enczDB.Backup(backupZipPath, opts); err != nil {
@@ -1371,7 +1371,7 @@ func (r *runner) validateBackupRestore() error {
 	// 4. Restore database from backup zip
 	restoreDir := filepath.Dir(r.cfg.EnczDBPath)
 	r.logger.Record("restoring database from %s to %s", backupZipPath, restoreDir)
-	if err := encz.RestoreBackup(backupZipPath, r.cfg.EnczPassword, restoreDir, true); err != nil {
+	if err := sqliteseal.RestoreBackup(backupZipPath, r.cfg.EnczPassword, restoreDir, true); err != nil {
 		r.logger.Fatal("restore backup failed: %v", err)
 		return err
 	}

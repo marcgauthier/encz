@@ -1,6 +1,6 @@
 # Cryptographic & Security Integration Tests
 
-This directory contains integration tests verifying data confidentiality, cryptographic key rejection boundaries, and metadata safety of the `encz` VFS.
+This directory contains integration tests verifying data confidentiality, cryptographic key rejection boundaries, and metadata safety of the `SQLiteSeal` VFS.
 
 ## What is tested
 - **Invalid Key Rejection**: Asserts that attempting to open or read an encrypted database using an incorrect key fails.

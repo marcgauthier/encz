@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 /*
 #include <stdint.h>

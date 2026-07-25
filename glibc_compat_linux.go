@@ -1,6 +1,6 @@
 //go:build linux
 
-package encz
+package sqliteseal
 
 /*
 #include <stdlib.h>

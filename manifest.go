@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"crypto/rand"
@@ -47,17 +47,18 @@ func getArgonParams() (uint32, uint32, uint8) {
 }
 
 var (
-	ErrKeyRequired           = errors.New("encz: encryption key is required")
-	ErrManifestMissing       = errors.New("encz: manifest file is required")
-	ErrManifestMismatch      = errors.New("encz: database and manifest files are inconsistent")
-	ErrManifestInvalid       = errors.New("encz: manifest is invalid")
-	ErrManifestAuthFailed    = errors.New("encz: manifest authentication failed")
-	ErrDirectKeyUnsupported  = errors.New("encz: direct key configuration is unsupported")
-	ErrFileBackedRequired    = errors.New("encz: only file-backed encrypted databases are supported")
-	ErrUnsafeJournalMode     = errors.New("encz: on-disk rollback journals are not encrypted; use WAL or MEMORY")
-	ErrRotationPolicyInvalid = errors.New("encz: rotation policy is invalid")
-	ErrDBClosed              = errors.New("encz: database handle is closed")
-	ErrCurrentKeyMismatch    = errors.New("encz: old key does not match the active handle key")
+	ErrKeyRequired           = errors.New("sqliteseal: encryption key is required")
+	ErrManifestMissing       = errors.New("sqliteseal: manifest file is required")
+	ErrManifestMismatch      = errors.New("sqliteseal: database and manifest files are inconsistent")
+	ErrManifestInvalid       = errors.New("sqliteseal: manifest is invalid")
+	ErrManifestAuthFailed    = errors.New("sqliteseal: manifest authentication failed")
+	ErrDirectKeyUnsupported  = errors.New("sqliteseal: direct key configuration is unsupported")
+	ErrFileBackedRequired    = errors.New("sqliteseal: only file-backed encrypted databases are supported")
+	ErrUnsafeJournalMode     = errors.New("sqliteseal: on-disk rollback journals are not encrypted; use WAL or MEMORY")
+	ErrRotationPolicyInvalid = errors.New("sqliteseal: rotation policy is invalid")
+	ErrDBClosed              = errors.New("sqliteseal: database handle is closed")
+	ErrCurrentKeyMismatch    = errors.New("sqliteseal: old key does not match the active handle key")
+	ErrPageCacheSizeInvalid  = errors.New("sqliteseal: decrypted page cache size must be -1, zero, or a positive byte count")
 )
 
 type RotationPolicy struct {
@@ -134,7 +135,10 @@ func resolveOpenOptions(path string, opts Options) (Options, string, uint64, err
 	if isMemoryPath(path, opts) {
 		return Options{}, "", 0, ErrFileBackedRequired
 	}
-	var err error
+	cacheBytes, err := normalizeDecryptedPageCacheBytes(opts.DecryptedPageCacheBytes)
+	if err != nil {
+		return Options{}, "", 0, err
+	}
 	opts, err = secureOpenOptions(opts)
 	if err != nil {
 		return Options{}, "", 0, err
@@ -202,11 +206,26 @@ func resolveOpenOptions(path string, opts Options) (Options, string, uint64, err
 		return Options{}, "", 0, err
 	}
 
-	handle, err := registerKeyRegistry(manifestPath, keyBuf, payload, policy, true)
+	handle, err := registerKeyRegistry(manifestPath, keyBuf, payload, policy, true, registryRuntimeConfig{
+		cacheBytes: cacheBytes, statsEnabled: opts.EnableReadPerformanceStats,
+	})
 	if err != nil {
 		return Options{}, "", 0, err
 	}
 	return applyRegistryToOptions(opts, handle), manifestPath, handle, nil
+}
+
+func normalizeDecryptedPageCacheBytes(value int64) (int64, error) {
+	switch {
+	case value == 0:
+		return DefaultDecryptedPageCacheBytes, nil
+	case value == DisableDecryptedPageCache:
+		return 0, nil
+	case value > 0:
+		return value, nil
+	default:
+		return 0, ErrPageCacheSizeInvalid
+	}
 }
 
 func secureOpenOptions(opts Options) (Options, error) {

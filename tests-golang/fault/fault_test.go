@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/marcgauthier/encz"
-	"github.com/marcgauthier/encz/tests-golang/testutil"
+	"github.com/marcgauthier/SQLiteSeal"
+	"github.com/marcgauthier/SQLiteSeal/tests-golang/testutil"
 )
 
 func init() {
@@ -40,7 +40,7 @@ func runCrashHelper() {
 		return
 	}
 	key := "CrashPassword123"
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		os.Exit(2)
 	}
@@ -123,7 +123,7 @@ func TestCrashRecovery(t *testing.T) {
 	key := "CrashPassword123"
 
 	// 1. Setup the database file with initial schema
-	setupDB, err := encz.OpenEncz(dbPath, key)
+	setupDB, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to setup: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestCrashRecovery(t *testing.T) {
 	t.Logf("crash helper exited, error: %v", err)
 
 	// 3. Reopen and verify recovery
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("reopen after crash failed: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestReadOnlyFileSystem(t *testing.T) {
 	key := "ReadOnlyKey"
 
 	// 1. Create and write initial table
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to open: %v", err)
 	}
@@ -219,13 +219,13 @@ func TestReadOnlyFileSystem(t *testing.T) {
 	})
 
 	// 3. Attempt to open in read-only mode using URI parameters
-	opts := encz.Options{
+	opts := sqliteseal.Options{
 		Key: key,
 		URIParameters: map[string]string{
 			"mode": "ro",
 		},
 	}
-	dbRO, err := encz.OpenWithOptions(dbPath, opts)
+	dbRO, err := sqliteseal.OpenWithOptions(dbPath, opts)
 	if err != nil {
 		t.Fatalf("failed to open read-only DB: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestCorruptionTampering(t *testing.T) {
 	key := "CorruptKey"
 
 	// 1. Create and write initial data
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to open: %v", err)
 	}
@@ -293,8 +293,8 @@ func TestCorruptionTampering(t *testing.T) {
 	}
 
 	// 3. Attempt to open and read from the tampered database.
-	// Either the header load (OpenEncz/Ping) must fail, or the subsequent query must fail.
-	dbReopened, err := encz.OpenEncz(dbPath, key)
+	// Either the header load (OpenSQLiteSeal/Ping) must fail, or the subsequent query must fail.
+	dbReopened, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err == nil {
 		defer dbReopened.Close()
 		// Try to query data
@@ -311,7 +311,7 @@ func TestManifestTamperAuthFails(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "manifest-corrupt.db")
 	key := "ManifestCorruptKey"
 
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -330,11 +330,11 @@ func TestManifestTamperAuthFails(t *testing.T) {
 	manifestPath := dbPath + ".encz"
 	tamperByte(t, manifestPath, 32)
 
-	_, err = encz.OpenEncz(dbPath, key)
+	_, err = sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err == nil {
 		t.Fatal("expected open to fail after manifest tampering")
 	}
-	if !errors.Is(err, encz.ErrManifestAuthFailed) && !errors.Is(err, encz.ErrManifestInvalid) {
+	if !errors.Is(err, sqliteseal.ErrManifestAuthFailed) && !errors.Is(err, sqliteseal.ErrManifestInvalid) {
 		t.Fatalf("expected ErrManifestAuthFailed or ErrManifestInvalid, got %v", err)
 	}
 }
@@ -398,11 +398,11 @@ func TestManifestTruncationFails(t *testing.T) {
 			manifestPath := dbPath + ".encz"
 			truncateToSize(t, manifestPath, tc.truncateTo)
 
-			_, err := encz.OpenEncz(dbPath, key)
+			_, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 			if err == nil {
 				t.Fatal("expected open to fail after manifest truncation")
 			}
-			if !errors.Is(err, encz.ErrManifestInvalid) && !errors.Is(err, encz.ErrManifestAuthFailed) {
+			if !errors.Is(err, sqliteseal.ErrManifestInvalid) && !errors.Is(err, sqliteseal.ErrManifestAuthFailed) {
 				t.Fatalf("expected ErrManifestInvalid or ErrManifestAuthFailed, got %v", err)
 			}
 		})
@@ -429,11 +429,11 @@ func TestSidecarMismatchDetected(t *testing.T) {
 		t.Fatalf("overwrite manifest A: %v", err)
 	}
 
-	_, err = encz.OpenEncz(dbPathA, key)
+	_, err = sqliteseal.OpenSQLiteSeal(dbPathA, key)
 	if err == nil {
 		t.Fatal("expected open to fail after manifest swap")
 	}
-	if !errors.Is(err, encz.ErrManifestMismatch) && !corruptionError(err) {
+	if !errors.Is(err, sqliteseal.ErrManifestMismatch) && !corruptionError(err) {
 		t.Fatalf("expected ErrManifestMismatch or another corruption-class failure, got %v", err)
 	}
 }
@@ -494,7 +494,7 @@ func TestCorruptionDoesNotReturnWrongData(t *testing.T) {
 		"epsilon-record-444",
 	}
 
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestCorruptionDoesNotReturnWrongData(t *testing.T) {
 	offset := info.Size() - int64(pageSize/2)
 	tamperByte(t, dbPath, offset)
 
-	reopened, err := encz.OpenEncz(dbPath, key)
+	reopened, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		if corruptionError(err) {
 			return
@@ -621,7 +621,7 @@ func TestWALCorruptionDetected(t *testing.T) {
 func createRollbackRecoveryBase(t *testing.T, dbPath, key string) {
 	t.Helper()
 
-	db, err := encz.OpenWithOptions(dbPath, encz.Options{Key: key, JournalMode: "DELETE"})
+	db, err := sqliteseal.OpenWithOptions(dbPath, sqliteseal.Options{Key: key, JournalMode: "DELETE"})
 	if err != nil {
 		t.Fatalf("open base db: %v", err)
 	}
@@ -653,7 +653,7 @@ func spawnRollbackJournalHelper(t *testing.T, dbPath string) {
 func assertRollbackRecoveryDegraded(t *testing.T, dbPath, key string) {
 	t.Helper()
 
-	db, err := encz.OpenWithOptions(dbPath, encz.Options{Key: key, JournalMode: "DELETE"})
+	db, err := sqliteseal.OpenWithOptions(dbPath, sqliteseal.Options{Key: key, JournalMode: "DELETE"})
 	if err != nil {
 		if corruptionError(err) {
 			return
@@ -702,7 +702,7 @@ func assertRollbackRecoveryDegraded(t *testing.T, dbPath, key string) {
 func readPageSize(t *testing.T, dbPath, key string) int {
 	t.Helper()
 
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("open for page size: %v", err)
 	}
@@ -757,7 +757,7 @@ func truncateToSize(t *testing.T, path string, size int64) {
 func assertWALRecoveryDegraded(t *testing.T, dbPath, key string) {
 	t.Helper()
 
-	reader, err := encz.OpenWithOptions(dbPath, encz.Options{
+	reader, err := sqliteseal.OpenWithOptions(dbPath, sqliteseal.Options{
 		Key:         key,
 		JournalMode: "WAL",
 	})
@@ -799,7 +799,7 @@ func assertWALRecoveryDegraded(t *testing.T, dbPath, key string) {
 func createLargeEncryptedDB(t *testing.T, dbPath, key string) int {
 	t.Helper()
 
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -856,7 +856,7 @@ func tamperByte(t *testing.T, path string, offset int64) {
 func assertEncryptedReadFails(t *testing.T, dbPath, key string) {
 	t.Helper()
 
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		if corruptionError(err) {
 			return
@@ -883,7 +883,7 @@ func corruptionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, encz.ErrManifestAuthFailed) || errors.Is(err, encz.ErrManifestInvalid) || errors.Is(err, encz.ErrManifestMismatch) {
+	if errors.Is(err, sqliteseal.ErrManifestAuthFailed) || errors.Is(err, sqliteseal.ErrManifestInvalid) || errors.Is(err, sqliteseal.ErrManifestMismatch) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
@@ -901,7 +901,7 @@ func runRollbackJournalHelper() {
 		return
 	}
 	key := "RollbackCorruptKey"
-	db, err := encz.OpenWithOptions(dbPath, encz.Options{Key: key, JournalMode: "DELETE"})
+	db, err := sqliteseal.OpenWithOptions(dbPath, sqliteseal.Options{Key: key, JournalMode: "DELETE"})
 	if err != nil {
 		os.Exit(2)
 	}
@@ -928,7 +928,7 @@ func runWALHelper() {
 		return
 	}
 	key := "WALCorruptKey"
-	db, err := encz.OpenWithOptions(dbPath, encz.Options{Key: key, JournalMode: "WAL"})
+	db, err := sqliteseal.OpenWithOptions(dbPath, sqliteseal.Options{Key: key, JournalMode: "WAL"})
 	if err != nil {
 		os.Exit(2)
 	}
@@ -953,7 +953,7 @@ func runExitZeroHelper() {
 		return
 	}
 	key := "ExitZeroPassword123"
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		os.Exit(2)
 	}
@@ -999,7 +999,7 @@ func TestAbruptExitGrace(t *testing.T) {
 	}
 
 	// 2. Reopen the database and verify integrity
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to reopen DB after exit(0): %v", err)
 	}

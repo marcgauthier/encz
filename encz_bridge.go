@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 /*
 #include "sqlite3.h"

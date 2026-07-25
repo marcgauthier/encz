@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"bytes"
@@ -18,14 +18,14 @@ func TestConcurrentDEKRotationAndReKeyRetainsReadableKeys(t *testing.T) {
 	const oldKey = "ConcurrentRotationOldKey"
 	const newKey = "ConcurrentRotationNewKey"
 
-	writer, err := OpenEncz(path, oldKey)
+	writer, err := OpenSQLiteSeal(path, oldKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := writer.Exec(`CREATE TABLE events (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
 		t.Fatal(err)
 	}
-	rekeyer, err := OpenEncz(path, oldKey)
+	rekeyer, err := OpenSQLiteSeal(path, oldKey)
 	if err != nil {
 		writer.Close()
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestConcurrentDEKRotationAndReKeyRetainsReadableKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenEncz(path, newKey)
+	reopened, err := OpenSQLiteSeal(path, newKey)
 	if err != nil {
 		t.Fatalf("reopen with new key: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestRestoreValidationFailurePreservesExistingTargets(t *testing.T) {
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.db")
 	const key = "RestorePreservationKey"
-	db, err := OpenEncz(sourcePath, key)
+	db, err := OpenSQLiteSeal(sourcePath, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestRestoreValidationFailurePreservesExistingTargets(t *testing.T) {
 }
 
 func TestSQLiteDependencyHasWALResetFix(t *testing.T) {
-	db, err := OpenEncz(filepath.Join(t.TempDir(), "version.db"), "SQLiteVersionKey")
+	db, err := OpenSQLiteSeal(filepath.Join(t.TempDir(), "version.db"), "SQLiteVersionKey")
 	if err != nil {
 		t.Fatal(err)
 	}

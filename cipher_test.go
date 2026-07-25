@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"errors"
@@ -33,7 +33,7 @@ func TestCipherRoundTripAndPersistence(t *testing.T) {
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			db, err = OpenEncz(path, "CipherPass123")
+			db, err = OpenSQLiteSeal(path, "CipherPass123")
 			if err != nil {
 				t.Fatal(err)
 			}

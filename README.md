@@ -1,19 +1,39 @@
-# encz
+<p align="center">
+  <img src="logo.png" alt="SQLiteSeal logo" width="560">
+</p>
 
-`encz` is a Go wrapper around `github.com/mattn/go-sqlite3` that adds transparent page-level encryption to SQLite database files and stores envelope-protected key material in a `*.encz` sidecar manifest.
+# SQLiteSeal
+
+`SQLiteSeal` is a Go wrapper around `github.com/mattn/go-sqlite3` that adds transparent page-level encryption to SQLite database files and stores envelope-protected key material in a `*.encz` sidecar manifest.
+
+## Benchmark: SQLiteSeal vs. Turso AES-256-GCM
+
+The standalone benchmark runs the same schema, seed data, writes, reads, aggregations, joins, reopen validation, and on-disk plaintext check against SQLiteSeal (AES-256-GCM) and the Turso embedded Go driver (AES-256-GCM). It retains plain SQLite as a baseline.
+
+```bash
+cd tests-benchmark
+go run .
+```
+
+Use `-turso` to choose Turso's local database path, `-turso-hex-key` to provide its required 32-byte hex key, and `-sqliteseal-read-cache-bytes` to change SQLiteSeal's decrypted-page cache budget (`-1` disables it). The report includes SQLiteSeal cache, physical-read, AEAD, allocation, and copy metrics.
+
+```bash
+go run . -rows 10000 -write-rows 20000 -turso /tmp/turso-aes256gcm.db
+```
 
 ## Architecture
 
-`encz` registers a custom SQLite VFS named `encz`. For file-backed databases, the master key unlocks a `db.encz` manifest that contains the full DEK set for the database. SQLite then opens the database through that VFS and page I/O is transformed in place on the flat database file.
+`SQLiteSeal` registers a custom SQLite VFS named `encz` (retained for on-disk and connection compatibility). For file-backed databases, the master key unlocks a `db.encz` manifest that contains the full DEK set for the database. SQLite then opens the database through that VFS and page I/O is transformed in place on the flat database file.
 
 - **Storage format**: Standard SQLite database and WAL files on disk, an encrypted `db.encz` sidecar manifest, and a `db.encz.lock` coordination file.
-- **Reserved bytes**: `encz` reserves 48 bytes on each SQLite page.
+- **Reserved bytes**: `SQLiteSeal` reserves 48 bytes on each SQLite page.
 - **Encryption**: New databases default to **AES-256-GCM** and may instead use **ChaCha20-Poly1305** or **XChaCha20-Poly1305**. The selected cipher protects pages, manifests, and backup archives.
 - **Per-page metadata**: The final 48 reserved bytes hold 4 bytes of flags, a 4-byte DEK key ID, a 24-byte nonce slot, and a 16-byte authentication tag. AES-GCM and ChaCha20-Poly1305 use the first 12 nonce bytes; XChaCha20-Poly1305 uses all 24.
 - **Nonce generation**: Each encrypted container uses a fresh operating-system random nonce. AES-GCM and ChaCha20-Poly1305 use 96-bit nonces; XChaCha20-Poly1305 uses 192-bit nonces. For pages, this provides probabilistic nonce uniqueness per DEK rather than a deterministic counter-based guarantee.
 - **Authentication binding**: The AEAD authentication tag is computed with additional authenticated data (AAD) that binds the ciphertext to the database UUID, page number, file offset, WAL/main-file context, and cipher identifier. This protects page identity and location, but it is separate from nonce uniqueness.
 - **Multi-DEK model**: Every page stores the DEK key ID used to encrypt it. Older DEKs remain in the manifest forever, so a single database can contain pages encrypted under different DEKs.
-- **Encrypted-only API**: `encz` only supports file-backed encrypted databases. Plain SQLite files, in-memory databases, direct-key DSNs, and direct-key PRAGMAs are rejected.
+- **Decrypted-page cache**: Each `DB` has a shared, authenticated LRU with a 128 MB default page-payload budget. Entries are validated against the encrypted on-disk trailer before use and wiped on eviction or invalidation.
+- **Encrypted-only API**: `SQLiteSeal` only supports file-backed encrypted databases. Plain SQLite files, in-memory databases, direct-key DSNs, and direct-key PRAGMAs are rejected.
 
 ```
  SQLite Engine (SQL parsing, query planning, B-trees)
@@ -37,7 +57,7 @@
 ## Install
 
 ```bash
-go get github.com/marcgauthier/encz
+go get github.com/marcgauthier/SQLiteSeal
 ```
 
 ## Usage
@@ -48,20 +68,22 @@ package main
 import (
 	"log"
 
-	"github.com/marcgauthier/encz"
+	"github.com/marcgauthier/SQLiteSeal"
 )
 
 func main() {
-	db, err := encz.OpenEncz("users.db", "Password123Password123Password123")
+	db, err := sqliteseal.OpenSQLiteSeal("users.db", "Password123Password123Password123")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
 	// Cipher choice is made when creating a database and is then stored in its manifest.
-	// db, err := encz.OpenWithOptions("users.db", encz.Options{
-	// 	Key: "Password123Password123Password123",
-	// 	Cipher: encz.CipherXChaCha20Poly1305,
+	// db, err := sqliteseal.OpenWithOptions("users.db", sqliteseal.Options{
+	// 	Key:                        "Password123Password123Password123",
+	// 	Cipher:                     sqliteseal.CipherXChaCha20Poly1305,
+	// 	DecryptedPageCacheBytes:    256 << 20,
+	// 	EnableReadPerformanceStats: true,
 	// })
 
 	db.SetMaxOpenConns(5)
@@ -70,7 +92,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := db.SetRotationPolicy(encz.RotationPolicy{
+	if err := db.SetRotationPolicy(sqliteseal.RotationPolicy{
 		KEKRotationDays:  30,
 		DEKRotationHours: 24,
 		AutoRewrap:       true,
@@ -83,7 +105,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := db.Backup("users-backup.zip", encz.BackupOptions{Compression: encz.BackupCompressionDeflate}); err != nil {
+	if err := db.Backup("users-backup.zip", sqliteseal.BackupOptions{Compression: sqliteseal.BackupCompressionDeflate}); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -91,24 +113,27 @@ func main() {
 
 ## API Notes
 
-- `encz.OpenEncz` opens an existing encrypted database when `<db>.encz` is present and creates both files when neither the database nor manifest exists.
-- `encz.OpenWithOptions` returns `*encz.DB`, which wraps `*sql.DB` and adds manifest operations such as `ReKey`, `SetRotationPolicy`, `RotationStatus`, and `Backup`.
-- Opening fails with `encz.ErrManifestMissing` when a database file exists without its manifest.
-- Opening fails with `encz.ErrManifestAuthFailed` when the manifest exists but the master key is wrong.
+- `sqliteseal.OpenSQLiteSeal` opens an existing encrypted database when `<db>.encz` is present and creates both files when neither the database nor manifest exists.
+- `sqliteseal.OpenWithOptions` returns `*sqliteseal.DB`, which wraps `*sql.DB` and adds manifest operations such as `ReKey`, `SetRotationPolicy`, `RotationStatus`, and `Backup`.
+- Opening fails with `sqliteseal.ErrManifestMissing` when a database file exists without its manifest.
+- Opening fails with `sqliteseal.ErrManifestAuthFailed` when the manifest exists but the master key is wrong.
 - In-memory paths, direct-key URI settings, and direct-key PRAGMAs are rejected.
 - WAL is the default journal mode. MEMORY is also supported; on-disk rollback journals are rejected because they expose plaintext page images.
+- `Options.DecryptedPageCacheBytes` uses 128 MB when zero, accepts a positive byte budget, and uses `sqliteseal.DisableDecryptedPageCache` (`-1`) to disable caching.
+- Cached pages are authenticated before insertion and revalidated against their encrypted trailer before a hit is returned. Plaintext is wiped on eviction, invalidation, registry update, and close, but remains resident in ordinary process heap memory while cached.
+- `ReadPerformanceStats` and `ResetReadPerformanceStats` expose opt-in read-path measurements when `Options.EnableReadPerformanceStats` is true.
 
 ## Backup & Restore
 
-`encz` provides a robust, encrypted backup and restore mechanism designed to securely package the database and its envelope keys.
+`SQLiteSeal` provides a robust, encrypted backup and restore mechanism designed to securely package the database and its envelope keys.
 
 ### Backing Up
 
 The `Backup` method creates a single, encrypted `.zip` archive containing the `.bak` database file and its matching `.bak.encz` manifest.
 
 ```go
-err := db.Backup("backup.zip", encz.BackupOptions{
-	Compression: encz.BackupCompressionDeflate,
+err := db.Backup("backup.zip", sqliteseal.BackupOptions{
+	Compression: sqliteseal.BackupCompressionDeflate,
 })
 ```
 
@@ -120,7 +145,7 @@ err := db.Backup("backup.zip", encz.BackupOptions{
 Before performing a restore, you can verify the integrity of an archive using `TestBackup`.
 
 ```go
-err := encz.TestBackup("backup.zip", "MasterKey123", "/tmp/restore-test")
+err := sqliteseal.TestBackup("backup.zip", "MasterKey123", "/tmp/restore-test")
 ```
 
 This decrypts and unpacks the backup archive to a temporary directory, opens the database using the restored manifest, and runs `PRAGMA integrity_check`.
@@ -130,7 +155,7 @@ This decrypts and unpacks the backup archive to a temporary directory, opens the
 The `RestoreBackup` function safely extracts and restores a database from an encrypted backup archive.
 
 ```go
-err := encz.RestoreBackup("backup.zip", "MasterKey123", "/path/to/restore/dir", false)
+err := sqliteseal.RestoreBackup("backup.zip", "MasterKey123", "/path/to/restore/dir", false)
 ```
 
 - **Integrity Validation**: Decrypts the archive to a temporary location and executes `PRAGMA integrity_check` before copying files to the destination. If verification fails, the restore is aborted.
@@ -138,17 +163,17 @@ err := encz.RestoreBackup("backup.zip", "MasterKey123", "/path/to/restore/dir", 
 
 ## Public API Reference
 
-Below is a summary of all public package-level functions and methods available in `encz`.
+Below is a summary of all public package-level functions and methods available in `sqliteseal`.
 
 ### Package-Level Functions
 
 - **`Register() error`**  
-  Registers the custom `encz` SQLite VFS and driver name with Go's `database/sql` package automatically.
+  Registers the SQLiteSeal driver and its compatibility `encz` VFS with Go's `database/sql` package automatically.
 - **`BuildDSN(path string, opts Options) (string, error)`**
   Constructs a non-secret SQLite DSN. Key-bearing options return `ErrDirectKeyUnsupported`.
-- **`BuildEnczDSN(path, key string) (string, error)`**
-  Deprecated migration stub that always returns `ErrDirectKeyUnsupported`; use `OpenEncz`.
-- **`OpenEncz(path, key string) (*DB, error)`**  
+- **`BuildSQLiteSealDSN(path, key string) (string, error)`**
+  Compatibility stub that always returns `ErrDirectKeyUnsupported`; use `OpenSQLiteSeal`.
+- **`OpenSQLiteSeal(path, key string) (*DB, error)`**
   Opens or creates an encrypted database with default configurations and the specified master key.
 - **`OpenWithOptions(path string, opts Options) (*DB, error)`**  
   Opens or creates an encrypted database using a customized `Options` configuration.
@@ -171,11 +196,16 @@ Below is a summary of all public package-level functions and methods available i
   Returns the active rotation policy, DEK count, and when KEK/DEK rotations are next scheduled.
 - **`Backup(toFile string, opts BackupOptions) error`**  
   Generates an encrypted ZIP backup of the active database and manifest.
+- **`ReadPerformanceStats() ReadPerformanceStats`**
+  Returns a point-in-time read-path metrics snapshot. Metrics are collected only
+  when `Options.EnableReadPerformanceStats` is enabled.
+- **`ResetReadPerformanceStats()`**
+  Resets the read-path counters and timers without clearing the page cache.
 
 
 ## Key Rotation
 
-`encz` utilizes envelope encryption to secure file-backed databases:
+`SQLiteSeal` utilizes envelope encryption to secure file-backed databases:
 
 1. **Master Key**: The user-provided passphrase.
 2. **Key Encryption Key (KEK)**: Derived from the master key using Argon2id, used to encrypt/decrypt the sidecar `db.encz` manifest.
@@ -209,15 +239,15 @@ Defaults for newly created databases:
 
 ### Data Encryption Key (DEK) Rotation
 
-`encz` implements a **multi-DEK architecture** with lazy, incremental DEK rotation:
+`SQLiteSeal` implements a **multi-DEK architecture** with lazy, incremental DEK rotation:
 
-* **Trigger**: DEK rotation is assessed automatically on write operations. When a transaction attempts to write pages to disk (including WAL checkpoints), `encz` checks if the active DEK has been in use longer than the configured `DEKRotationHours` interval.
+* **Trigger**: DEK rotation is assessed automatically on write operations. When a transaction attempts to write pages to disk (including WAL checkpoints), `SQLiteSeal` checks if the active DEK has been in use longer than the configured `DEKRotationHours` interval.
 * **Mechanism**: If the interval has expired:
   1. A new 32-byte DEK is cryptographically generated.
   2. The new DEK is appended to the encrypted manifest sidecar (`db.encz`) and assigned the next sequential Key ID.
   3. The new DEK becomes the active key.
 * **Incremental Writes**: Only newly written or modified database pages are encrypted with the new active DEK. Unmodified pages are not touched. This avoids massive disk I/O and keeps rotation operations lightweight.
-* **Key Resolution**: Each page's 36-byte trailer stores the specific Key ID used to encrypt its payload. When reading a page, the VFS reads the Key ID from the page trailer, retrieves the corresponding DEK from the manifest, and decrypts the payload.
+* **Key Resolution**: Each page's 48-byte trailer stores the specific Key ID used to encrypt its payload. When reading a page, the VFS reads the Key ID from the page trailer, retrieves the corresponding DEK from the manifest, and decrypts the payload.
 * **Historical Retention**: Older DEKs are preserved in the encrypted manifest indefinitely so that older, unmodified pages remain fully readable.
 
 ---
@@ -230,7 +260,7 @@ Defaults for newly created databases:
 Example:
 
 ```go
-db, err := encz.OpenEncz("app.db", "master-passphrase")
+db, err := sqliteseal.OpenSQLiteSeal("app.db", "master-passphrase")
 if err != nil {
 	return err
 }
@@ -247,7 +277,7 @@ fmt.Printf("Auto rewrap: %t\n", status.AutoRewrap)
 fmt.Printf("Keep previous key: %t\n", status.KeepPreviousKey)
 fmt.Printf("Active DEK Key ID: %d\n", status.ActiveDEKKeyID)
 
-err = db.SetRotationPolicy(encz.RotationPolicy{
+err = db.SetRotationPolicy(sqliteseal.RotationPolicy{
 	KEKRotationDays:  30,
 	DEKRotationHours: 12,
 	AutoRewrap:       true,
@@ -262,9 +292,15 @@ if err != nil {
 
 This release uses the selected Go AEAD cipher consistently across pages, manifests, and backup archives. New databases default to AES-256-GCM; ChaCha20-Poly1305 and XChaCha20-Poly1305 are available at creation. The v3 page trailer reserves 48 bytes and the manifest stores the immutable cipher choice.
 
+Brand compatibility:
+
+- The public Go package identifier is `sqliteseal` and the module path is `github.com/marcgauthier/SQLiteSeal`.
+- `OpenEncz`, `BuildEnczDSN`, and the `encz-sqlite3` driver name remain available as deprecated compatibility aliases.
+- The internal VFS name, `.encz` manifest suffix, and ENCZ container magic values remain unchanged so existing v3 databases continue to open.
+
 Release scope:
 
-- This version is intended for newly created `encz` databases only.
+- This version is intended for newly created `SQLiteSeal` databases only.
 - Existing manifests and backup archives created with the legacy Monocypher-based container format are not supported by this release.
 - Existing databases created with the legacy page/manifest format are not supported by this release.
 - This package does not provide automatic migration, in-place upgrade, or compatibility fallback for older database files or encrypted backup containers.

@@ -1,6 +1,6 @@
 //go:build unix
 
-package encz
+package sqliteseal
 
 import (
 	"os"

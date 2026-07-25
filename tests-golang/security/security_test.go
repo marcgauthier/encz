@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/marcgauthier/encz"
+	"github.com/marcgauthier/SQLiteSeal"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -17,7 +17,7 @@ func TestInvalidKeyRejection(t *testing.T) {
 	key := "CorrectPassword123"
 
 	// 1. Create database and write data
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to create database: %v", err)
 	}
@@ -34,11 +34,11 @@ func TestInvalidKeyRejection(t *testing.T) {
 	db.Close()
 
 	// 2. Attempt to open with wrong key
-	// If Ping fails during OpenEncz, OpenEncz will return an error.
-	dbWrong, err := encz.OpenEncz(dbPath, "WrongPassword!!!")
+	// If Ping fails during OpenSQLiteSeal, OpenSQLiteSeal will return an error.
+	dbWrong, err := sqliteseal.OpenSQLiteSeal(dbPath, "WrongPassword!!!")
 	if err == nil {
 		defer dbWrong.Close()
-		// If OpenEncz didn't fail at ping time (e.g. if Ping executes a query that didn't read encrypted pages,
+		// If OpenSQLiteSeal didn't fail at ping time (e.g. if Ping executes a query that didn't read encrypted pages,
 		// though standard ping does read), try to query the table.
 		var secret string
 		err = dbWrong.QueryRow(`SELECT secret FROM sensitive_data WHERE id = 1`).Scan(&secret)
@@ -54,7 +54,7 @@ func TestUnencryptedToEncrypted(t *testing.T) {
 	plainPath := filepath.Join(tempDir, "plain.db")
 	encPath := filepath.Join(tempDir, "encrypted.db")
 
-	// 1. Create plain database outside encz.
+	// 1. Create plain database outside sqliteseal.
 	dbPlain, err := sql.Open("sqlite3", plainPath)
 	if err != nil {
 		t.Fatalf("failed to open plain DB: %v", err)
@@ -67,7 +67,7 @@ func TestUnencryptedToEncrypted(t *testing.T) {
 	dbPlain.Close()
 
 	// 2. Create encrypted database
-	dbEnc, err := encz.OpenEncz(encPath, "Secret123")
+	dbEnc, err := sqliteseal.OpenSQLiteSeal(encPath, "Secret123")
 	if err != nil {
 		t.Fatalf("failed to open encrypted DB: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestUnencryptedToEncrypted(t *testing.T) {
 	dbEnc.Close()
 
 	// 3. Try to open plain database with encryption key
-	dbPlainWithKey, err := encz.OpenEncz(plainPath, "Secret123")
+	dbPlainWithKey, err := sqliteseal.OpenSQLiteSeal(plainPath, "Secret123")
 	if err == nil {
 		defer dbPlainWithKey.Close()
 		var count int
@@ -90,7 +90,7 @@ func TestUnencryptedToEncrypted(t *testing.T) {
 	}
 
 	// 4. Opening encrypted database without a key must fail at the package boundary.
-	if _, err := encz.OpenWithOptions(encPath, encz.Options{}); err == nil {
+	if _, err := sqliteseal.OpenWithOptions(encPath, sqliteseal.Options{}); err == nil {
 		t.Error("expected OpenWithOptions to reject encrypted database without a key")
 	}
 }
@@ -100,7 +100,7 @@ func TestHeaderSecrecy(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "secretheader.db")
 	key := "SuperSecretKey99"
 
-	db, err := encz.OpenEncz(dbPath, key)
+	db, err := sqliteseal.OpenSQLiteSeal(dbPath, key)
 	if err != nil {
 		t.Fatalf("failed to open: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestExtremeKeys(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "extreme.db")
 
 			// 1. Create and write
-			db, err := encz.OpenEncz(dbPath, tc.key)
+			db, err := sqliteseal.OpenSQLiteSeal(dbPath, tc.key)
 			if err != nil {
 				t.Fatalf("failed to open with key: %v", err)
 			}
@@ -170,7 +170,7 @@ func TestExtremeKeys(t *testing.T) {
 			db.Close()
 
 			// 2. Reopen and verify
-			reopened, err := encz.OpenEncz(dbPath, tc.key)
+			reopened, err := sqliteseal.OpenSQLiteSeal(dbPath, tc.key)
 			if err != nil {
 				t.Fatalf("failed to reopen: %v", err)
 			}

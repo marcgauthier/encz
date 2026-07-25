@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"fmt"
@@ -7,13 +7,15 @@ import (
 )
 
 type Options struct {
-	Key               string
-	Cipher            Cipher
-	URIParameters     map[string]string
-	JournalMode       string
-	BusyTimeoutMillis *int
-	ManifestPath      string
-	RotationPolicy    *RotationPolicy
+	Key                        string
+	Cipher                     Cipher
+	URIParameters              map[string]string
+	JournalMode                string
+	BusyTimeoutMillis          *int
+	ManifestPath               string
+	RotationPolicy             *RotationPolicy
+	DecryptedPageCacheBytes    int64
+	EnableReadPerformanceStats bool
 }
 
 // BuildDSN builds a non-secret SQLite DSN. Encryption keys are intentionally
@@ -26,10 +28,16 @@ func BuildDSN(path string, opts Options) (string, error) {
 	return buildDSN(path, opts), nil
 }
 
-// BuildEnczDSN is retained only to provide an explicit migration error.
-// Deprecated: use OpenEncz or OpenWithOptions; direct-key DSNs are disabled.
-func BuildEnczDSN(string, string) (string, error) {
+// BuildSQLiteSealDSN returns an explicit migration error because direct-key
+// DSNs are intentionally disabled. Use OpenSQLiteSeal or OpenWithOptions.
+func BuildSQLiteSealDSN(string, string) (string, error) {
 	return "", ErrDirectKeyUnsupported
+}
+
+// BuildEnczDSN is retained only for source compatibility.
+// Deprecated: use BuildSQLiteSealDSN.
+func BuildEnczDSN(path, key string) (string, error) {
+	return BuildSQLiteSealDSN(path, key)
 }
 
 func buildDSN(path string, opts Options) string {

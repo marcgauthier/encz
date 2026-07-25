@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"crypto/aes"
@@ -28,9 +28,9 @@ const (
 )
 
 var (
-	ErrCipherUnsupported       = errors.New("encz: unsupported cipher")
-	ErrCipherMismatch          = errors.New("encz: requested cipher does not match database cipher")
-	ErrLegacyFormatUnsupported = errors.New("encz: legacy Monocypher format is unsupported")
+	ErrCipherUnsupported       = errors.New("sqliteseal: unsupported cipher")
+	ErrCipherMismatch          = errors.New("sqliteseal: requested cipher does not match database cipher")
+	ErrLegacyFormatUnsupported = errors.New("sqliteseal: legacy Monocypher format is unsupported")
 )
 
 func normalizeCipher(value Cipher) (Cipher, error) {

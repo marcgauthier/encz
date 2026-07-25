@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"archive/zip"
@@ -28,18 +28,33 @@ func TestOpenWithOptionsRequiresKey(t *testing.T) {
 	}
 }
 
-func TestBuildEnczDSN(t *testing.T) {
-	if _, err := BuildEnczDSN("users.db", "secret"); !errors.Is(err, ErrDirectKeyUnsupported) {
+func TestBuildSQLiteSealDSN(t *testing.T) {
+	if _, err := BuildSQLiteSealDSN("users.db", "secret"); !errors.Is(err, ErrDirectKeyUnsupported) {
 		t.Fatalf("expected ErrDirectKeyUnsupported, got %v", err)
+	}
+	if _, err := BuildEnczDSN("users.db", "secret"); !errors.Is(err, ErrDirectKeyUnsupported) {
+		t.Fatalf("legacy alias: expected ErrDirectKeyUnsupported, got %v", err)
 	}
 }
 
-func TestOpenEnczSQLite(t *testing.T) {
+func TestDriverNamesRegistered(t *testing.T) {
+	registered := make(map[string]bool)
+	for _, name := range sql.Drivers() {
+		registered[name] = true
+	}
+	for _, name := range []string{DriverName, LegacyDriverName} {
+		if !registered[name] {
+			t.Fatalf("driver %q is not registered", name)
+		}
+	}
+}
+
+func TestOpenSQLiteSeal(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "encz.db")
 
-	db, err := OpenEncz(dbPath, "Password123")
+	db, err := OpenSQLiteSeal(dbPath, "Password123")
 	if err != nil {
-		t.Fatalf("OpenEncz: %v", err)
+		t.Fatalf("OpenSQLiteSeal: %v", err)
 	}
 	if _, err := db.Exec(`CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`); err != nil {
 		db.Close()
@@ -53,7 +68,7 @@ func TestOpenEnczSQLite(t *testing.T) {
 		t.Fatalf("close after write: %v", err)
 	}
 
-	reopened, err := OpenEncz(dbPath, "Password123")
+	reopened, err := OpenSQLiteSeal(dbPath, "Password123")
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -72,7 +87,7 @@ func TestManifestCreatedAndOpaque(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "manifest.db")
 	masterKey := "ManifestMasterPass"
 
-	db, err := OpenEncz(dbPath, masterKey)
+	db, err := OpenSQLiteSeal(dbPath, masterKey)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -105,7 +120,7 @@ func TestManifestCreatedAndOpaque(t *testing.T) {
 
 func TestMissingManifestFails(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "missing-manifest.db")
-	db, err := OpenEncz(dbPath, "MissingManifestPass")
+	db, err := OpenSQLiteSeal(dbPath, "MissingManifestPass")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -119,7 +134,7 @@ func TestMissingManifestFails(t *testing.T) {
 	if err := os.Remove(dbPath + ".encz"); err != nil {
 		t.Fatalf("remove manifest: %v", err)
 	}
-	if _, err := OpenEncz(dbPath, "MissingManifestPass"); !errors.Is(err, ErrManifestMissing) {
+	if _, err := OpenSQLiteSeal(dbPath, "MissingManifestPass"); !errors.Is(err, ErrManifestMissing) {
 		t.Fatalf("expected ErrManifestMissing, got %v", err)
 	}
 }
@@ -138,7 +153,7 @@ func TestOpenPlainSQLiteFailsWithMissingManifest(t *testing.T) {
 		t.Fatalf("close plain db: %v", err)
 	}
 
-	if _, err := OpenEncz(dbPath, "Password123"); !errors.Is(err, ErrManifestMissing) {
+	if _, err := OpenSQLiteSeal(dbPath, "Password123"); !errors.Is(err, ErrManifestMissing) {
 		t.Fatalf("expected ErrManifestMissing, got %v", err)
 	}
 }
@@ -148,7 +163,7 @@ func TestReKey(t *testing.T) {
 	oldKey := "OldManifestMasterPass"
 	newKey := "NewManifestMasterPass"
 
-	db, err := OpenEncz(dbPath, oldKey)
+	db, err := OpenSQLiteSeal(dbPath, oldKey)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -178,10 +193,10 @@ func TestReKey(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	if _, err := OpenEncz(dbPath, oldKey); err == nil {
+	if _, err := OpenSQLiteSeal(dbPath, oldKey); err == nil {
 		t.Fatal("expected old manifest key to fail after rotation")
 	}
-	reopened, err := OpenEncz(dbPath, newKey)
+	reopened, err := OpenSQLiteSeal(dbPath, newKey)
 	if err != nil {
 		t.Fatalf("reopen with new key: %v", err)
 	}
@@ -196,7 +211,7 @@ func TestReKey(t *testing.T) {
 
 func TestSetRotationPolicyPersists(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "policy.db")
-	db, err := OpenEncz(dbPath, "RotationPolicyPass")
+	db, err := OpenSQLiteSeal(dbPath, "RotationPolicyPass")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -218,7 +233,7 @@ func TestSetRotationPolicyPersists(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	reopened, err := OpenEncz(dbPath, "RotationPolicyPass")
+	reopened, err := OpenSQLiteSeal(dbPath, "RotationPolicyPass")
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -242,7 +257,7 @@ func TestDEKRotationAppendsManifestKey(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "dek-rotation.db")
 	masterKey := "RotateDEKPass123"
 
-	db, err := OpenEncz(dbPath, masterKey)
+	db, err := OpenSQLiteSeal(dbPath, masterKey)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -271,7 +286,7 @@ func TestDEKRotationAppendsManifestKey(t *testing.T) {
 		t.Fatalf("save manifest: %v", err)
 	}
 
-	reopened, err := OpenEncz(dbPath, masterKey)
+	reopened, err := OpenSQLiteSeal(dbPath, masterKey)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -297,7 +312,7 @@ func TestDEKRotationAppendsManifestKey(t *testing.T) {
 		t.Fatal("expected LastDEKRotationAt to advance")
 	}
 
-	verify, err := OpenEncz(dbPath, masterKey)
+	verify, err := OpenSQLiteSeal(dbPath, masterKey)
 	if err != nil {
 		t.Fatalf("open for verify: %v", err)
 	}
@@ -312,7 +327,7 @@ func TestDEKRotationAppendsManifestKey(t *testing.T) {
 }
 
 func TestHandleMethodsFailAfterClose(t *testing.T) {
-	db, err := OpenEncz(filepath.Join(t.TempDir(), "closed.db"), "ClosedPass")
+	db, err := OpenSQLiteSeal(filepath.Join(t.TempDir(), "closed.db"), "ClosedPass")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -418,7 +433,7 @@ func TestBackupCreatesArchiveAndRestores(t *testing.T) {
 			}
 
 			restoredDBPath := filepath.Join(extractDir, expectedDBName)
-			reopened, err := OpenEncz(restoredDBPath, key)
+			reopened, err := OpenSQLiteSeal(restoredDBPath, key)
 			if err != nil {
 				t.Fatalf("open restored backup: %v", err)
 			}
@@ -444,7 +459,7 @@ func TestBackupCreatesArchiveAndRestores(t *testing.T) {
 }
 
 func TestBackupRejectsUnsupportedCompression(t *testing.T) {
-	db, err := OpenEncz(filepath.Join(t.TempDir(), "unsupported.db"), "UnsupportedBackupPass")
+	db, err := OpenSQLiteSeal(filepath.Join(t.TempDir(), "unsupported.db"), "UnsupportedBackupPass")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -457,7 +472,7 @@ func TestBackupRejectsUnsupportedCompression(t *testing.T) {
 
 func TestBackupFailsWhenOutputExists(t *testing.T) {
 	tempDir := t.TempDir()
-	db, err := OpenEncz(filepath.Join(tempDir, "exists.db"), "BackupExistsPass")
+	db, err := OpenSQLiteSeal(filepath.Join(tempDir, "exists.db"), "BackupExistsPass")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -476,7 +491,7 @@ func TestBackupFailsWhenOutputExists(t *testing.T) {
 func TestBackupFailsWhenManifestMissing(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "missing-backup-manifest.db")
-	db, err := OpenEncz(dbPath, "MissingBackupManifestPass")
+	db, err := OpenSQLiteSeal(dbPath, "MissingBackupManifestPass")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -493,7 +508,7 @@ func TestBackupFailsWhenManifestMissing(t *testing.T) {
 
 func TestBackupFailsAfterClose(t *testing.T) {
 	tempDir := t.TempDir()
-	db, err := OpenEncz(filepath.Join(tempDir, "closed-backup.db"), "ClosedBackupPass")
+	db, err := OpenSQLiteSeal(filepath.Join(tempDir, "closed-backup.db"), "ClosedBackupPass")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -697,7 +712,7 @@ func TestLogHandler(t *testing.T) {
 	pass := "TestLogHandlerPass123"
 
 	// Create and write something
-	db, err := OpenEncz(dbPath, pass)
+	db, err := OpenSQLiteSeal(dbPath, pass)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -744,7 +759,7 @@ func TestLogHandler(t *testing.T) {
 	}()
 
 	// Reopen and try to read, which should trigger decryption error
-	reopened, err := OpenEncz(dbPath, pass)
+	reopened, err := OpenSQLiteSeal(dbPath, pass)
 	if err == nil {
 		_, _ = reopened.Exec("SELECT * FROM t1")
 		reopened.Close()

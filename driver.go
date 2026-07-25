@@ -1,4 +1,4 @@
-package encz
+package sqliteseal
 
 import (
 	"database/sql"
@@ -8,7 +8,10 @@ import (
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
-const DriverName = "encz-sqlite3"
+const (
+	DriverName       = "sqliteseal-sqlite3"
+	LegacyDriverName = "encz-sqlite3"
+)
 
 var (
 	registerDriverOnce sync.Once
@@ -25,7 +28,7 @@ func Register() error {
 			registerDriverErr = err
 			return
 		}
-		sql.Register(DriverName, &sqlite3.SQLiteDriver{
+		driver := &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 				if err := registerEncz(); err != nil {
 					return err
@@ -33,7 +36,9 @@ func Register() error {
 				_, err := conn.Exec("PRAGMA temp_store=MEMORY", nil)
 				return err
 			},
-		})
+		}
+		sql.Register(DriverName, driver)
+		sql.Register(LegacyDriverName, driver)
 	})
 	return registerDriverErr
 }
