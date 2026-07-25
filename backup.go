@@ -16,14 +16,13 @@ import (
 	"github.com/awnumar/memguard"
 	sqlite3 "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/argon2"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
-	backupArchiveMagic     = "ENCZB2"
-	backupArchiveVersion   = 2
+	backupArchiveMagic     = "ENCZB3"
+	backupArchiveVersion   = 3
 	backupArchiveSaltSize  = 16
-	backupArchiveNonceSize = 12
+	backupArchiveNonceSize = 24
 	backupArchiveKeySize   = 32
 )
 
@@ -32,6 +31,7 @@ var (
 	ErrBackupOutputExists           = errors.New("encz: backup output already exists")
 	ErrBackupCompressionUnsupported = errors.New("encz: backup compression is unsupported")
 	ErrBackupArchiveInvalid         = errors.New("encz: backup archive is invalid")
+	ErrBackupAuthFailed             = errors.New("encz: backup archive authentication failed")
 )
 
 type BackupOptions struct {
@@ -87,10 +87,17 @@ func (db *DB) Backup(toFile string, opts BackupOptions) (err error) {
 
 	backupDBPath := backupTempDBPath(db.path, toFile)
 	backupManifestPath := manifestPathFor(backupDBPath, Options{})
-	zipTempPath := toFile + ".plainzip"
+	zipTempFile, err := os.CreateTemp("", ".encz-backup-plain-*.zip")
+	if err != nil {
+		return err
+	}
+	zipTempPath := zipTempFile.Name()
+	zipTempFile.Close()
+	os.Remove(zipTempPath) // remove so writeBackupArchive can create it exclusively
 
-	cleanupPaths := []string{backupManifestPath, backupDBPath, zipTempPath}
+	cleanupPaths := []string{backupManifestPath, backupDBPath}
 	defer func() {
+		_ = secureRemoveFile(zipTempPath)
 		for _, path := range cleanupPaths {
 			_ = os.Remove(path)
 		}
@@ -117,7 +124,7 @@ func (db *DB) Backup(toFile string, opts BackupOptions) (err error) {
 		return err
 	}
 	defer destroyKeyRegistry(backupHandle)
-	backupDSN := BuildDSN(backupDBPath, applyRegistryToOptions(Options{}, backupHandle))
+	backupDSN := buildDSN(backupDBPath, applyRegistryToOptions(Options{Cipher: payload.Cipher}, backupHandle))
 	destDB, err := openSQLDB(backupDSN)
 	if err != nil {
 		return err
@@ -141,7 +148,7 @@ func (db *DB) Backup(toFile string, opts BackupOptions) (err error) {
 	if err = writeBackupArchive(zipTempPath, compression, backupDBPath, backupManifestPath); err != nil {
 		return err
 	}
-	return encryptBackupArchive(zipTempPath, toFile, db.key)
+	return encryptBackupArchiveWithCipher(zipTempPath, toFile, db.key, payload.Cipher)
 }
 
 func normalizeBackupCompression(mode BackupCompression) (BackupCompression, error) {
@@ -155,6 +162,54 @@ func normalizeBackupCompression(mode BackupCompression) (BackupCompression, erro
 	default:
 		return "", fmt.Errorf("%w: %s", ErrBackupCompressionUnsupported, mode)
 	}
+}
+
+func sanitizeZipEntryPath(base, entryName string) (string, error) {
+	if filepath.IsAbs(entryName) {
+		return "", fmt.Errorf("encz: absolute path in backup archive: %s", entryName)
+	}
+	target := filepath.Join(base, entryName)
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return "", err
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(absTarget, absBase+string(os.PathSeparator)) && absTarget != absBase {
+		return "", fmt.Errorf("encz: path escapes target directory: %s", entryName)
+	}
+	return target, nil
+}
+
+// secureRemoveFile overwrites a file's contents with zeros before removing it.
+// This reduces the window for forensic recovery of plaintext data, though it
+// cannot guarantee secure erasure on all storage media (e.g. SSDs with wear leveling).
+func secureRemoveFile(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return os.Remove(path)
+	}
+	info, statErr := f.Stat()
+	if statErr == nil && info.Size() > 0 {
+		zeros := make([]byte, 32*1024)
+		remaining := info.Size()
+		for remaining > 0 {
+			n := int64(len(zeros))
+			if n > remaining {
+				n = remaining
+			}
+			written, werr := f.Write(zeros[:n])
+			if werr != nil || written == 0 {
+				break
+			}
+			remaining -= int64(written)
+		}
+		_ = f.Sync()
+	}
+	f.Close()
+	return os.Remove(path)
 }
 
 func backupTempDBPath(dbPath, archivePath string) string {
@@ -204,7 +259,7 @@ func TestBackup(file, masterKey, tempFolder string) error {
 		return err
 	}
 	defer destroyKeyRegistry(handle)
-	backupDSN := BuildDSN(dbPath, applyRegistryToOptions(Options{}, handle))
+	backupDSN := buildDSN(dbPath, applyRegistryToOptions(Options{Cipher: payload.Cipher}, handle))
 	opened, err := openSQLDB(backupDSN)
 	if err != nil {
 		return err
@@ -225,102 +280,6 @@ func TestBackup(file, masterKey, tempFolder string) error {
 // toFolder, and verifies the database integrity check succeeds.
 // If overwriteExistingFile is true, existing files in toFolder will be overwritten;
 // if false, the restore will fail if any destination file already exists.
-func RestoreBackup(fle, masterkey, toFolder string, overwriteExistingFile bool) error {
-	if strings.TrimSpace(fle) == "" {
-		return ErrBackupTargetRequired
-	}
-	if strings.TrimSpace(masterkey) == "" {
-		return ErrKeyRequired
-	}
-	if strings.TrimSpace(toFolder) == "" {
-		return fmt.Errorf("encz: restore target folder is required")
-	}
-
-	tmpDir, err := os.MkdirTemp("", "encz-restore-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmpDir)
-
-	zipPath, err := decryptBackupArchive(fle, masterkey, tmpDir)
-	if err != nil {
-		return err
-	}
-
-	r, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-
-	if !overwriteExistingFile {
-		for _, f := range r.File {
-			target := filepath.Join(toFolder, f.Name)
-			if _, err := os.Stat(target); err == nil {
-				return fmt.Errorf("encz: restore target file already exists: %s", target)
-			}
-		}
-	}
-
-	if err := os.MkdirAll(toFolder, 0o755); err != nil {
-		return err
-	}
-
-	var dbPath, manifestPath string
-	for _, f := range r.File {
-		target := filepath.Join(toFolder, f.Name)
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		if err := extractZipEntry(f, target); err != nil {
-			return err
-		}
-		if strings.HasSuffix(f.Name, ".bak.encz") {
-			manifestPath = target
-		} else if strings.HasSuffix(f.Name, ".bak") {
-			dbPath = target
-		}
-	}
-
-	if dbPath == "" {
-		return fmt.Errorf("encz: backup archive missing .bak database")
-	}
-	if manifestPath == "" {
-		return ErrManifestMissing
-	}
-
-	keyBuf := memguard.NewBufferFromBytes([]byte(masterkey))
-	defer keyBuf.Destroy()
-
-	payload, policy, err := loadManifest(manifestPath, keyBuf)
-	if err != nil {
-		return err
-	}
-
-	handle, err := registerKeyRegistry(manifestPath, keyBuf, payload, policy, false)
-	if err != nil {
-		return err
-	}
-	defer destroyKeyRegistry(handle)
-
-	backupDSN := BuildDSN(dbPath, applyRegistryToOptions(Options{}, handle))
-	opened, err := openSQLDB(backupDSN)
-	if err != nil {
-		return err
-	}
-	defer opened.Close()
-
-	var integrity string
-	if err := opened.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil {
-		return err
-	}
-	if integrity != "ok" {
-		return fmt.Errorf("encz: backup integrity check failed: %s", integrity)
-	}
-
-	return nil
-}
-
 func extractBackupArchive(file, tempFolder string) (dbPath string, manifestPath string, err error) {
 	if err := os.MkdirAll(tempFolder, 0o755); err != nil {
 		return "", "", err
@@ -333,7 +292,10 @@ func extractBackupArchive(file, tempFolder string) (dbPath string, manifestPath 
 	defer r.Close()
 
 	for _, f := range r.File {
-		target := filepath.Join(tempFolder, f.Name)
+		target, err := sanitizeZipEntryPath(tempFolder, f.Name)
+		if err != nil {
+			return "", "", err
+		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return "", "", err
 		}
@@ -392,11 +354,15 @@ func decryptBackupArchive(file, masterKey, tempFolder string) (string, error) {
 }
 
 func encryptBackupArchive(plainZipPath, encryptedPath string, key *memguard.LockedBuffer) error {
+	return encryptBackupArchiveWithCipher(plainZipPath, encryptedPath, key, defaultCipher)
+}
+
+func encryptBackupArchiveWithCipher(plainZipPath, encryptedPath string, key *memguard.LockedBuffer, cipher Cipher) error {
 	plain, err := os.ReadFile(plainZipPath)
 	if err != nil {
 		return err
 	}
-	hdr, kek, err := newBackupArchiveHeader(key)
+	hdr, kek, err := newBackupArchiveHeader(key, cipher)
 	if err != nil {
 		return err
 	}
@@ -407,7 +373,11 @@ func encryptBackupArchive(plainZipPath, encryptedPath string, key *memguard.Lock
 	t, m, thr := getArgonParams()
 	buf := make([]byte, 0, backupArchiveHeaderSize()+len(sealed))
 	buf = append(buf, []byte(backupArchiveMagic)...)
-	buf = append(buf, backupArchiveVersion)
+	id, err := cipherID(hdr.Cipher)
+	if err != nil {
+		return err
+	}
+	buf = append(buf, backupArchiveVersion, byte(id))
 	buf = binary.LittleEndian.AppendUint32(buf, t)
 	buf = binary.LittleEndian.AppendUint32(buf, m)
 	buf = append(buf, thr)
@@ -418,6 +388,13 @@ func encryptBackupArchive(plainZipPath, encryptedPath string, key *memguard.Lock
 }
 
 func decryptBackupArchiveToFile(encryptedPath, zipPath string, key *memguard.LockedBuffer) error {
+	info, err := os.Stat(encryptedPath)
+	if err != nil {
+		return err
+	}
+	if info.Size() > maxBackupArchiveSize {
+		return fmt.Errorf("%w: archive exceeds size limit", ErrBackupArchiveInvalid)
+	}
 	blob, err := os.ReadFile(encryptedPath)
 	if err != nil {
 		return err
@@ -434,10 +411,11 @@ func decryptBackupArchiveToFile(encryptedPath, zipPath string, key *memguard.Loc
 	return atomicWriteFile(zipPath, plain, 0o600)
 }
 
-func newBackupArchiveHeader(key *memguard.LockedBuffer) (backupArchiveHeader, []byte, error) {
+func newBackupArchiveHeader(key *memguard.LockedBuffer, cipher Cipher) (backupArchiveHeader, []byte, error) {
 	var hdr backupArchiveHeader
 	t, m, thr := getArgonParams()
 	hdr.Version = backupArchiveVersion
+	hdr.Cipher = cipher
 	hdr.ArgonTime = t
 	hdr.ArgonMemory = m
 	hdr.ArgonThreads = thr
@@ -452,6 +430,7 @@ func newBackupArchiveHeader(key *memguard.LockedBuffer) (backupArchiveHeader, []
 
 type backupArchiveHeader struct {
 	Version      byte
+	Cipher       Cipher
 	ArgonTime    uint32
 	ArgonMemory  uint32
 	ArgonThreads uint8
@@ -460,7 +439,7 @@ type backupArchiveHeader struct {
 }
 
 func backupArchiveHeaderSize() int {
-	return len(backupArchiveMagic) + 1 + 4 + 4 + 1 + backupArchiveSaltSize + backupArchiveNonceSize
+	return len(backupArchiveMagic) + 1 + 1 + 4 + 4 + 1 + backupArchiveSaltSize + backupArchiveNonceSize
 }
 
 func parseBackupArchive(blob []byte) (backupArchiveHeader, []byte, error) {
@@ -469,20 +448,35 @@ func parseBackupArchive(blob []byte) (backupArchiveHeader, []byte, error) {
 		return hdr, nil, ErrBackupArchiveInvalid
 	}
 	if string(blob[:len(backupArchiveMagic)]) != backupArchiveMagic {
+		if len(blob) >= 6 && string(blob[:6]) == "ENCZB2" {
+			return hdr, nil, ErrLegacyFormatUnsupported
+		}
 		return hdr, nil, ErrBackupArchiveInvalid
 	}
 	offset := len(backupArchiveMagic)
 	hdr.Version = blob[offset]
 	offset++
 	if hdr.Version != backupArchiveVersion {
+		if hdr.Version == 2 {
+			return hdr, nil, ErrLegacyFormatUnsupported
+		}
 		return hdr, nil, ErrBackupArchiveInvalid
 	}
+	parsedCipher, err := cipherFromID(uint32(blob[offset]))
+	if err != nil {
+		return hdr, nil, ErrBackupArchiveInvalid
+	}
+	hdr.Cipher = parsedCipher
+	offset++
 	hdr.ArgonTime = binary.LittleEndian.Uint32(blob[offset:])
 	offset += 4
 	hdr.ArgonMemory = binary.LittleEndian.Uint32(blob[offset:])
 	offset += 4
 	hdr.ArgonThreads = blob[offset]
 	offset++
+	if err := validateArgonParams(hdr.ArgonTime, hdr.ArgonMemory, hdr.ArgonThreads); err != nil {
+		return backupArchiveHeader{}, nil, ErrBackupArchiveInvalid
+	}
 	copy(hdr.Salt[:], blob[offset:offset+backupArchiveSaltSize])
 	offset += backupArchiveSaltSize
 	copy(hdr.Nonce[:], blob[offset:offset+backupArchiveNonceSize])
@@ -495,29 +489,30 @@ func deriveBackupArchiveKey(key *memguard.LockedBuffer, hdr backupArchiveHeader)
 }
 
 func sealBackupArchive(kek []byte, hdr backupArchiveHeader, plain []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.New(kek)
+	aead, err := newCipherAEAD(hdr.Cipher, kek)
 	if err != nil {
 		return nil, err
 	}
-	return aead.Seal(nil, hdr.Nonce[:], plain, backupArchiveAAD(hdr)), nil
+	return aead.Seal(nil, hdr.Nonce[:aead.NonceSize()], plain, backupArchiveAAD(hdr)), nil
 }
 
 func openBackupArchive(kek []byte, hdr backupArchiveHeader, ciphertext []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.New(kek)
+	aead, err := newCipherAEAD(hdr.Cipher, kek)
 	if err != nil {
 		return nil, err
 	}
-	plain, err := aead.Open(nil, hdr.Nonce[:], ciphertext, backupArchiveAAD(hdr))
+	plain, err := aead.Open(nil, hdr.Nonce[:aead.NonceSize()], ciphertext, backupArchiveAAD(hdr))
 	if err != nil {
-		return nil, ErrManifestAuthFailed
+		return nil, ErrBackupAuthFailed
 	}
 	return plain, nil
 }
 
 func backupArchiveAAD(hdr backupArchiveHeader) []byte {
-	buf := make([]byte, 0, len(backupArchiveMagic)+1+4+4+1+backupArchiveSaltSize)
+	buf := make([]byte, 0, len(backupArchiveMagic)+1+1+4+4+1+backupArchiveSaltSize)
 	buf = append(buf, []byte(backupArchiveMagic)...)
-	buf = append(buf, hdr.Version)
+	id, _ := cipherID(hdr.Cipher)
+	buf = append(buf, hdr.Version, byte(id))
 	buf = binary.LittleEndian.AppendUint32(buf, hdr.ArgonTime)
 	buf = binary.LittleEndian.AppendUint32(buf, hdr.ArgonMemory)
 	buf = append(buf, hdr.ArgonThreads)

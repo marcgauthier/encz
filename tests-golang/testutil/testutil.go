@@ -10,7 +10,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var JournalModes = []string{"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+var JournalModes = []string{"MEMORY", "WAL"}
 
 // OpenTestDB opens a test database with specific VFS configuration.
 func OpenTestDB(t *testing.T, encrypted bool, foreignKeys bool, journalMode string) (*sql.DB, string) {

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-var compatJournalModes = []string{"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+var compatJournalModes = []string{"MEMORY", "WAL"}
 
 func TestCompatOpenTxlock(t *testing.T) {
 	cases := []struct {

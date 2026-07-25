@@ -5,18 +5,27 @@ import "C"
 import (
 	"log"
 	"strings"
+	"sync/atomic"
 )
 
-// LogHandler is called whenever the underlying C extension encounters an error
+var logHandler atomic.Pointer[func(string)]
+
+// SetLogHandler sets a custom handler for encz error messages
 // (such as page decryption failure or MAC verification failure).
-// If nil, errors are logged using standard Go log package.
-var LogHandler func(string)
+// Pass nil to revert to the default (log.Println) behavior.
+func SetLogHandler(h func(string)) {
+	if h == nil {
+		logHandler.Store(nil)
+	} else {
+		logHandler.Store(&h)
+	}
+}
 
 //export enczGoLog
 func enczGoLog(msg *C.char) {
 	str := strings.TrimSpace(C.GoString(msg))
-	if LogHandler != nil {
-		LogHandler(str)
+	if hp := logHandler.Load(); hp != nil {
+		(*hp)(str)
 	} else {
 		log.Println(str)
 	}

@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"flag"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -574,25 +573,7 @@ func TestBackupDirCreationAndFileExistsErrors(t *testing.T) {
 }
 
 func TestBackupOutputExistsPreTemp(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "backup_exists.db")
-	db, err := OpenEncz(dbPath, "Pass123")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	// Pre-create the temp zip file path to trigger ErrBackupOutputExists inside the loop
-	toFile := filepath.Join(tempDir, "exists.zip")
-	zipTempPath := toFile + ".plainzip"
-	if err := os.WriteFile(zipTempPath, []byte("tempzip"), 0600); err != nil {
-		t.Fatalf("write temp zip: %v", err)
-	}
-
-	err = db.Backup(toFile, BackupOptions{})
-	if !errors.Is(err, ErrBackupOutputExists) {
-		t.Errorf("expected ErrBackupOutputExists for temp zip path, got %v", err)
-	}
+	t.Skip("backup plaintext staging now uses an unpredictable private temporary path")
 }
 
 func TestBackupOpenSQLDBFailure(t *testing.T) {
@@ -727,7 +708,7 @@ func TestRestoreBackupMissingFiles(t *testing.T) {
 	}
 
 	err = RestoreBackup(encZipPathDbOnly, key, filepath.Join(tempDir, "restore_dbonly"), true)
-	if !errors.Is(err, ErrManifestMissing) {
+	if !errors.Is(err, ErrBackupArchiveInvalid) {
 		t.Errorf("expected ErrManifestMissing, got %v", err)
 	}
 }
@@ -871,7 +852,7 @@ func TestOptionsManifestPath(t *testing.T) {
 		t.Fatalf("OpenWithOptions with ManifestPath: %v", err)
 	}
 	db.Close()
-	
+
 	// Check that the manifest was created at the custom path
 	if _, err := os.Stat(manifestPath); err != nil {
 		t.Errorf("expected manifest at custom path, got: %v", err)
@@ -895,7 +876,7 @@ func TestNormalizeCreateRotationPolicyValid(t *testing.T) {
 		t.Fatalf("OpenWithOptions with custom policy: %v", err)
 	}
 	defer db.Close()
-	
+
 	status, err := db.RotationStatus()
 	if err != nil {
 		t.Fatalf("RotationStatus: %v", err)
@@ -931,6 +912,7 @@ func createCustomEncryptedManifest(t *testing.T, path string, key *memguard.Lock
 	t.Helper()
 	hdr := manifestHeader{
 		Version:      manifestVersion,
+		Cipher:       defaultCipher,
 		ArgonTime:    1,
 		ArgonMemory:  1024,
 		ArgonThreads: 1,
@@ -953,6 +935,7 @@ func createCustomEncryptedManifest(t *testing.T, path string, key *memguard.Lock
 		}
 	} else {
 		payload := manifestPayload{
+			Cipher:               defaultCipher,
 			DBUUID:               "0102030405060708090a0b0c0d0e0f10",
 			ActiveDEKKeyID:       1,
 			DEKs:                 []manifestDEK{{KeyID: 1, DEKHex: "0000000000000000000000000000000000000000000000000000000000000001"}},
@@ -979,8 +962,9 @@ func createCustomEncryptedManifest(t *testing.T, path string, key *memguard.Lock
 	}
 
 	buf := make([]byte, 0, manifestHeaderSize()+len(sealed))
+	id, _ := cipherID(hdr.Cipher)
 	buf = append(buf, []byte(manifestMagic)...)
-	buf = append(buf, hdr.Version)
+	buf = append(buf, hdr.Version, byte(id))
 	buf = binary.LittleEndian.AppendUint32(buf, hdr.ArgonTime)
 	buf = binary.LittleEndian.AppendUint32(buf, hdr.ArgonMemory)
 	buf = append(buf, hdr.ArgonThreads)
@@ -1212,15 +1196,14 @@ func TestSetRotationPolicyErrors(t *testing.T) {
 }
 
 func TestDriverRegisterErrors(t *testing.T) {
-	// Save original bridge state
-	origDriverOnce := registerDriverOnce
-	origEnczOnce := registerEnczOnce
 	origDriverErr := registerDriverErr
 	origEnczErr := registerEnczErr
 
 	defer func() {
-		registerDriverOnce = origDriverOnce
-		registerEnczOnce = origEnczOnce
+		registerDriverOnce = sync.Once{}
+		registerDriverOnce.Do(func() {})
+		registerEnczOnce = sync.Once{}
+		registerEnczOnce.Do(func() {})
 		registerDriverErr = origDriverErr
 		registerEnczErr = origEnczErr
 	}()
@@ -1505,43 +1488,9 @@ func TestBackupInternalErrors(t *testing.T) {
 		}
 	})
 
-	// 5. TestBackup_WriteArchiveError
-	t.Run("WriteArchiveError", func(t *testing.T) {
-		tempDir := t.TempDir()
-		dbPath := filepath.Join(tempDir, "write_archive.db")
-		db, err := OpenEncz(dbPath, "Pass123")
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		defer db.Close()
+	// Plaintext ZIP staging now uses an unpredictable private temporary path,
+	// so callers cannot pre-create or replace it.
 
-		toFile := filepath.Join(tempDir, "backup.zip")
-		backupDBPath := backupTempDBPath(db.path, toFile)
-		zipTempPath := toFile + ".plainzip"
-
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				if _, err := os.Stat(backupDBPath); err == nil {
-					os.MkdirAll(zipTempPath, 0755) // block zip creation
-					break
-				}
-				time.Sleep(1 * time.Millisecond)
-			}
-		}()
-
-		err = db.Backup(toFile, BackupOptions{})
-		wg.Wait()
-		os.RemoveAll(zipTempPath)
-		if err == nil {
-			t.Fatal("expected error when temp DB is deleted before archiving")
-		} else {
-			t.Logf("WRITE ARCHIVE ERROR: %v", err)
-		}
-	})
-	
 	// 6. TestBackup_OpenSQLDBFailure (updated version)
 	t.Run("OpenSQLDBFailure", func(t *testing.T) {
 		tempDir := t.TempDir()
@@ -1624,7 +1573,7 @@ func TestResolveOpenOptionsRegisterKeyRegistryError(t *testing.T) {
 	keyBuf := memguard.NewBufferFromBytes([]byte(key))
 	defer keyBuf.Destroy()
 	manifestPath := dbPath + ".encz"
-	
+
 	createCustomEncryptedManifest(t, manifestPath, keyBuf, nil, func(p *manifestPayload) {
 		p.DEKs[0].DEKHex = "invalid-hex-chars!!"
 	})
@@ -1662,13 +1611,13 @@ func TestTestBackupHelperMoreErrors(t *testing.T) {
 	zipPathCorrupt := filepath.Join(tempDir, "corrupt_db.zip")
 	f2, _ := os.Create(zipPathCorrupt)
 	zw2 := zip.NewWriter(f2)
-	
+
 	// Create a real manifest
 	dbPath := filepath.Join(tempDir, "src.db")
 	db, _ := OpenEncz(dbPath, key)
 	db.Exec("CREATE TABLE t(x)")
 	db.Close()
-	
+
 	mBytes, _ := os.ReadFile(dbPath + ".encz")
 	wm, _ := zw2.Create("test.bak.encz")
 	wm.Write(mBytes)
@@ -1686,7 +1635,7 @@ func TestTestBackupHelperMoreErrors(t *testing.T) {
 	}
 	wd, _ := zw2.Create("test.bak")
 	wd.Write(dbBytes)
-	
+
 	zw2.Close()
 	f2.Close()
 
@@ -1770,7 +1719,7 @@ func TestTestBackupHelperManifestCorrupt(t *testing.T) {
 	zipPathRegFail := filepath.Join(tempDir, "reg_fail_zip.zip")
 	f2, _ := os.Create(zipPathRegFail)
 	zw2 := zip.NewWriter(f2)
-	
+
 	// Create manifest with invalid DEKHex
 	mPath := filepath.Join(tempDir, "invalid_dek.encz")
 	createCustomEncryptedManifest(t, mPath, keyBuf, nil, func(p *manifestPayload) {
@@ -1779,11 +1728,11 @@ func TestTestBackupHelperManifestCorrupt(t *testing.T) {
 	mBytes, _ := os.ReadFile(mPath)
 	wm, _ := zw2.Create("test.bak.encz")
 	wm.Write(mBytes)
-	
+
 	// Write dummy database bytes
 	wd, _ := zw2.Create("test.bak")
 	wd.Write([]byte("dummy db"))
-	
+
 	zw2.Close()
 	f2.Close()
 
@@ -1926,22 +1875,24 @@ func TestAddPathToZipOpenError(t *testing.T) {
 func TestBuildDSNAllOptions(t *testing.T) {
 	timeout := 5000
 	opts := Options{
-		Key: "somekey",
-		URIParameters: map[string]string{
-			"custom_param": "custom_val",
-		},
-		JournalMode: "WAL",
+		URIParameters:     map[string]string{"custom_param": "custom_val"},
+		JournalMode:       "WAL",
 		BusyTimeoutMillis: &timeout,
 	}
-	dsn := BuildDSN("/path/to/db.db", opts)
-	if !strings.Contains(dsn, "_busy_timeout=5000") {
-		t.Errorf("expected DSN to contain _busy_timeout=5000, got %s", dsn)
+	dsn, err := BuildDSN("/path/to/db.db", opts)
+	if err != nil {
+		t.Fatalf("BuildDSN: %v", err)
 	}
-	if !strings.Contains(dsn, "_journal_mode=WAL") {
-		t.Errorf("expected DSN to contain _journal_mode=WAL, got %s", dsn)
+	for _, expected := range []string{"_busy_timeout=5000", "_journal_mode=WAL", "custom_param=custom_val"} {
+		if !strings.Contains(dsn, expected) {
+			t.Errorf("expected DSN to contain %s, got %s", expected, dsn)
+		}
 	}
-	if !strings.Contains(dsn, "custom_param=custom_val") {
-		t.Errorf("expected DSN to contain custom_param=custom_val, got %s", dsn)
+	if _, err := BuildDSN("/path/to/db.db", Options{Key: "secret"}); !errors.Is(err, ErrDirectKeyUnsupported) {
+		t.Fatalf("expected direct key rejection, got %v", err)
+	}
+	if _, err := BuildDSN("/path/to/db.db", Options{URIParameters: map[string]string{"encz_registry": "1"}}); !errors.Is(err, ErrDirectKeyUnsupported) {
+		t.Fatalf("expected registry capability rejection, got %v", err)
 	}
 }
 
@@ -2019,10 +1970,10 @@ func TestSQLOpenError(t *testing.T) {
 }
 
 func TestGetArgonParamsDefault(t *testing.T) {
-	origCommandLine := flag.CommandLine
-	flag.CommandLine = flag.NewFlagSet("dummy", flag.ContinueOnError)
+	orig := testArgonOverride
+	testArgonOverride = false
 	defer func() {
-		flag.CommandLine = origCommandLine
+		testArgonOverride = orig
 	}()
 
 	timeParam, memParam, threadsParam := getArgonParams()
@@ -2140,8 +2091,3 @@ func TestRestoreBackupExtractErrors(t *testing.T) {
 		t.Fatal("expected RestoreBackup to fail when target file is blocked by a directory")
 	}
 }
-
-
-
-
-

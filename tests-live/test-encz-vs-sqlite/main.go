@@ -134,7 +134,7 @@ func (l *dualLogger) Progress(format string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.out, "\r"+msg)
+	fmt.Fprintf(l.out, "\r%s", msg)
 	l.progress = true
 
 	line := fmt.Sprintf("%s [PROGRESS] %s\n", time.Now().Format(time.RFC3339), msg)
@@ -636,7 +636,7 @@ func main() {
 	if status, err := r.enczDB.RotationStatus(); err != nil {
 		logger.Error("rotation status failed: %v", err)
 	} else {
-		logger.Info("ENCZ rotation status: KEK every %d days, DEK every %d hours, active DEK key id=%s", status.KEKRotationDays, status.DEKRotationHours, status.ActiveDEKKeyID)
+		logger.Info("ENCZ rotation status: KEK every %d days, DEK every %d hours, active DEK key id=%d", status.KEKRotationDays, status.DEKRotationHours, status.ActiveDEKKeyID)
 	}
 
 	logger.Info("runner started: action_interval=%s compare_interval=%s reopen_interval=%s schema_change_interval=%s complex_query_interval=%s large_tx_interval=%s max_db_size=%s max_run_time=%s workers=%d invalid_write_pct=%d", cfg.ActionEvery, cfg.CompareEvery, cfg.ReopenEvery, cfg.SchemaChangeEvery, cfg.ComplexQueryEvery, cfg.LargeTxEvery, cfg.MaxDBSize, cfg.MaxRunDuration, cfg.WorkerCount, cfg.InvalidWritePct)
@@ -1240,7 +1240,7 @@ func (r *runner) performUpdate(table *tableSpec, id string, changes map[string]a
 			return errors.New("update inline_verify mismatch")
 		}
 	} else if !reflect.DeepEqual(sqliteRowsSelect, enczRowsSelect) {
-		r.logger.Fatal("action=%d op=UPDATE table=%s id=%s inline_verify data mismatch sqlite=%v encz=%v", actionNo, table.Name, sqliteRowsSelect, enczRowsSelect)
+		r.logger.Fatal("action=%d op=UPDATE table=%s id=%s inline_verify data mismatch sqlite=%v encz=%v", actionNo, table.Name, id, sqliteRowsSelect, enczRowsSelect)
 		return errors.New("update inline_verify data mismatch")
 	}
 

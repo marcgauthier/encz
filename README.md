@@ -6,14 +6,14 @@
 
 `encz` registers a custom SQLite VFS named `encz`. For file-backed databases, the master key unlocks a `db.encz` manifest that contains the full DEK set for the database. SQLite then opens the database through that VFS and page I/O is transformed in place on the flat database file.
 
-- **Storage format**: Standard SQLite database and WAL files on disk, plus an encrypted `db.encz` sidecar manifest.
-- **Reserved bytes**: `encz` reserves 36 bytes on each SQLite page.
-- **Encryption**: Database pages, manifests, and backup archives are encrypted with **ChaCha20-Poly1305**.
-- **Per-page metadata**: The final 36 reserved bytes hold 4 bytes of flags, a 4-byte DEK key ID, a 12-byte nonce, and a 16-byte authentication tag.
-- **Nonce generation**: Each encrypted container uses a fresh random 96-bit nonce from the operating system's secure random number generator. For pages, this provides probabilistic nonce uniqueness per DEK rather than a deterministic counter-based guarantee.
-- **Authentication binding**: The Poly1305 authentication tag is computed with additional authenticated data (AAD) that binds the ciphertext to the database UUID, page number, file offset, and WAL/main-file context. This protects page identity and location, but it is separate from nonce uniqueness.
+- **Storage format**: Standard SQLite database and WAL files on disk, an encrypted `db.encz` sidecar manifest, and a `db.encz.lock` coordination file.
+- **Reserved bytes**: `encz` reserves 48 bytes on each SQLite page.
+- **Encryption**: New databases default to **AES-256-GCM** and may instead use **ChaCha20-Poly1305** or **XChaCha20-Poly1305**. The selected cipher protects pages, manifests, and backup archives.
+- **Per-page metadata**: The final 48 reserved bytes hold 4 bytes of flags, a 4-byte DEK key ID, a 24-byte nonce slot, and a 16-byte authentication tag. AES-GCM and ChaCha20-Poly1305 use the first 12 nonce bytes; XChaCha20-Poly1305 uses all 24.
+- **Nonce generation**: Each encrypted container uses a fresh operating-system random nonce. AES-GCM and ChaCha20-Poly1305 use 96-bit nonces; XChaCha20-Poly1305 uses 192-bit nonces. For pages, this provides probabilistic nonce uniqueness per DEK rather than a deterministic counter-based guarantee.
+- **Authentication binding**: The AEAD authentication tag is computed with additional authenticated data (AAD) that binds the ciphertext to the database UUID, page number, file offset, WAL/main-file context, and cipher identifier. This protects page identity and location, but it is separate from nonce uniqueness.
 - **Multi-DEK model**: Every page stores the DEK key ID used to encrypt it. Older DEKs remain in the manifest forever, so a single database can contain pages encrypted under different DEKs.
-- **Encrypted-only API**: `encz` only supports file-backed encrypted databases. Plain SQLite files, in-memory databases, and direct-key compatibility paths are rejected by the package helpers.
+- **Encrypted-only API**: `encz` only supports file-backed encrypted databases. Plain SQLite files, in-memory databases, direct-key DSNs, and direct-key PRAGMAs are rejected.
 
 ```
  SQLite Engine (SQL parsing, query planning, B-trees)
@@ -22,7 +22,7 @@
          Custom SQLite VFS Extension (encz)
                       |
                       v
-             ChaCha20-Poly1305 encryption
+              Selected Go AEAD encryption
                       |
                       v
            Flat SQLite database / WAL files
@@ -32,7 +32,7 @@
 
 - Go 1.25+
 - CGO enabled
-- Zero external C library dependencies (uses Monocypher)
+- Zero external C crypto library dependencies; AEAD operations are provided by Go through CGO callbacks
 
 ## Install
 
@@ -57,6 +57,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+
+	// Cipher choice is made when creating a database and is then stored in its manifest.
+	// db, err := encz.OpenWithOptions("users.db", encz.Options{
+	// 	Key: "Password123Password123Password123",
+	// 	Cipher: encz.CipherXChaCha20Poly1305,
+	// })
 
 	db.SetMaxOpenConns(5)
 
@@ -89,7 +95,8 @@ func main() {
 - `encz.OpenWithOptions` returns `*encz.DB`, which wraps `*sql.DB` and adds manifest operations such as `ReKey`, `SetRotationPolicy`, `RotationStatus`, and `Backup`.
 - Opening fails with `encz.ErrManifestMissing` when a database file exists without its manifest.
 - Opening fails with `encz.ErrManifestAuthFailed` when the manifest exists but the master key is wrong.
-- In-memory paths and direct-key URI compatibility settings are rejected by the package helpers.
+- In-memory paths, direct-key URI settings, and direct-key PRAGMAs are rejected.
+- WAL is the default journal mode. MEMORY is also supported; on-disk rollback journals are rejected because they expose plaintext page images.
 
 ## Backup & Restore
 
@@ -105,7 +112,7 @@ err := db.Backup("backup.zip", encz.BackupOptions{
 })
 ```
 
-- **Encryption**: The archive is sealed using ChaCha20-Poly1305. A secondary key is derived from the active master key using a unique salt, separate from the primary database's KEK.
+- **Encryption**: The archive is sealed with the database's selected cipher. A secondary key is derived from the active master key using a unique salt, separate from the primary database's KEK.
 - **Payload**: Contains the database page-encrypted files and the manifest containing all historical DEKs.
 
 ### Testing Backups
@@ -137,10 +144,10 @@ Below is a summary of all public package-level functions and methods available i
 
 - **`Register() error`**  
   Registers the custom `encz` SQLite VFS and driver name with Go's `database/sql` package automatically.
-- **`BuildDSN(path string, opts Options) string`**  
-  Constructs a standard SQLite connection DSN containing the custom VFS configuration and options.
-- **`BuildEnczDSN(path, key string) string`**  
-  Constructs a simplified connection string using the default `encz` driver and master key.
+- **`BuildDSN(path string, opts Options) (string, error)`**
+  Constructs a non-secret SQLite DSN. Key-bearing options return `ErrDirectKeyUnsupported`.
+- **`BuildEnczDSN(path, key string) (string, error)`**
+  Deprecated migration stub that always returns `ErrDirectKeyUnsupported`; use `OpenEncz`.
 - **`OpenEncz(path, key string) (*DB, error)`**  
   Opens or creates an encrypted database with default configurations and the specified master key.
 - **`OpenWithOptions(path string, opts Options) (*DB, error)`**  
@@ -253,12 +260,12 @@ if err != nil {
 
 ## Compatibility
 
-This release uses ChaCha20-Poly1305 consistently across pages, manifests, and backup archives. It also changes the page trailer format from 32 reserved bytes to 36 reserved bytes and changes the manifest schema from a single-DEK model to a multi-DEK model.
+This release uses the selected Go AEAD cipher consistently across pages, manifests, and backup archives. New databases default to AES-256-GCM; ChaCha20-Poly1305 and XChaCha20-Poly1305 are available at creation. The v3 page trailer reserves 48 bytes and the manifest stores the immutable cipher choice.
 
 Release scope:
 
 - This version is intended for newly created `encz` databases only.
-- Existing manifests and backup archives created with the older AES-based container format are not supported by this release.
-- Existing databases created with the older page/manifest format are not supported by this release.
+- Existing manifests and backup archives created with the legacy Monocypher-based container format are not supported by this release.
+- Existing databases created with the legacy page/manifest format are not supported by this release.
 - This package does not provide automatic migration, in-place upgrade, or compatibility fallback for older database files or encrypted backup containers.
 - Existing deployments must keep using the previous format until a separate migration path is introduced.

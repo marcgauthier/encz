@@ -6,35 +6,41 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/awnumar/memguard"
 	"golang.org/x/crypto/argon2"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
-	manifestMagic                  = "ENCZK2"
-	manifestVersion                = 2
+	manifestMagic                  = "ENCZK3"
+	manifestVersion                = 3
 	manifestSaltSize               = 16
-	manifestNonceSize              = 12
+	manifestNonceSize              = 24
 	manifestKEKSize                = 32
 	defaultKEKRotationDays         = 7
 	defaultDEKRotationHours        = 24
 	defaultArgonTime        uint32 = 3
 	defaultArgonMemory      uint32 = 64 * 1024
 	defaultArgonThreads     uint8  = 4
+	maxArgonTime            uint32 = 6
+	maxArgonMemory          uint32 = 256 * 1024
+	maxArgonThreads         uint8  = 16
 )
 
+// testArgonOverride enables fast Argon2id parameters for testing.
+// Set to true in test init functions; must not be used in production.
+var testArgonOverride bool
+
 func getArgonParams() (uint32, uint32, uint8) {
-	if flag.Lookup("test.v") != nil {
+	if testArgonOverride {
 		return 1, 1024, 1
 	}
 	return defaultArgonTime, defaultArgonMemory, defaultArgonThreads
@@ -48,6 +54,7 @@ var (
 	ErrManifestAuthFailed    = errors.New("encz: manifest authentication failed")
 	ErrDirectKeyUnsupported  = errors.New("encz: direct key configuration is unsupported")
 	ErrFileBackedRequired    = errors.New("encz: only file-backed encrypted databases are supported")
+	ErrUnsafeJournalMode     = errors.New("encz: on-disk rollback journals are not encrypted; use WAL or MEMORY")
 	ErrRotationPolicyInvalid = errors.New("encz: rotation policy is invalid")
 	ErrDBClosed              = errors.New("encz: database handle is closed")
 	ErrCurrentKeyMismatch    = errors.New("encz: old key does not match the active handle key")
@@ -80,6 +87,7 @@ type RotationInfo struct {
 
 type manifestHeader struct {
 	Version      byte
+	Cipher       Cipher
 	ArgonTime    uint32
 	ArgonMemory  uint32
 	ArgonThreads uint8
@@ -100,6 +108,7 @@ type manifestDEK struct {
 }
 
 type manifestPayload struct {
+	Cipher               Cipher           `json:"cipher"`
 	DBUUID               string           `json:"db_uuid"`
 	ActiveDEKKeyID       uint32           `json:"active_dek_key_id"`
 	DEKs                 []manifestDEK    `json:"deks"`
@@ -125,60 +134,72 @@ func resolveOpenOptions(path string, opts Options) (Options, string, uint64, err
 	if isMemoryPath(path, opts) {
 		return Options{}, "", 0, ErrFileBackedRequired
 	}
+	var err error
+	opts, err = secureOpenOptions(opts)
+	if err != nil {
+		return Options{}, "", 0, err
+	}
 
 	manifestPath := manifestPathFor(path, opts)
-	dbExists, err := fileExists(path)
-	if err != nil {
-		return Options{}, "", 0, err
-	}
-	manifestExists, err := fileExists(manifestPath)
-	if err != nil {
-		return Options{}, "", 0, err
-	}
-	createAllowed := modeAllowsCreate(opts)
-
 	keyBuf := memguard.NewBufferFromBytes([]byte(opts.Key))
 	defer keyBuf.Destroy()
+	requestedCipher := opts.Cipher
+	opts.Cipher, err = normalizeCipher(opts.Cipher)
+	if err != nil {
+		return Options{}, "", 0, err
+	}
 
 	var (
 		payload manifestPayload
 		policy  RotationPolicy
 	)
 
-	if !dbExists && !manifestExists {
-		if !createAllowed {
-			return Options{}, "", 0, os.ErrNotExist
+	err = withManifestLock(manifestPath, func() error {
+		dbExists, statErr := fileExists(path)
+		if statErr != nil {
+			return statErr
 		}
-		policy, err = normalizeCreateRotationPolicy(opts.RotationPolicy)
-		if err != nil {
-			return Options{}, "", 0, err
+		manifestExists, statErr := fileExists(manifestPath)
+		if statErr != nil {
+			return statErr
 		}
-		payload, err = newManifestPayload(policy, timeNowUTC())
-		if err != nil {
-			return Options{}, "", 0, err
+		if !dbExists && !manifestExists {
+			if !modeAllowsCreate(opts) {
+				return os.ErrNotExist
+			}
+			policy, err = normalizeCreateRotationPolicy(opts.RotationPolicy)
+			if err != nil {
+				return err
+			}
+			payload, err = newManifestPayload(policy, opts.Cipher, timeNowUTC())
+			if err != nil {
+				return err
+			}
+			return saveManifest(manifestPath, keyBuf, payload)
 		}
-		if err := saveManifest(manifestPath, keyBuf, payload); err != nil {
-			return Options{}, "", 0, err
-		}
-	} else {
 		if dbExists && !manifestExists {
-			return Options{}, "", 0, ErrManifestMissing
+			return ErrManifestMissing
 		}
 		if !dbExists && manifestExists {
-			return Options{}, "", 0, ErrManifestMismatch
+			return ErrManifestMismatch
 		}
-
 		payload, policy, err = loadManifest(manifestPath, keyBuf)
 		if err != nil {
-			return Options{}, "", 0, err
+			return err
 		}
+		if requestedCipher != "" && requestedCipher != payload.Cipher {
+			return ErrCipherMismatch
+		}
+		opts.Cipher = payload.Cipher
 		now := timeNowUTC()
 		if policy.AutoRewrap && rotationDue(payload, now) {
 			applyKEKRotation(&payload, policy, now)
-			if err := saveManifest(manifestPath, keyBuf, payload); err != nil {
-				return Options{}, "", 0, err
-			}
+			return saveManifest(manifestPath, keyBuf, payload)
 		}
+		return nil
+	})
+	if err != nil {
+		return Options{}, "", 0, err
 	}
 
 	handle, err := registerKeyRegistry(manifestPath, keyBuf, payload, policy, true)
@@ -186,6 +207,33 @@ func resolveOpenOptions(path string, opts Options) (Options, string, uint64, err
 		return Options{}, "", 0, err
 	}
 	return applyRegistryToOptions(opts, handle), manifestPath, handle, nil
+}
+
+func secureOpenOptions(opts Options) (Options, error) {
+	resolved := opts
+	resolved.URIParameters = cloneURIParameters(opts.URIParameters)
+
+	requested := opts.JournalMode
+	if requested == "" {
+		if value := resolved.URIParameters["_journal_mode"]; value != "" {
+			requested = value
+		}
+		if value := resolved.URIParameters["_journal"]; value != "" {
+			requested = value
+		}
+	}
+	if requested == "" && resolved.URIParameters["mode"] != "ro" {
+		requested = "WAL"
+	}
+	switch strings.ToUpper(requested) {
+	case "", "WAL", "MEMORY":
+	default:
+		return Options{}, fmt.Errorf("%w: %s", ErrUnsafeJournalMode, requested)
+	}
+	delete(resolved.URIParameters, "_journal")
+	delete(resolved.URIParameters, "_journal_mode")
+	resolved.JournalMode = strings.ToUpper(requested)
+	return resolved, nil
 }
 
 func fileExists(path string) (bool, error) {
@@ -247,6 +295,8 @@ func applyRegistryToOptions(opts Options, handle uint64) Options {
 	resolved.URIParameters = cloneURIParameters(opts.URIParameters)
 	resolved.URIParameters["vfs"] = "encz"
 	resolved.URIParameters["encz_registry"] = strconv.FormatUint(handle, 10)
+	id, _ := cipherID(resolved.Cipher)
+	resolved.URIParameters["encz_cipher"] = strconv.FormatUint(uint64(id), 10)
 	delete(resolved.URIParameters, "crypto_key")
 	delete(resolved.URIParameters, "crypto_key_hex")
 	delete(resolved.URIParameters, "crypto_key_env")
@@ -293,7 +343,7 @@ func validateRotationPolicy(policy RotationPolicy) (RotationPolicy, error) {
 	return out, nil
 }
 
-func newManifestPayload(policy RotationPolicy, now time.Time) (manifestPayload, error) {
+func newManifestPayload(policy RotationPolicy, cipher Cipher, now time.Time) (manifestPayload, error) {
 	dbUUID, err := randomID()
 	if err != nil {
 		return manifestPayload{}, err
@@ -303,6 +353,7 @@ func newManifestPayload(policy RotationPolicy, now time.Time) (manifestPayload, 
 		return manifestPayload{}, err
 	}
 	payload := manifestPayload{
+		Cipher:               cipher,
 		DBUUID:               dbUUID,
 		ActiveDEKKeyID:       0,
 		DEKs:                 []manifestDEK{{KeyID: 0, DEKHex: dekHex, CreatedAt: now}},
@@ -371,6 +422,12 @@ func loadManifest(path string, passphrase *memguard.LockedBuffer) (manifestPaylo
 	if len(payload.DEKs) == 0 || payload.KEKRotationDays <= 0 {
 		return payload, RotationPolicy{}, ErrManifestInvalid
 	}
+	if payload.Cipher == "" {
+		payload.Cipher = hdr.Cipher
+	}
+	if payload.Cipher != hdr.Cipher {
+		return payload, RotationPolicy{}, ErrManifestInvalid
+	}
 	policy := policyFromPayload(payload)
 	if _, ok := activeDEKFromPayload(&payload); !ok {
 		return payload, RotationPolicy{}, ErrManifestInvalid
@@ -394,6 +451,7 @@ func saveManifest(path string, passphrase *memguard.LockedBuffer, payload manife
 	t, m, thr := getArgonParams()
 	hdr := manifestHeader{
 		Version:      manifestVersion,
+		Cipher:       payload.Cipher,
 		ArgonTime:    t,
 		ArgonMemory:  m,
 		ArgonThreads: thr,
@@ -415,7 +473,11 @@ func saveManifest(path string, passphrase *memguard.LockedBuffer, payload manife
 	}
 	buf := make([]byte, 0, manifestHeaderSize()+len(sealed))
 	buf = append(buf, []byte(manifestMagic)...)
-	buf = append(buf, hdr.Version)
+	id, err := cipherID(hdr.Cipher)
+	if err != nil {
+		return err
+	}
+	buf = append(buf, hdr.Version, byte(id))
 	buf = binary.LittleEndian.AppendUint32(buf, hdr.ArgonTime)
 	buf = binary.LittleEndian.AppendUint32(buf, hdr.ArgonMemory)
 	buf = append(buf, hdr.ArgonThreads)
@@ -426,7 +488,7 @@ func saveManifest(path string, passphrase *memguard.LockedBuffer, payload manife
 }
 
 func manifestHeaderSize() int {
-	return len(manifestMagic) + 1 + 4 + 4 + 1 + manifestSaltSize + manifestNonceSize
+	return len(manifestMagic) + 1 + 1 + 4 + 4 + 1 + manifestSaltSize + manifestNonceSize
 }
 
 func parseManifest(blob []byte) (manifestHeader, []byte, error) {
@@ -435,20 +497,35 @@ func parseManifest(blob []byte) (manifestHeader, []byte, error) {
 		return hdr, nil, ErrManifestInvalid
 	}
 	if string(blob[:len(manifestMagic)]) != manifestMagic {
+		if len(blob) >= 6 && string(blob[:6]) == "ENCZK2" {
+			return hdr, nil, ErrLegacyFormatUnsupported
+		}
 		return hdr, nil, ErrManifestInvalid
 	}
 	offset := len(manifestMagic)
 	hdr.Version = blob[offset]
 	offset++
 	if hdr.Version != manifestVersion {
+		if hdr.Version == 2 {
+			return hdr, nil, ErrLegacyFormatUnsupported
+		}
 		return hdr, nil, ErrManifestInvalid
 	}
+	parsedCipher, err := cipherFromID(uint32(blob[offset]))
+	hdr.Cipher = parsedCipher
+	if err != nil {
+		return hdr, nil, ErrManifestInvalid
+	}
+	offset++
 	hdr.ArgonTime = binary.LittleEndian.Uint32(blob[offset:])
 	offset += 4
 	hdr.ArgonMemory = binary.LittleEndian.Uint32(blob[offset:])
 	offset += 4
 	hdr.ArgonThreads = blob[offset]
 	offset++
+	if err := validateArgonParams(hdr.ArgonTime, hdr.ArgonMemory, hdr.ArgonThreads); err != nil {
+		return manifestHeader{}, nil, ErrManifestInvalid
+	}
 	copy(hdr.Salt[:], blob[offset:offset+manifestSaltSize])
 	offset += manifestSaltSize
 	copy(hdr.Nonce[:], blob[offset:offset+manifestNonceSize])
@@ -456,24 +533,37 @@ func parseManifest(blob []byte) (manifestHeader, []byte, error) {
 	return hdr, blob[offset:], nil
 }
 
+func validateArgonParams(timeCost, memoryCost uint32, threads uint8) error {
+	if timeCost < 1 || timeCost > maxArgonTime {
+		return ErrManifestInvalid
+	}
+	if memoryCost < 8 || memoryCost > maxArgonMemory {
+		return ErrManifestInvalid
+	}
+	if threads < 1 || threads > maxArgonThreads {
+		return ErrManifestInvalid
+	}
+	return nil
+}
+
 func deriveKEK(passphrase *memguard.LockedBuffer, hdr manifestHeader) []byte {
 	return argon2.IDKey(passphrase.Bytes(), hdr.Salt[:], hdr.ArgonTime, hdr.ArgonMemory, hdr.ArgonThreads, manifestKEKSize)
 }
 
 func encryptManifestPayload(kek []byte, hdr manifestHeader, plain []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.New(kek)
+	aead, err := newCipherAEAD(hdr.Cipher, kek)
 	if err != nil {
 		return nil, err
 	}
-	return aead.Seal(nil, hdr.Nonce[:], plain, manifestAAD(hdr)), nil
+	return aead.Seal(nil, hdr.Nonce[:aead.NonceSize()], plain, manifestAAD(hdr)), nil
 }
 
 func decryptManifestPayload(kek []byte, hdr manifestHeader, ciphertext []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.New(kek)
+	aead, err := newCipherAEAD(hdr.Cipher, kek)
 	if err != nil {
 		return nil, err
 	}
-	plain, err := aead.Open(nil, hdr.Nonce[:], ciphertext, manifestAAD(hdr))
+	plain, err := aead.Open(nil, hdr.Nonce[:aead.NonceSize()], ciphertext, manifestAAD(hdr))
 	if err != nil {
 		return nil, ErrManifestAuthFailed
 	}
@@ -481,9 +571,10 @@ func decryptManifestPayload(kek []byte, hdr manifestHeader, ciphertext []byte) (
 }
 
 func manifestAAD(hdr manifestHeader) []byte {
-	buf := make([]byte, 0, len(manifestMagic)+1+4+4+1+manifestSaltSize)
+	buf := make([]byte, 0, len(manifestMagic)+1+1+4+4+1+manifestSaltSize)
 	buf = append(buf, []byte(manifestMagic)...)
-	buf = append(buf, hdr.Version)
+	id, _ := cipherID(hdr.Cipher)
+	buf = append(buf, hdr.Version, byte(id))
 	buf = binary.LittleEndian.AppendUint32(buf, hdr.ArgonTime)
 	buf = binary.LittleEndian.AppendUint32(buf, hdr.ArgonMemory)
 	buf = append(buf, hdr.ArgonThreads)

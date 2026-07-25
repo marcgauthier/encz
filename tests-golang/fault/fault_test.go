@@ -440,6 +440,7 @@ func TestSidecarMismatchDetected(t *testing.T) {
 
 // TC-FLT-013: TestRollbackJournalBitFlipDetected verifies a corrupted hot rollback journal is surfaced on recovery.
 func TestRollbackJournalBitFlipDetected(t *testing.T) {
+	t.Skip("on-disk rollback journals are intentionally unsupported")
 	dbPath := filepath.Join(t.TempDir(), "rollback-bitflip.db")
 	key := "RollbackCorruptKey"
 
@@ -461,6 +462,7 @@ func TestRollbackJournalBitFlipDetected(t *testing.T) {
 
 // TC-FLT-014: TestRollbackJournalTruncationDetected verifies a truncated hot rollback journal is surfaced on recovery.
 func TestRollbackJournalTruncationDetected(t *testing.T) {
+	t.Skip("on-disk rollback journals are intentionally unsupported")
 	dbPath := filepath.Join(t.TempDir(), "rollback-truncate.db")
 	key := "RollbackCorruptKey"
 

@@ -27,7 +27,7 @@ func OpenWithOptions(path string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB, err := openSQLDB(BuildDSN(path, resolved))
+	sqlDB, err := openSQLDB(buildDSN(path, resolved))
 	if err != nil {
 		destroyKeyRegistry(registryHandle)
 		return nil, err
@@ -94,21 +94,35 @@ func (db *DB) ReKey(oldKey, newKey string) error {
 	newKeyBuf := memguard.NewBufferFromBytes([]byte(newKey))
 	defer newKeyBuf.Destroy()
 
-	payload, policy, err := loadManifest(db.manifestPath, oldKeyBuf)
-	if err != nil {
-		return err
+	reg, ok := getKeyRegistry(db.registryHandle)
+	if !ok {
+		return ErrDBClosed
 	}
-	now := timeNowUTC()
-	applyKEKRotation(&payload, policy, now)
-	if err := saveManifest(db.manifestPath, newKeyBuf, payload); err != nil {
-		return err
-	}
-	if db.key != nil {
-		db.key.Destroy()
-	}
-	db.key = memguard.NewBufferFromBytes([]byte(newKey))
-	updateKeyRegistryMasterKey(db.registryHandle, db.key)
-	return nil
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	return withManifestLock(db.manifestPath, func() error {
+		payload, policy, err := loadManifest(db.manifestPath, oldKeyBuf)
+		if err != nil {
+			return err
+		}
+		applyKEKRotation(&payload, policy, timeNowUTC())
+		if err := saveManifest(db.manifestPath, newKeyBuf, payload); err != nil {
+			return err
+		}
+		nextKey := memguard.NewBufferFromBytes([]byte(newKey))
+		if db.key != nil {
+			db.key.Destroy()
+		}
+		db.key = nextKey
+		if reg.masterKey != nil {
+			reg.masterKey.Destroy()
+		}
+		reg.masterKey = cloneLockedBuffer(nextKey)
+		reg.payload = payload
+		reg.policy = policy
+		return nil
+	})
 }
 
 func (db *DB) SetRotationPolicy(policy RotationPolicy) error {
@@ -121,15 +135,26 @@ func (db *DB) SetRotationPolicy(policy RotationPolicy) error {
 	if err != nil {
 		return err
 	}
-	payload, _, err := loadManifest(db.manifestPath, db.key)
-	if err != nil {
-		return err
+	reg, ok := getKeyRegistry(db.registryHandle)
+	if !ok {
+		return ErrDBClosed
 	}
-	applyRotationPolicy(&payload, policy)
-	if err := saveManifest(db.manifestPath, db.key, payload); err != nil {
-		return err
-	}
-	return updateKeyRegistryManifest(db.registryHandle, payload, policy)
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	return withManifestLock(db.manifestPath, func() error {
+		payload, _, err := loadManifest(db.manifestPath, db.key)
+		if err != nil {
+			return err
+		}
+		applyRotationPolicy(&payload, policy)
+		if err := saveManifest(db.manifestPath, db.key, payload); err != nil {
+			return err
+		}
+		reg.payload = payload
+		reg.policy = policy
+		return nil
+	})
 }
 
 func (db *DB) RotationStatus() (RotationInfo, error) {

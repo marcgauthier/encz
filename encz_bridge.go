@@ -34,7 +34,14 @@ func registerEncz() error {
 }
 
 //export enczGoRandomBytes
-func enczGoRandomBytes(out *C.uchar, n C.int) {
+func enczGoRandomBytes(out *C.uchar, n C.int) C.int {
+	if out == nil || n <= 0 {
+		return 0
+	}
 	buf := unsafe.Slice((*byte)(unsafe.Pointer(out)), n)
-	_, _ = rand.Read(buf)
+	if _, err := rand.Read(buf); err != nil {
+		clear(buf)
+		return 0
+	}
+	return 1
 }

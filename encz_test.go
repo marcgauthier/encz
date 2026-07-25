@@ -29,10 +29,8 @@ func TestOpenWithOptionsRequiresKey(t *testing.T) {
 }
 
 func TestBuildEnczDSN(t *testing.T) {
-	dsn := BuildEnczDSN("users.db", "secret")
-	expected := "file:users.db?crypto_key=secret&vfs=encz"
-	if dsn != expected {
-		t.Fatalf("unexpected dsn %q", dsn)
+	if _, err := BuildEnczDSN("users.db", "secret"); !errors.Is(err, ErrDirectKeyUnsupported) {
+		t.Fatalf("expected ErrDirectKeyUnsupported, got %v", err)
 	}
 }
 
@@ -736,13 +734,13 @@ func TestLogHandler(t *testing.T) {
 	// Setup LogHandler to capture the error message
 	var logged []string
 	var mu sync.Mutex
-	LogHandler = func(msg string) {
+	SetLogHandler(func(msg string) {
 		mu.Lock()
 		logged = append(logged, msg)
 		mu.Unlock()
-	}
+	})
 	defer func() {
-		LogHandler = nil
+		SetLogHandler(nil)
 	}()
 
 	// Reopen and try to read, which should trigger decryption error

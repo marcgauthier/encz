@@ -26,8 +26,12 @@ func Register() error {
 			return
 		}
 		sql.Register(DriverName, &sqlite3.SQLiteDriver{
-			ConnectHook: func(*sqlite3.SQLiteConn) error {
-				return registerEncz()
+			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+				if err := registerEncz(); err != nil {
+					return err
+				}
+				_, err := conn.Exec("PRAGMA temp_store=MEMORY", nil)
+				return err
 			},
 		})
 	})

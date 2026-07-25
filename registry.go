@@ -1,10 +1,11 @@
 package encz
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/awnumar/memguard"
@@ -22,9 +23,8 @@ type keyRegistry struct {
 }
 
 var (
-	keyRegistrySeq atomic.Uint64
-	keyRegistryMu  sync.RWMutex
-	keyRegistries  = make(map[uint64]*keyRegistry)
+	keyRegistryMu sync.RWMutex
+	keyRegistries = make(map[uint64]*keyRegistry)
 )
 
 func cloneLockedBuffer(src *memguard.LockedBuffer) *memguard.LockedBuffer {
@@ -53,11 +53,27 @@ func registerKeyRegistry(manifestPath string, masterKey *memguard.LockedBuffer, 
 		allowDEKRotation: allowDEKRotation,
 		dbUUID:           dbUUID,
 	}
-	handle := keyRegistrySeq.Add(1)
-	keyRegistryMu.Lock()
-	keyRegistries[handle] = reg
-	keyRegistryMu.Unlock()
-	return handle, nil
+	for {
+		var capability [8]byte
+		if _, err := rand.Read(capability[:]); err != nil {
+			reg.masterKey.Destroy()
+			for _, key := range reg.keys {
+				key.Destroy()
+			}
+			return 0, err
+		}
+		handle := binary.LittleEndian.Uint64(capability[:])
+		if handle == 0 {
+			continue
+		}
+		keyRegistryMu.Lock()
+		if _, exists := keyRegistries[handle]; !exists {
+			keyRegistries[handle] = reg
+			keyRegistryMu.Unlock()
+			return handle, nil
+		}
+		keyRegistryMu.Unlock()
+	}
 }
 
 func getKeyRegistry(handle uint64) (*keyRegistry, bool) {
@@ -139,6 +155,7 @@ func buildRegistryKeyBuffers(payload manifestPayload) (map[uint32]*memguard.Lock
 			return nil, ErrManifestInvalid
 		}
 		keys[dek.KeyID] = memguard.NewBufferFromBytes(decoded)
+		clear(decoded)
 	}
 	if _, ok := keys[payload.ActiveDEKKeyID]; !ok {
 		for _, buf := range keys {
@@ -152,9 +169,14 @@ func buildRegistryKeyBuffers(payload manifestPayload) (map[uint32]*memguard.Lock
 }
 
 func (r *keyRegistry) fillKey(keyID uint32, out []byte) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	buf, ok := r.keys[keyID]
+	if !ok && r.masterKey != nil {
+		if err := r.refreshManifestLocked(); err == nil {
+			buf, ok = r.keys[keyID]
+		}
+	}
 	if !ok || buf == nil || len(out) < 32 {
 		return false
 	}
@@ -168,7 +190,16 @@ func (r *keyRegistry) fillActiveKey(out []byte) (uint32, bool) {
 
 	now := timeNowUTC()
 	if r.allowDEKRotation && dekRotationDue(r.payload, now) {
-		if err := r.rotateActiveDEKLocked(now); err != nil {
+		if err := withManifestLock(r.manifestPath, func() error {
+			if err := r.refreshManifestLocked(); err != nil {
+				return err
+			}
+			now = timeNowUTC()
+			if dekRotationDue(r.payload, now) {
+				return r.rotateActiveDEKLocked(now)
+			}
+			return nil
+		}); err != nil {
 			return 0, false
 		}
 	}
@@ -179,6 +210,29 @@ func (r *keyRegistry) fillActiveKey(out []byte) (uint32, bool) {
 	}
 	copy(out, buf.Bytes())
 	return r.payload.ActiveDEKKeyID, true
+}
+
+func (r *keyRegistry) refreshManifestLocked() error {
+	payload, policy, err := loadManifest(r.manifestPath, r.masterKey)
+	if err != nil {
+		return err
+	}
+	if payload.DBUUID != r.payload.DBUUID {
+		return ErrManifestMismatch
+	}
+	keys, err := buildRegistryKeyBuffers(payload)
+	if err != nil {
+		return err
+	}
+	for _, buf := range r.keys {
+		if buf != nil {
+			buf.Destroy()
+		}
+	}
+	r.keys = keys
+	r.payload = payload
+	r.policy = policy
+	return nil
 }
 
 func (r *keyRegistry) rotateActiveDEKLocked(now time.Time) error {
@@ -207,5 +261,6 @@ func (r *keyRegistry) rotateActiveDEKLocked(now time.Time) error {
 
 	r.payload = nextPayload
 	r.keys[nextID] = memguard.NewBufferFromBytes(decoded)
+	clear(decoded)
 	return nil
 }
