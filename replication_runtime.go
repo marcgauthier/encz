@@ -327,9 +327,15 @@ func (db *DB) ReloadReplicationCredentials(context.Context) error {
 		return ErrReplicationNotReady
 	}
 	db.replication.mu.Lock()
-	for _, c := range db.replication.connections {
-		_ = c.Close()
+	for _, connection := range db.replication.connections {
+		_ = connection.Close()
 	}
+	for _, listener := range db.replication.listeners {
+		_ = listener.Close()
+	}
+	db.replication.connections = make(map[string]net.Conn)
+	db.replication.listeners = nil
+	db.replication.authReplay = make(map[string]time.Time)
 	db.replication.mu.Unlock()
 	db.replication.start()
 	return nil
