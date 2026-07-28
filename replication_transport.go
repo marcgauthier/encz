@@ -5,8 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
@@ -154,6 +152,7 @@ func (r *replicationRuntime) acceptLoop(ln net.Listener) {
 				r.log("replication inbound handshake: %v", err)
 				return
 			}
+			r.setPeerAuthenticated(peer.NodeUUID, peer.SessionUUID)
 			r.trackConnection(peer.NodeUUID, c, true)
 			defer r.trackConnection(peer.NodeUUID, nil, false)
 			_ = r.serveSession(c, peer)
@@ -192,7 +191,7 @@ func (r *replicationRuntime) dialLoop(p peerRuntimeConfig) {
 					peer, err = r.handshake(tc, true, p.NodeUUID)
 					if err == nil {
 						r.trackConnection(p.NodeUUID, tc, true)
-						r.setPeerState(p.NodeUUID, "connected", "")
+						r.setPeerAuthenticated(p.NodeUUID, peer.SessionUUID)
 						err = r.clientSession(tc, peer, p)
 						r.trackConnection(p.NodeUUID, nil, false)
 					}
@@ -225,34 +224,13 @@ func (r *replicationRuntime) trackConnection(peer string, c net.Conn, add bool) 
 		delete(r.connections, peer)
 	}
 }
+func (r *replicationRuntime) setPeerAuthenticated(peer, session string) {
+	_, _ = r.db.Exec(`UPDATE replication_peer_connections SET session_state='connected',last_session_uuid=?,last_error=NULL,connected_at_utc=sqliteseal_utc_now(),consecutive_failures=0,updated_at_utc=sqliteseal_utc_now() WHERE peer_node_uuid=?`, session, peer)
+}
 func (r *replicationRuntime) setPeerState(peer, state, lastErr string) {
 	_, _ = r.db.Exec(`UPDATE replication_peer_connections SET session_state=?,last_error=?,connected_at_utc=CASE WHEN ?='connected' THEN sqliteseal_utc_now() ELSE connected_at_utc END,updated_at_utc=sqliteseal_utc_now() WHERE peer_node_uuid=?`, state, lastErr, state, peer)
 }
 
-func (r *replicationRuntime) localHello(ctx context.Context, credential string) (wireHello, error) {
-	var h wireHello
-	h.Protocol = replicationProtocolVersion
-	if err := r.db.QueryRowContext(ctx, `SELECT local_node_uuid,local_incarnation_uuid,replication_domain,schema_version,schema_hash,membership_epoch,membership_manifest_hash FROM replication_local_state`).Scan(&h.NodeUUID, &h.IncarnationUUID, &h.Domain, &h.SchemaVersion, &h.SchemaHash, &h.MembershipEpoch, &h.MembershipHash); err != nil {
-		return h, err
-	}
-	nonce := make([]byte, 32)
-	if _, err := rand.Read(nonce); err != nil {
-		return h, err
-	}
-	h.Nonce = base64.RawURLEncoding.EncodeToString(nonce)
-	psk, err := r.opts.Credentials.PSK(ctx, credential)
-	if err != nil {
-		return h, err
-	}
-	defer wipeBytes(psk)
-	h.Proof = replicationProof(psk, h)
-	return h, nil
-}
-func replicationProof(key []byte, h wireHello) string {
-	m := hmac.New(sha256.New, key)
-	fmt.Fprintf(m, "%d\x00%s\x00%s\x00%s\x00%s\x00%s", h.Protocol, h.NodeUUID, h.IncarnationUUID, h.Domain, h.SchemaHash, h.Nonce)
-	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
-}
 func wipeBytes(b []byte) {
 	for i := range b {
 		b[i] = 0

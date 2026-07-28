@@ -135,6 +135,158 @@ func main() {
 }
 ```
 
+### Two-Node Masterless Active-Active Replication
+
+`SQLiteSeal` includes built-in peer-to-peer active-active replication. The example below sets up two encrypted database nodes (`Node A` and `Node B`) running locally, configures multi-master synchronization on a `users` table, and demonstrates bidirectional replication.
+
+```go
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/marcgauthier/SQLiteSeal"
+)
+
+// StaticCredentialProvider delivers local process-only PSK secrets & TLS configuration.
+type StaticCredentialProvider struct {
+	PSK []byte
+}
+
+func (p *StaticCredentialProvider) GetReplicationPSK(name string) ([]byte, error) {
+	return p.PSK, nil
+}
+
+func (p *StaticCredentialProvider) GetClientTLSConfig(name string) (*tls.Config, error) {
+	return &tls.Config{InsecureSkipVerify: true}, nil
+}
+
+func (p *StaticCredentialProvider) GetServerTLSConfig(name string) (*tls.Config, error) {
+	return nil, nil
+}
+
+func main() {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "sqliteseal-repl-demo-*")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	nodeIDA := uuid.New()
+	nodeIDB := uuid.New()
+	psk := []byte("0123456789abcdef0123456789abcdef")
+	creds := &StaticCredentialProvider{PSK: psk}
+
+	// 1. Open Node A
+	dbA, err := sqliteseal.OpenWithOptions(filepath.Join(dir, "nodeA.db"), sqliteseal.Options{
+		Key: "MasterKeyNodeA_32BytesLengthPass!",
+		Replication: &sqliteseal.ReplicationRuntimeOptions{
+			Credentials: creds,
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer dbA.Close()
+
+	// 2. Open Node B
+	dbB, err := sqliteseal.OpenWithOptions(filepath.Join(dir, "nodeB.db"), sqliteseal.Options{
+		Key: "MasterKeyNodeB_32BytesLengthPass!",
+		Replication: &sqliteseal.ReplicationRuntimeOptions{
+			Credentials: creds,
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer dbB.Close()
+
+	// Create identical application schema on both nodes
+	schema := `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);`
+	if _, err := dbA.Exec(schema); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := dbB.Exec(schema); err != nil {
+		log.Fatal(err)
+	}
+
+	// 3. Initialize replication on Node A (Listen on 127.0.0.1:9444)
+	err = dbA.InitializeReplication(ctx, sqliteseal.LocalNodeConfig{
+		NodeUUID:          nodeIDA,
+		NodeName:          "node-a",
+		ReplicationDomain: "demo-domain",
+		ListenAddress:     "127.0.0.1:9444",
+		AuthMode:          sqliteseal.ReplicationAuthPSK,
+		CredentialName:    "demo-psk",
+	}, []sqliteseal.ReplicatedTable{{Name: "users"}})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 4. Initialize replication on Node B (Listen on 127.0.0.1:9445)
+	err = dbB.InitializeReplication(ctx, sqliteseal.LocalNodeConfig{
+		NodeUUID:          nodeIDB,
+		NodeName:          "node-b",
+		ReplicationDomain: "demo-domain",
+		ListenAddress:     "127.0.0.1:9445",
+		AuthMode:          sqliteseal.ReplicationAuthPSK,
+		CredentialName:    "demo-psk",
+	}, []sqliteseal.ReplicatedTable{{Name: "users"}})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 5. Register peers across nodes
+	err = dbA.UpsertReplicationPeer(ctx, sqliteseal.ReplicationPeerConfig{
+		PeerNodeUUID:    nodeIDB,
+		PeerName:        "node-b",
+		EndpointAddress: "127.0.0.1:9445",
+		Role:            sqliteseal.ReplicationRoleFullDuplex,
+		CredentialName:  "demo-psk",
+		Enabled:         true,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = dbB.UpsertReplicationPeer(ctx, sqliteseal.ReplicationPeerConfig{
+		PeerNodeUUID:    nodeIDA,
+		PeerName:        "node-a",
+		EndpointAddress: "127.0.0.1:9444",
+		Role:            sqliteseal.ReplicationRoleFullDuplex,
+		CredentialName:  "demo-psk",
+		Enabled:         true,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 6. Write on Node A -> Automatically replicated to Node B
+	if _, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')`); err != nil {
+		log.Fatal(err)
+	}
+
+	// Wait briefly for peer synchronization
+	time.Sleep(300 * time.Millisecond)
+
+	var name string
+	err = dbB.QueryRow(`SELECT name FROM users WHERE id = 1`).Scan(&name)
+	if err != nil {
+		log.Fatal("Replication failed:", err)
+	}
+
+	fmt.Printf("Successfully replicated row to Node B! User name: %s\n", name)
+}
+```
+
 ## API Notes
 
 - `sqliteseal.OpenSQLiteSeal` opens an existing encrypted database when `<db>.encz` is present and creates both files when neither the database nor manifest exists.
