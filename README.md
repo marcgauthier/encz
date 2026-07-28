@@ -86,6 +86,10 @@ go get github.com/marcgauthier/SQLiteSeal
 
 ## Usage
 
+### Single-Node (Standalone Encrypted Database)
+
+If you only need standalone encrypted database functionality without replication, simply open the database with `OpenSQLiteSeal` or `OpenWithOptions` without setting any replication options:
+
 ```go
 package main
 
