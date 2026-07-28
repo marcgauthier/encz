@@ -6,6 +6,16 @@
 
 `SQLiteSeal` is a Go wrapper around `github.com/mattn/go-sqlite3` that adds transparent page-level encryption to SQLite database files and stores envelope-protected key material in a `*.encz` sidecar manifest.
 
+## Documentation
+
+Detailed documentation guides are available in the [`documentation/`](documentation) directory:
+
+- [**Architecture & Design (`documentation/ARCHITECTURE.md`)**](documentation/ARCHITECTURE.md): System topology, custom SQLite `encz` VFS, CGO bridge, 48-byte trailer layout, AAD parameter binding, and LRU decrypted-page cache design.
+- [**Replication API (`documentation/REPLICATION_API.md`)**](documentation/REPLICATION_API.md): Node and peer setup, authenticated membership activation, lifecycle controls, schema restrictions, and the two-node verifier.
+- [**API Reference (`documentation/API_REFERENCE.md`)**](documentation/API_REFERENCE.md): Exhaustive API catalog of exported types (`DB`, `Options`, `Cipher`), methods, backup/restore functions, database conversion tools, and error sentinels.
+- [**Cryptographic Specification (`documentation/CRYPTO_SPEC.md`)**](documentation/CRYPTO_SPEC.md): Technical specification for security auditors covering key hierarchy (Master Key -> KEK -> DEKs), Argon2id KDF parameters, `memguard` memory protection, cipher suites, CSPRNG nonces, and threat model boundaries.
+- [**Operations & Migration Guide (`documentation/OPERATIONS_GUIDE.md`)**](documentation/OPERATIONS_GUIDE.md): Operational guide covering database conversion (`ConvertDB`), live key rotation (`ReKey`), backup and staging restore workflows, performance tuning, cache metrics, and troubleshooting.
+
 ## Benchmark: SQLiteSeal vs. Turso AES-256-GCM
 
 The standalone benchmark runs the same schema, seed data, writes, reads, aggregations, joins, reopen validation, and on-disk plaintext check against SQLiteSeal (AES-256-GCM) and the Turso embedded Go driver (AES-256-GCM). It retains plain SQLite as a baseline.
@@ -19,6 +29,20 @@ Use `-turso` to choose Turso's local database path, `-turso-hex-key` to provide 
 
 ```bash
 go run . -rows 10000 -write-rows 20000 -turso /tmp/turso-aes256gcm.db
+```
+
+## Continuous oracle test
+
+[`app-test`](app-test) is a standalone long-running verification application
+with 20 related tables and an independent in-memory oracle. It continuously
+checks inserts, updates, point and list reads, full-row joins, integrity,
+reopen, encrypted backup/restore, rekey, all supported ciphers, and the public
+SQLiteSeal API. It runs until Ctrl-C by default and preserves each run's log and
+database artifacts for diagnosis.
+
+```bash
+cd app-test
+go run .
 ```
 
 ## Architecture
@@ -161,6 +185,47 @@ err := sqliteseal.RestoreBackup("backup.zip", "MasterKey123", "/path/to/restore/
 - **Integrity Validation**: Decrypts the archive to a temporary location and executes `PRAGMA integrity_check` before copying files to the destination. If verification fails, the restore is aborted.
 - **Overwrite Protection**: The final parameter (`overwriteExistingFile`) acts as a safety guard. If set to `false`, the restore process will fail if a database file or manifest already exists in the target directory, preventing accidental data loss.
 
+## Database Conversion
+
+`ConvertDB` reads a source database and writes a converted copy to a new file.
+The source is never modified.
+
+### Plain SQLite → Encrypted
+
+```go
+err := sqliteseal.ConvertDB("plain.db", "encrypted.db", sqliteseal.ConvertOptions{
+	TargetKey:    "MySecretKey123",
+	TargetCipher: sqliteseal.CipherAES256GCM,
+})
+```
+
+### Switch Cipher (e.g., AES → XChaCha)
+
+```go
+err := sqliteseal.ConvertDB("aes.db", "xchacha.db", sqliteseal.ConvertOptions{
+	SourceKey:    "MySecretKey123",
+	TargetCipher: sqliteseal.CipherXChaCha20Poly1305,
+})
+```
+
+### Switch Cipher and Key
+
+```go
+err := sqliteseal.ConvertDB("old.db", "new.db", sqliteseal.ConvertOptions{
+	SourceKey:    "OldKey123",
+	TargetKey:    "NewKey456",
+	TargetCipher: sqliteseal.CipherChaCha20Poly1305,
+})
+```
+
+### Decrypt to Plain SQLite
+
+```go
+err := sqliteseal.ConvertDB("encrypted.db", "plain.db", sqliteseal.ConvertOptions{
+	SourceKey: "MySecretKey123",
+})
+```
+
 ## Public API Reference
 
 Below is a summary of all public package-level functions and methods available in `sqliteseal`.
@@ -177,6 +242,10 @@ Below is a summary of all public package-level functions and methods available i
   Opens or creates an encrypted database with default configurations and the specified master key.
 - **`OpenWithOptions(path string, opts Options) (*DB, error)`**  
   Opens or creates an encrypted database using a customized `Options` configuration.
+- **`ConvertDB(srcPath, dstPath string, opts ConvertOptions) error`**
+  Reads a database at `srcPath` and writes a converted copy to `dstPath`. Supports
+  plain-to-encrypted, encrypted cipher switch, key change, and decrypt-to-plain.
+  The source is never modified; the output must not already exist.
 - **`TestBackup(file, masterKey, tempFolder string) error`**  
   Decrypts a backup archive and runs a full database integrity check to verify backup correctness.
 - **`RestoreBackup(file, masterKey, toFolder string, overwriteExistingFile bool) error`**  

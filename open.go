@@ -17,6 +17,7 @@ type DB struct {
 	key            *memguard.LockedBuffer
 	registryHandle uint64
 	closed         bool
+	replication    *replicationRuntime
 }
 
 func OpenWithOptions(path string, opts Options) (*DB, error) {
@@ -32,13 +33,20 @@ func OpenWithOptions(path string, opts Options) (*DB, error) {
 		destroyKeyRegistry(registryHandle)
 		return nil, err
 	}
-	return &DB{
+	db := &DB{
 		DB:             sqlDB,
 		path:           path,
 		manifestPath:   manifestPath,
 		key:            memguard.NewBufferFromBytes([]byte(opts.Key)),
 		registryHandle: registryHandle,
-	}, nil
+	}
+	if err := db.openReplication(opts.Replication); err != nil {
+		_ = sqlDB.Close()
+		destroyKeyRegistry(registryHandle)
+		db.key.Destroy()
+		return nil, err
+	}
+	return db, nil
 }
 
 // OpenSQLiteSeal opens or creates an encrypted SQLiteSeal database using the
@@ -109,9 +117,14 @@ func (db *DB) Close() error {
 		db.key = nil
 	}
 	sqlDB := db.DB
+	repl := db.replication
+	db.replication = nil
 	registryHandle := db.registryHandle
 	db.registryHandle = 0
 	db.mu.Unlock()
+	if repl != nil {
+		repl.close()
+	}
 	err := sqlDB.Close()
 	if registryHandle != 0 {
 		destroyKeyRegistry(registryHandle)

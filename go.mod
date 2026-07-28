@@ -9,4 +9,7 @@ require (
 	golang.org/x/sys v0.45.0
 )
 
-require github.com/awnumar/memcall v0.4.0 // indirect
+require (
+	github.com/awnumar/memcall v0.4.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
+)

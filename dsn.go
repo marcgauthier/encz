@@ -16,6 +16,7 @@ type Options struct {
 	RotationPolicy             *RotationPolicy
 	DecryptedPageCacheBytes    int64
 	EnableReadPerformanceStats bool
+	Replication                *ReplicationRuntimeOptions
 }
 
 // BuildDSN builds a non-secret SQLite DSN. Encryption keys are intentionally

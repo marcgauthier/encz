@@ -33,7 +33,10 @@ func Register() error {
 				if err := registerEncz(); err != nil {
 					return err
 				}
-				_, err := conn.Exec("PRAGMA temp_store=MEMORY", nil)
+				if err := registerReplicationConnection(conn); err != nil {
+					return err
+				}
+				_, err := conn.Exec("PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY", nil)
 				return err
 			},
 		}
