@@ -14,7 +14,9 @@ data.
 Replication secrets are process-local. Implement
 `ReplicationCredentialProvider` to return a relationship PSK and hardened
 client/server `*tls.Config` values, and implement `MembershipVerifier` to
-authenticate the operator-provided membership manifest. SQLiteSeal stores only
+authenticate the operator-provided membership manifest. For mTLS, also provide
+`ReplicationCertificateAuthorizer`; it must bind the verified leaf certificate
+to the claimed credential reference, node UUID, and replication domain. SQLiteSeal stores only
 credential reference names.
 
 Pass both providers when opening the database:
@@ -24,7 +26,8 @@ db, err := sqliteseal.OpenWithOptions(path, sqliteseal.Options{
     Key: masterKey,
     Replication: &sqliteseal.ReplicationRuntimeOptions{
         Credentials:        credentials,
-        MembershipVerifier: membershipVerifier,
+        MembershipVerifier:    membershipVerifier,
+        CertificateAuthorizer: certificateAuthorizer, // required for mTLS
     },
 })
 ```
@@ -71,8 +74,7 @@ canonical manifest and signature.
   authenticate with newly supplied operator credentials.
 
 Frames are canonical JSON objects encoded as independent gzip members with a
-four-byte big-endian compressed-length prefix. Production sessions require TLS
-and either relationship-PSK proof or mTLS. Received events must come directly
+four-byte big-endian compressed-length prefix. Production sessions require TLS. PSK sessions use mutual role-separated proofs over both fresh nonces, a server-issued session UUID, timestamps, membership and schema guards, and TLS exporter material. Authentication transcripts are freshness-checked and replay-cached. mTLS sessions additionally require explicit certificate-to-node authorization. Received events must come directly
 from their authenticated origin. Duplicate delivery is idempotent, and
 per-field winners compare HLC physical time, logical time, then origin UUID.
 

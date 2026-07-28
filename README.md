@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="SQLiteSeal logo" width="560">
+  <img src="logo.png" alt="SQLiteSeal logo" width="750">
 </p>
 
 # SQLiteSeal
