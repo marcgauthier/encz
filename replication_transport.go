@@ -36,6 +36,8 @@ type wireHello struct {
 	MembershipEpoch int64  `json:"membership_epoch"`
 	MembershipHash  string `json:"membership_hash"`
 	Nonce           string `json:"nonce"`
+	SessionUUID     string `json:"session_uuid,omitempty"`
+	SentAtUTC       string `json:"sent_at_utc"`
 	Proof           string `json:"proof,omitempty"`
 }
 type wireValue struct {

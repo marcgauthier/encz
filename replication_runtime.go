@@ -23,6 +23,7 @@ type replicationRuntime struct {
 	listeners   []net.Listener
 	connections map[string]net.Conn
 	dialers     map[string]bool
+	authReplay  map[string]time.Time
 	kick        chan struct{}
 	writer      sync.Mutex
 	wg          sync.WaitGroup
@@ -30,7 +31,7 @@ type replicationRuntime struct {
 
 func (db *DB) openReplication(opts *ReplicationRuntimeOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &replicationRuntime{db: db, opts: opts, ctx: ctx, cancel: cancel, connections: make(map[string]net.Conn), dialers: make(map[string]bool), kick: make(chan struct{}, 1)}
+	r := &replicationRuntime{db: db, opts: opts, ctx: ctx, cancel: cancel, connections: make(map[string]net.Conn), dialers: make(map[string]bool), authReplay: make(map[string]time.Time), kick: make(chan struct{}, 1)}
 	db.replication = r
 	var n int
 	err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='replication_local_state'`).Scan(&n)
@@ -47,6 +48,9 @@ func (db *DB) openReplication(opts *ReplicationRuntimeOptions) error {
 			}
 			return err
 		}
+		if err := r.registerIdentityGuardWriter(); err != nil {
+			return err
+		}
 		if err := r.validateInstalledReplicationSchema(ctx); err != nil {
 			r.fenceStartup(err)
 			return nil
@@ -60,6 +64,7 @@ func (db *DB) openReplication(opts *ReplicationRuntimeOptions) error {
 	return nil
 }
 func (r *replicationRuntime) close() {
+	r.unregisterIdentityGuardWriter()
 	r.cancel()
 	r.mu.Lock()
 	for _, l := range r.listeners {
@@ -143,6 +148,9 @@ func (db *DB) InitializeReplication(ctx context.Context, cfg LocalNodeConfig, ta
 		return err
 	}
 	if err := db.replication.updateIdentityGuard(); err != nil {
+		return err
+	}
+	if err := db.replication.registerIdentityGuardWriter(); err != nil {
 		return err
 	}
 	db.replication.start()

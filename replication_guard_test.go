@@ -48,3 +48,32 @@ func TestReplicationIdentityGuardFencesRollback(t *testing.T) {
 		t.Fatalf("rollback was not fenced: %+v", s)
 	}
 }
+
+func TestReplicationIdentityGuardAdvancesWithLocalTransaction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "guard-commit.db")
+	db, err := OpenSQLiteSeal(path, "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec(`CREATE TABLE items(id TEXT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.InitializeReplication(t.Context(), LocalNodeConfig{NodeName: "commit", ReplicationDomain: "test"}, []ReplicatedTable{{Name: "items"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO items VALUES('one')`); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(db.replication.guardPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var guard replicationIdentityGuard
+	if err = json.Unmarshal(raw, &guard); err != nil {
+		t.Fatal(err)
+	}
+	if guard.Counter != 1 {
+		t.Fatalf("guard counter=%d", guard.Counter)
+	}
+}

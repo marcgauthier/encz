@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 type replicationIdentityGuard struct {
@@ -101,4 +102,71 @@ func (r *replicationRuntime) updateIdentityGuard() error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+type replicationGuardWriter struct {
+	runtime     *replicationRuntime
+	node        string
+	incarnation string
+	generation  int64
+	counter     int64
+	mu          sync.Mutex
+}
+
+var replicationGuardWriters sync.Map
+
+func (r *replicationRuntime) registerIdentityGuardWriter() error {
+	writer := &replicationGuardWriter{runtime: r}
+	if err := r.db.QueryRow(`SELECT local_node_uuid,local_incarnation_uuid,database_generation,last_origin_counter FROM replication_local_state`).Scan(&writer.node, &writer.incarnation, &writer.generation, &writer.counter); err != nil {
+		return err
+	}
+	replicationGuardWriters.Store(writer.node, writer)
+	return nil
+}
+
+func (r *replicationRuntime) unregisterIdentityGuardWriter() {
+	var node string
+	if err := r.db.QueryRow(`SELECT local_node_uuid FROM replication_local_state`).Scan(&node); err != nil {
+		return
+	}
+	if value, ok := replicationGuardWriters.Load(node); ok && value.(*replicationGuardWriter).runtime == r {
+		replicationGuardWriters.Delete(node)
+	}
+}
+
+func replicationAdvanceIdentityGuard(node string, counter int64) (int, error) {
+	value, ok := replicationGuardWriters.Load(node)
+	if !ok {
+		return 0, errors.New("replication identity guard writer is unavailable")
+	}
+	writer := value.(*replicationGuardWriter)
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if counter <= writer.counter {
+		return 1, nil
+	}
+	guard := replicationIdentityGuard{NodeUUID: writer.node, IncarnationUUID: writer.incarnation, DatabaseGeneration: writer.generation, Counter: counter}
+	key, err := writer.runtime.guardKey()
+	if err != nil {
+		return 0, err
+	}
+	guard.MAC = guardMAC(key, guard)
+	wipeBytes(key)
+	raw, err := json.Marshal(guard)
+	if err != nil {
+		return 0, err
+	}
+	path := writer.runtime.guardPath()
+	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return 0, err
+	}
+	temporary := path + ".tmp"
+	if err = os.WriteFile(temporary, raw, 0600); err != nil {
+		return 0, err
+	}
+	if err = os.Rename(temporary, path); err != nil {
+		return 0, err
+	}
+	writer.counter = counter
+	return 1, nil
 }

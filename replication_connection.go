@@ -34,6 +34,7 @@ func registerReplicationConnection(conn *sqlite3.SQLiteConn) error {
 		{"sqliteseal_canonical_object", canonicalRowKeySQL, true},
 		{"sqliteseal_event_hash", replicationEventHashSQL, true},
 		{"sqliteseal_is_nfc", replicationIsNFC, true},
+		{"sqliteseal_identity_guard", replicationAdvanceIdentityGuard, false},
 		{"sqliteseal_sha256", func(v ...any) string {
 			h := sha256.New()
 			for _, x := range v {

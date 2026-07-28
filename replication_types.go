@@ -3,6 +3,7 @@ package sqliteseal
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"time"
 )
@@ -41,12 +42,16 @@ type ReplicationCredentialProvider interface {
 type MembershipVerifier interface {
 	VerifyMembership(context.Context, []byte, []byte) error
 }
+type ReplicationCertificateAuthorizer interface {
+	AuthorizeReplicationCertificate(context.Context, string, string, string, *x509.Certificate) error
+}
 type ReplicationRuntimeOptions struct {
-	Credentials        ReplicationCredentialProvider
-	MembershipVerifier MembershipVerifier
-	IdentityGuardPath  string
-	ReadYourWriteKey   []byte
-	Logf               func(string, ...any)
+	Credentials           ReplicationCredentialProvider
+	MembershipVerifier    MembershipVerifier
+	CertificateAuthorizer ReplicationCertificateAuthorizer
+	IdentityGuardPath     string
+	ReadYourWriteKey      []byte
+	Logf                  func(string, ...any)
 }
 type LocalNodeConfig struct {
 	NodeUUID, NodeName, ReplicationDomain, ListenAddress, CredentialName  string
