@@ -2,9 +2,11 @@ package sqliteseal
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func setupEventValidationNodes(t *testing.T) (context.Context, *DB, *DB, string) {
@@ -82,5 +84,47 @@ func TestReplicationExplicitNullAndNFCValidation(t *testing.T) {
 	}
 	if _, err = source.Exec(`UPDATE items SET name=? WHERE id='one'`, "e\u0301"); err == nil {
 		t.Fatal("non-NFC replicated text accepted")
+	}
+}
+
+func TestReplicationQuarantinesAndReplaysFutureEvent(t *testing.T) {
+	ctx, source, target, sourceID := setupEventValidationNodes(t)
+	if _, err := target.Exec(`UPDATE replication_local_state SET maximum_future_skew_us=10000`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Exec(`INSERT INTO items VALUES('future','later','note')`); err != nil {
+		t.Fatal(err)
+	}
+	events, err := source.replication.loadOriginEvents(ctx, 0, 10)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events=%d err=%v", len(events), err)
+	}
+	event := events[0]
+	event.HLCPhysicalUS = time.Now().Add(60 * time.Millisecond).UnixMicro()
+	event.PayloadHash, _, err = replicationEventHash(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = target.replication.applyRemoteEvent(ctx, sourceID, event)
+	if !errors.Is(err, ErrReplicationEventQuarantined) {
+		t.Fatalf("expected quarantine, got %v", err)
+	}
+	var state string
+	if err = target.QueryRow(`SELECT apply_state FROM replication_changes WHERE change_uuid=?`, event.ChangeUUID).Scan(&state); err != nil || state != "quarantined" {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	var contiguous, highest int64
+	if err = target.QueryRow(`SELECT contiguous_counter,highest_seen_counter FROM replication_origin_cursors WHERE origin_node_uuid=?`, sourceID).Scan(&contiguous, &highest); err != nil || contiguous != 0 || highest != 1 {
+		t.Fatalf("cursor=%d/%d err=%v", contiguous, highest, err)
+	}
+	time.Sleep(90 * time.Millisecond)
+	if err = target.replication.applyRemoteEvent(ctx, sourceID, event); err != nil {
+		t.Fatal(err)
+	}
+	if err = target.QueryRow(`SELECT apply_state FROM replication_changes WHERE change_uuid=?`, event.ChangeUUID).Scan(&state); err != nil || state != "applied" {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	if err = target.QueryRow(`SELECT contiguous_counter FROM replication_origin_cursors WHERE origin_node_uuid=?`, sourceID).Scan(&contiguous); err != nil || contiguous != 1 {
+		t.Fatalf("contiguous=%d err=%v", contiguous, err)
 	}
 }

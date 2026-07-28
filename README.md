@@ -4,7 +4,7 @@
 
 # SQLiteSeal
 
-`SQLiteSeal` is a Go wrapper around `github.com/mattn/go-sqlite3` that adds transparent page-level encryption to SQLite database files and stores envelope-protected key material in a `*.encz` sidecar manifest.
+`SQLiteSeal` is a Go driver for encrypted, zero-trust SQLite databases featuring built-in **masterless active-active replication**. Built on top of `github.com/mattn/go-sqlite3`, it adds transparent page-level encryption to SQLite database files, stores envelope-protected key material in a `*.encz` sidecar manifest, and enables decentralized, peer-to-peer multi-master synchronization across nodes without requiring a centralized primary or consensus server.
 
 ## Documentation
 

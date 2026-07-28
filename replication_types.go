@@ -17,6 +17,7 @@ var (
 	ErrReplicationIdentityRollback   = errors.New("sqliteseal: replication identity guard is ahead of the database")
 	ErrReplicationPeerNotFound       = errors.New("sqliteseal: replication peer not found")
 	ErrReplicationNotReady           = errors.New("sqliteseal: replication is not ready")
+	ErrReplicationEventQuarantined   = errors.New("sqliteseal: replication event is quarantined")
 )
 
 type ReplicationAuthMode string

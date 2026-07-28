@@ -7,9 +7,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.48
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sys v0.45.0
+	golang.org/x/text v0.38.0
 )
 
-require (
-	github.com/awnumar/memcall v0.4.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
-)
+require github.com/awnumar/memcall v0.4.0 // indirect

@@ -580,11 +580,13 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 		_ = r.recordRejectedEvent(ctx, peer, e, "invalid_event", "")
 		return err
 	}
-	if e.HLCPhysicalUS > time.Now().UTC().Add(5*time.Minute).UnixMicro() {
-		return errors.New("replication: future event quarantined")
+	skew, err := r.maximumFutureSkew(ctx)
+	if err != nil {
+		return err
 	}
-	var existing string
-	err = r.db.QueryRowContext(ctx, `SELECT payload_hash FROM replication_changes WHERE origin_node_uuid=? AND origin_counter=?`, e.OriginNodeUUID, e.OriginCounter).Scan(&existing)
+	future := e.HLCPhysicalUS > time.Now().UTC().Add(skew).UnixMicro()
+	var existing, existingState string
+	err = r.db.QueryRowContext(ctx, `SELECT payload_hash,apply_state FROM replication_changes WHERE origin_node_uuid=? AND origin_counter=?`, e.OriginNodeUUID, e.OriginCounter).Scan(&existing, &existingState)
 	if err == nil {
 		if existing != e.PayloadHash {
 			if recordErr := r.recordRejectedEvent(ctx, peer, e, "conflicting_duplicate", existing); recordErr != nil {
@@ -592,18 +594,30 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 			}
 			return errors.New("replication: conflicting duplicate event")
 		}
-		tx, beginErr := r.db.BeginTx(ctx, nil)
-		if beginErr != nil {
-			return beginErr
+		if existingState == "pending" || existingState == "quarantined" {
+			if existingState == "quarantined" && future {
+				return fmt.Errorf("%w: future_clock", ErrReplicationEventQuarantined)
+			}
+			if err = r.removeDeferredEvent(ctx, d, e.ChangeUUID); err != nil {
+				return err
+			}
+		} else {
+			tx, beginErr := r.db.BeginTx(ctx, nil)
+			if beginErr != nil {
+				return beginErr
+			}
+			defer tx.Rollback()
+			now := time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
+			if advanceErr := advanceRemoteCursor(ctx, tx, local, e.OriginNodeUUID, e.OriginCounter, now); advanceErr != nil {
+				return advanceErr
+			}
+			return tx.Commit()
 		}
-		defer tx.Rollback()
-		now := time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
-		if advanceErr := advanceRemoteCursor(ctx, tx, local, e.OriginNodeUUID, e.OriginCounter, now); advanceErr != nil {
-			return advanceErr
-		}
-		return tx.Commit()
 	} else if err != sql.ErrNoRows {
 		return err
+	}
+	if future {
+		return r.quarantineRemoteEvent(ctx, peer, local, d, e, "future_clock")
 	}
 	conn, err := r.db.Conn(ctx)
 	if err != nil {
@@ -736,7 +750,7 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 	if _, err = tx.ExecContext(ctx, `UPDATE replication_changes SET apply_state=? WHERE change_uuid=?`, state, e.ChangeUUID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE replication_local_state SET last_hlc_physical_utc_us=max(last_hlc_physical_utc_us,?),last_hlc_logical=CASE WHEN last_hlc_physical_utc_us=? THEN max(last_hlc_logical,?)+1 ELSE last_hlc_logical END,updated_at_utc=?`, e.HLCPhysicalUS, e.HLCPhysicalUS, e.HLCLogical, now); err != nil {
+	if err = mergeRemoteHLC(ctx, tx, e.HLCPhysicalUS, e.HLCLogical, time.Now().UTC().UnixMicro(), now); err != nil {
 		return err
 	}
 	if err = advanceRemoteCursor(ctx, tx, local, e.OriginNodeUUID, e.OriginCounter, now); err != nil {

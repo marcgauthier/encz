@@ -38,8 +38,22 @@ func (db *DB) openReplication(opts *ReplicationRuntimeOptions) error {
 		return err
 	}
 	if n > 0 {
-		if err := r.validateIdentityGuard(); err != nil && !errors.Is(err, ErrReplicationIdentityRollback) {
+		if err := r.ensureReplicationMetadataCompatibility(ctx); err != nil {
 			return err
+		}
+		if err := r.validateIdentityGuard(); err != nil {
+			if errors.Is(err, ErrReplicationIdentityRollback) {
+				return nil
+			}
+			return err
+		}
+		if err := r.validateInstalledReplicationSchema(ctx); err != nil {
+			r.fenceStartup(err)
+			return nil
+		}
+		if err := r.recoverDeferredEvents(ctx); err != nil {
+			r.fenceStartup(err)
+			return nil
 		}
 		r.start()
 	}
@@ -74,6 +88,9 @@ func (db *DB) InitializeReplication(ctx context.Context, cfg LocalNodeConfig, ta
 	if cfg.AuthMode == "" {
 		cfg.AuthMode = ReplicationAuthPSK
 	}
+	if cfg.MaximumFutureSkew <= 0 {
+		cfg.MaximumFutureSkew = 5 * time.Minute
+	}
 	inc := replicationUUID()
 	now := time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
 	tx, err := db.BeginTx(ctx, nil)
@@ -107,7 +124,7 @@ func (db *DB) InitializeReplication(ctx context.Context, cfg LocalNodeConfig, ta
 		return err
 	}
 	zero := strings.Repeat("0", 64)
-	if _, err = tx.ExecContext(ctx, `INSERT INTO replication_local_state VALUES(1,?,?,?,0,0,0,1,?,1,0,?,?,NULL,?,?)`, cfg.NodeUUID, inc, cfg.ReplicationDomain, zero, cfg.SchemaVersion, hash, now, now); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO replication_local_state(state_id,local_node_uuid,local_incarnation_uuid,replication_domain,last_origin_counter,last_hlc_physical_utc_us,last_hlc_logical,membership_epoch,membership_manifest_hash,database_generation,network_enabled,schema_version,schema_hash,blocked_reason,maximum_future_skew_us,created_at_utc,updated_at_utc) VALUES(1,?,?,?,0,0,0,1,?,1,0,?,?,NULL,?,?,?)`, cfg.NodeUUID, inc, cfg.ReplicationDomain, zero, cfg.SchemaVersion, hash, cfg.MaximumFutureSkew.Microseconds(), now, now); err != nil {
 		return err
 	}
 	for _, d := range ds {
