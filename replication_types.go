@@ -57,13 +57,24 @@ type ReplicationRuntimeOptions struct {
 type LocalNodeConfig struct {
 	NodeUUID, NodeName, ReplicationDomain, ListenAddress, CredentialName  string
 	AuthMode                                                              ReplicationAuthMode
+	Level                                                                 int
 	SchemaVersion                                                         int64
 	MaximumFutureSkew, MaximumOffline, EventRetention, TombstoneRetention time.Duration
 }
+type ReplicationConstraintPolicy string
+
+const (
+	// ReplicationConstraintsReject preserves the protocol-v1 fail-closed behaviour.
+	ReplicationConstraintsReject ReplicationConstraintPolicy = ""
+	// ReplicationConstraintsManaged enables FK deferral and deterministic unique-value LWW.
+	ReplicationConstraintsManaged ReplicationConstraintPolicy = "managed"
+)
+
 type ReplicatedTable struct {
 	Name                       string
 	PrimaryKeyColumns, Columns []string
 	AllowExplicitRecreation    bool
+	ConstraintPolicy           ReplicationConstraintPolicy
 }
 type PeerConfig struct {
 	NodeUUID, IncarnationUUID, NodeName, Address, CredentialName, NextCredentialName, TLSServerName, TLSConfigName string
@@ -76,6 +87,7 @@ type PeerConfig struct {
 type MembershipNode struct {
 	NodeUUID        string                               `json:"node_uuid"`
 	IncarnationUUID string                               `json:"incarnation_uuid"`
+	Level           int                                  `json:"level"`
 	State           string                               `json:"state"`
 	ListenEnabled   bool                                 `json:"listen_enabled"`
 	RoleByPeer      map[string]ReplicationConnectionRole `json:"role_by_peer"`
@@ -89,6 +101,7 @@ type MembershipManifest struct {
 }
 type ReplicationPeerStatus struct {
 	NodeUUID, State, LastError                      string
+	Level                                           int
 	ConnectedAt                                     time.Time
 	ContiguousCounter, HighestSeenCounter, GapCount int64
 }
@@ -96,9 +109,24 @@ type ReplicationStatus struct {
 	Initialized, Ready, NetworkEnabled                                                   bool
 	NodeUUID, IncarnationUUID, Domain, SchemaHash, MembershipHash, BlockedReason         string
 	ListenAddress                                                                        string
+	Level                                                                                int
 	SchemaVersion, MembershipEpoch, LastOriginCounter, LastHLCPhysicalUS, LastHLCLogical int64
 	Peers                                                                                []ReplicationPeerStatus
+	SchemaConflicts                                                                      []ReplicationSchemaConflict
 }
+
+type ReplicationSchemaConflict struct {
+	TableName, ColumnName string
+	DeclaredTypes         []string
+	OriginNodeUUIDs       []string
+	AuthorityLevel        int
+}
+type ReplicationConflict struct {
+	ChangeUUID, OriginNodeUUID, TableName, RowKeyJSON string
+	OriginCounter                                     int64
+	State, Reason                                     string
+}
+
 type ReplicationMigration struct {
 	FromVersion, ToVersion int64
 	Statements             []string

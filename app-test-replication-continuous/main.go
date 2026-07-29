@@ -59,6 +59,7 @@ func (v verifier) VerifyMembership(_ context.Context, b, s []byte) error {
 
 type node struct {
 	name, id, key, path string
+	level               int
 	db                  *sqliteseal.DB
 	creds               *credentials
 	verify              verifier
@@ -103,8 +104,8 @@ func run(duration, interval time.Duration, batchSize int) error {
 		return err
 	}
 
-	a := node{name: "node-a", id: nodeAID, key: "node-a-encryption-key", path: filepath.Join(runDir, "node-a.db"), creds: &credentials{pki.a, pki.roots, psk}, verify: verifier{signPub}}
-	b := node{name: "node-b", id: nodeBID, key: "node-b-encryption-key", path: filepath.Join(runDir, "node-b.db"), creds: &credentials{pki.b, pki.roots, psk}, verify: verifier{signPub}}
+	a := node{level: 0, name: "node-a", id: nodeAID, key: "node-a-encryption-key", path: filepath.Join(runDir, "node-a.db"), creds: &credentials{pki.a, pki.roots, psk}, verify: verifier{signPub}}
+	b := node{level: 1, name: "node-b", id: nodeBID, key: "node-b-encryption-key", path: filepath.Join(runDir, "node-b.db"), creds: &credentials{pki.b, pki.roots, psk}, verify: verifier{signPub}}
 
 	if err = openNode(ctx, &a, ""); err != nil {
 		return fmt.Errorf("open A: %w", err)
@@ -136,8 +137,8 @@ func run(duration, interval time.Duration, batchSize int) error {
 		Domain:     domain,
 		PolicyHash: "continuous-test-policy-v1",
 		Nodes: []sqliteseal.MembershipNode{
-			{NodeUUID: a.id, IncarnationUUID: mustStatus(ctx, a.db).IncarnationUUID, State: "active", ListenEnabled: false, RoleByPeer: map[string]sqliteseal.ReplicationConnectionRole{b.id: sqliteseal.ReplicationDial}},
-			{NodeUUID: b.id, IncarnationUUID: mustStatus(ctx, b.db).IncarnationUUID, State: "active", ListenEnabled: true, RoleByPeer: map[string]sqliteseal.ReplicationConnectionRole{a.id: sqliteseal.ReplicationAccept}},
+			{NodeUUID: a.id, Level: a.level, IncarnationUUID: mustStatus(ctx, a.db).IncarnationUUID, State: "active", ListenEnabled: false, RoleByPeer: map[string]sqliteseal.ReplicationConnectionRole{b.id: sqliteseal.ReplicationDial}},
+			{NodeUUID: b.id, Level: b.level, IncarnationUUID: mustStatus(ctx, b.db).IncarnationUUID, State: "active", ListenEnabled: true, RoleByPeer: map[string]sqliteseal.ReplicationConnectionRole{a.id: sqliteseal.ReplicationAccept}},
 		},
 	}
 	manifest.Signature = signManifest(manifest, signPriv)
@@ -315,7 +316,7 @@ func openNode(ctx context.Context, n *node, listen string) error {
 	if _, err = db.ExecContext(ctx, `CREATE TABLE items(id TEXT PRIMARY KEY, node_id TEXT, payload TEXT, updated_at TEXT)`); err != nil {
 		return err
 	}
-	return db.InitializeReplication(ctx, sqliteseal.LocalNodeConfig{NodeUUID: n.id, NodeName: n.name, ReplicationDomain: domain, ListenAddress: listen, AuthMode: sqliteseal.ReplicationAuthPSK, CredentialName: credential}, []sqliteseal.ReplicatedTable{{Name: "items"}})
+	return db.InitializeReplication(ctx, sqliteseal.LocalNodeConfig{NodeUUID: n.id, NodeName: n.name, ReplicationDomain: domain, ListenAddress: listen, Level: n.level, AuthMode: sqliteseal.ReplicationAuthPSK, CredentialName: credential}, []sqliteseal.ReplicatedTable{{Name: "items"}})
 }
 
 func peer(n node, addr string, role sqliteseal.ReplicationConnectionRole, listens bool) sqliteseal.PeerConfig {

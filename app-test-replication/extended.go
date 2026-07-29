@@ -27,7 +27,7 @@ func verifyControlPlane(ctx context.Context, a, b node) error {
 	if err = a.db.TestReplicationPeer(ctx, b.id); err != nil {
 		return fmt.Errorf("administrative peer authentication: %w", err)
 	}
-	if err = a.db.InitializeReplication(ctx, sqliteseal.LocalNodeConfig{NodeUUID: a.id, NodeName: a.name, ReplicationDomain: domain}, []sqliteseal.ReplicatedTable{{Name: "items"}}); !errors.Is(err, sqliteseal.ErrReplicationAlreadyInitialized) {
+	if err = a.db.InitializeReplication(ctx, sqliteseal.LocalNodeConfig{NodeUUID: a.id, Level: a.level, NodeName: a.name, ReplicationDomain: domain}, []sqliteseal.ReplicatedTable{{Name: "items"}}); !errors.Is(err, sqliteseal.ErrReplicationAlreadyInitialized) {
 		return fmt.Errorf("repeat initialization error = %v", err)
 	}
 	if err = a.db.SyncReplicationPeer(ctx, "ffffffff-ffff-4fff-8fff-ffffffffffff"); !errors.Is(err, sqliteseal.ErrReplicationPeerNotFound) {
@@ -84,8 +84,8 @@ func runAutomaticSnapshotBootstrap(ctx context.Context, runDir string, pki gener
 	if err != nil {
 		return err
 	}
-	source := node{name: "snapshot-source", id: snapshotSourceID, key: "snapshot-source-encryption-key", path: runDir + "/snapshot-source.db", creds: &credentials{pki.a, pki.roots, psk}, verify: verifier{signPub}}
-	target := node{name: "snapshot-target", id: snapshotTargetID, key: "snapshot-target-encryption-key", path: runDir + "/snapshot-target.db", creds: &credentials{pki.b, pki.roots, psk}, verify: verifier{signPub}}
+	source := node{level: 0, name: "snapshot-source", id: snapshotSourceID, key: "snapshot-source-encryption-key", path: runDir + "/snapshot-source.db", creds: &credentials{pki.a, pki.roots, psk}, verify: verifier{signPub}}
+	target := node{level: 1, name: "snapshot-target", id: snapshotTargetID, key: "snapshot-target-encryption-key", path: runDir + "/snapshot-target.db", creds: &credentials{pki.b, pki.roots, psk}, verify: verifier{signPub}}
 	if err = openNode(ctx, &source, address); err != nil {
 		return fmt.Errorf("open snapshot source: %w", err)
 	}
@@ -112,8 +112,8 @@ func runAutomaticSnapshotBootstrap(ctx context.Context, runDir string, pki gener
 	sourceStatus := mustStatus(ctx, source.db)
 	targetStatus := mustStatus(ctx, target.db)
 	manifest := sqliteseal.MembershipManifest{Epoch: 2, Domain: domain, PolicyHash: "snapshot-bootstrap-policy-v1", Nodes: []sqliteseal.MembershipNode{
-		{NodeUUID: source.id, IncarnationUUID: sourceStatus.IncarnationUUID, State: "active", ListenEnabled: true, RoleByPeer: map[string]sqliteseal.ReplicationConnectionRole{target.id: sqliteseal.ReplicationAccept}},
-		{NodeUUID: target.id, IncarnationUUID: targetStatus.IncarnationUUID, State: "active", ListenEnabled: false, RoleByPeer: map[string]sqliteseal.ReplicationConnectionRole{source.id: sqliteseal.ReplicationDial}},
+		{NodeUUID: source.id, Level: source.level, IncarnationUUID: sourceStatus.IncarnationUUID, State: "active", ListenEnabled: true, RoleByPeer: map[string]sqliteseal.ReplicationConnectionRole{target.id: sqliteseal.ReplicationAccept}},
+		{NodeUUID: target.id, Level: target.level, IncarnationUUID: targetStatus.IncarnationUUID, State: "active", ListenEnabled: false, RoleByPeer: map[string]sqliteseal.ReplicationConnectionRole{source.id: sqliteseal.ReplicationDial}},
 	}}
 	manifest.Signature = signManifest(manifest, signPriv)
 	if err = source.db.ApplyMembershipManifest(ctx, manifest); err != nil {

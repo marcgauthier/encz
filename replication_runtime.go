@@ -43,6 +43,9 @@ func (db *DB) openReplication(opts *ReplicationRuntimeOptions) error {
 		if err := r.ensureReplicationMetadataCompatibility(ctx); err != nil {
 			return err
 		}
+		if err := r.seedSchemaDeclarations(ctx); err != nil {
+			return err
+		}
 		if err := r.validateIdentityGuard(); err != nil {
 			if errors.Is(err, ErrReplicationIdentityRollback) {
 				return nil
@@ -82,7 +85,7 @@ func (db *DB) InitializeReplication(ctx context.Context, cfg LocalNodeConfig, ta
 	if db == nil {
 		return ErrDBClosed
 	}
-	if cfg.NodeName == "" || cfg.ReplicationDomain == "" || len(tables) == 0 {
+	if cfg.NodeName == "" || cfg.ReplicationDomain == "" || cfg.Level < 0 {
 		return ErrReplicationInvalidConfig
 	}
 	if cfg.NodeUUID == "" {
@@ -116,6 +119,16 @@ func (db *DB) InitializeReplication(ctx context.Context, cfg LocalNodeConfig, ta
 	}
 	ds := make([]replicationTableDescriptor, 0, len(tables))
 	for _, table := range tables {
+		var tableExists int
+		if e := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, table.Name).Scan(&tableExists); e != nil {
+			return e
+		}
+		if tableExists == 0 {
+			if table.Name == "" || strings.HasPrefix(table.Name, "replication_") {
+				return ErrReplicationInvalidConfig
+			}
+			continue
+		}
 		d, e := tableDescriptor(ctx, tx, table)
 		if e != nil {
 			return e
@@ -126,11 +139,14 @@ func (db *DB) InitializeReplication(ctx context.Context, cfg LocalNodeConfig, ta
 	if err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO replication_nodes(node_uuid,incarnation_uuid,node_name,replication_domain,is_local,membership_state,membership_epoch,listen_enabled,address,auth_mode,credential_name,enabled,rebootstrap_required,created_at_utc,updated_at_utc) VALUES(?,?,?,?,1,'active',1,?,?,?,?,1,0,?,?)`, cfg.NodeUUID, inc, cfg.NodeName, cfg.ReplicationDomain, boolInt(cfg.ListenAddress != ""), cfg.ListenAddress, string(cfg.AuthMode), cfg.CredentialName, now, now); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO replication_nodes(node_uuid,incarnation_uuid,node_name,replication_domain,node_level,is_local,membership_state,membership_epoch,listen_enabled,address,auth_mode,credential_name,enabled,rebootstrap_required,created_at_utc,updated_at_utc) VALUES(?,?,?,?,?,1,'active',1,?,?,?,?,1,0,?,?)`, cfg.NodeUUID, inc, cfg.NodeName, cfg.ReplicationDomain, cfg.Level, boolInt(cfg.ListenAddress != ""), cfg.ListenAddress, string(cfg.AuthMode), cfg.CredentialName, now, now); err != nil {
 		return err
 	}
 	zero := strings.Repeat("0", 64)
 	if _, err = tx.ExecContext(ctx, `INSERT INTO replication_local_state(state_id,local_node_uuid,local_incarnation_uuid,replication_domain,last_origin_counter,last_hlc_physical_utc_us,last_hlc_logical,membership_epoch,membership_manifest_hash,database_generation,network_enabled,schema_version,schema_hash,blocked_reason,maximum_future_skew_us,created_at_utc,updated_at_utc) VALUES(1,?,?,?,0,0,0,1,?,1,0,?,?,NULL,?,?,?)`, cfg.NodeUUID, inc, cfg.ReplicationDomain, zero, cfg.SchemaVersion, hash, cfg.MaximumFutureSkew.Microseconds(), now, now); err != nil {
+		return err
+	}
+	if err = initializeSchemaDeclarations(ctx, tx, cfg.NodeUUID, 1, tables, ds); err != nil {
 		return err
 	}
 	for _, d := range ds {
@@ -185,7 +201,7 @@ func (db *DB) UpsertReplicationPeer(ctx context.Context, p PeerConfig) error {
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO replication_nodes(node_uuid,incarnation_uuid,node_name,replication_domain,is_local,membership_state,membership_epoch,listen_enabled,address,auth_mode,credential_name,enabled,rebootstrap_required,created_at_utc,updated_at_utc) VALUES(?,?,?, ?,0,'joining',1,?,?,?,?,0,1,?,?) ON CONFLICT(node_uuid) DO UPDATE SET incarnation_uuid=excluded.incarnation_uuid,node_name=excluded.node_name,address=excluded.address,listen_enabled=excluded.listen_enabled,auth_mode=excluded.auth_mode,credential_name=excluded.credential_name,updated_at_utc=excluded.updated_at_utc`, p.NodeUUID, p.IncarnationUUID, p.NodeName, domain, boolInt(p.ListenEnabled), p.Address, string(p.AuthMode), p.CredentialName, now, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO replication_nodes(node_uuid,incarnation_uuid,node_name,replication_domain,node_level,is_local,membership_state,membership_epoch,listen_enabled,address,auth_mode,credential_name,enabled,rebootstrap_required,created_at_utc,updated_at_utc) VALUES(?,?,?, ?,0,0,'joining',1,?,?,?,?,0,1,?,?) ON CONFLICT(node_uuid) DO UPDATE SET incarnation_uuid=excluded.incarnation_uuid,node_name=excluded.node_name,address=excluded.address,listen_enabled=excluded.listen_enabled,auth_mode=excluded.auth_mode,credential_name=excluded.credential_name,updated_at_utc=excluded.updated_at_utc`, p.NodeUUID, p.IncarnationUUID, p.NodeName, domain, boolInt(p.ListenEnabled), p.Address, string(p.AuthMode), p.CredentialName, now, now)
 	if err != nil {
 		return err
 	}
@@ -256,7 +272,7 @@ func (db *DB) ApplyMembershipManifest(ctx context.Context, m MembershipManifest)
 	}
 	defer tx.Rollback()
 	for _, n := range m.Nodes {
-		if _, err = tx.ExecContext(ctx, `UPDATE replication_nodes SET membership_state=?,membership_epoch=?,enabled=CASE WHEN ?='active' THEN 1 ELSE 0 END,rebootstrap_required=CASE WHEN ?='active' THEN rebootstrap_required ELSE 1 END WHERE node_uuid=?`, n.State, m.Epoch, n.State, n.State, n.NodeUUID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE replication_nodes SET node_level=?,membership_state=?,membership_epoch=?,enabled=CASE WHEN ?='active' THEN 1 ELSE 0 END,rebootstrap_required=CASE WHEN ?='active' THEN rebootstrap_required ELSE 1 END WHERE node_uuid=?`, n.Level, n.State, m.Epoch, n.State, n.State, n.NodeUUID); err != nil {
 			return err
 		}
 	}
@@ -286,7 +302,7 @@ func sha256Bytes(b []byte) []byte { h := sha256.New(); h.Write(b); return h.Sum(
 
 func (db *DB) ReplicationStatus(ctx context.Context) (ReplicationStatus, error) {
 	var s ReplicationStatus
-	err := db.QueryRowContext(ctx, `SELECT l.local_node_uuid,l.local_incarnation_uuid,l.replication_domain,l.schema_version,l.schema_hash,l.membership_epoch,l.membership_manifest_hash,l.last_origin_counter,l.last_hlc_physical_utc_us,l.last_hlc_logical,l.network_enabled,coalesce(l.blocked_reason,''),coalesce(n.address,'') FROM replication_local_state l JOIN replication_nodes n ON n.node_uuid=l.local_node_uuid WHERE l.state_id=1`).Scan(&s.NodeUUID, &s.IncarnationUUID, &s.Domain, &s.SchemaVersion, &s.SchemaHash, &s.MembershipEpoch, &s.MembershipHash, &s.LastOriginCounter, &s.LastHLCPhysicalUS, &s.LastHLCLogical, &s.NetworkEnabled, &s.BlockedReason, &s.ListenAddress)
+	err := db.QueryRowContext(ctx, `SELECT l.local_node_uuid,l.local_incarnation_uuid,l.replication_domain,n.node_level,l.schema_version,l.schema_hash,l.membership_epoch,l.membership_manifest_hash,l.last_origin_counter,l.last_hlc_physical_utc_us,l.last_hlc_logical,l.network_enabled,coalesce(l.blocked_reason,''),coalesce(n.address,'') FROM replication_local_state l JOIN replication_nodes n ON n.node_uuid=l.local_node_uuid WHERE l.state_id=1`).Scan(&s.NodeUUID, &s.IncarnationUUID, &s.Domain, &s.Level, &s.SchemaVersion, &s.SchemaHash, &s.MembershipEpoch, &s.MembershipHash, &s.LastOriginCounter, &s.LastHLCPhysicalUS, &s.LastHLCLogical, &s.NetworkEnabled, &s.BlockedReason, &s.ListenAddress)
 	if err == sql.ErrNoRows {
 		return s, ErrReplicationNotInitialized
 	}
@@ -295,19 +311,44 @@ func (db *DB) ReplicationStatus(ctx context.Context) (ReplicationStatus, error) 
 	}
 	s.Initialized = true
 	s.Ready = s.NetworkEnabled && s.BlockedReason == ""
-	rows, err := db.QueryContext(ctx, `SELECT p.peer_node_uuid,p.session_state,coalesce(p.last_error,''),coalesce(c.contiguous_counter,0),coalesce(c.highest_seen_counter,0),(SELECT count(*) FROM replication_origin_gaps g WHERE g.tracking_node_uuid=l.local_node_uuid AND g.origin_node_uuid=p.peer_node_uuid) FROM replication_peer_connections p CROSS JOIN replication_local_state l LEFT JOIN replication_origin_cursors c ON c.tracking_node_uuid=l.local_node_uuid AND c.origin_node_uuid=p.peer_node_uuid`)
+	rows, err := db.QueryContext(ctx, `SELECT p.peer_node_uuid,n.node_level,p.session_state,coalesce(p.last_error,''),coalesce(c.contiguous_counter,0),coalesce(c.highest_seen_counter,0),(SELECT count(*) FROM replication_origin_gaps g WHERE g.tracking_node_uuid=l.local_node_uuid AND g.origin_node_uuid=p.peer_node_uuid) FROM replication_peer_connections p JOIN replication_nodes n ON n.node_uuid=p.peer_node_uuid CROSS JOIN replication_local_state l LEFT JOIN replication_origin_cursors c ON c.tracking_node_uuid=l.local_node_uuid AND c.origin_node_uuid=p.peer_node_uuid`)
 	if err != nil {
 		return s, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var p ReplicationPeerStatus
-		if err = rows.Scan(&p.NodeUUID, &p.State, &p.LastError, &p.ContiguousCounter, &p.HighestSeenCounter, &p.GapCount); err != nil {
+		if err = rows.Scan(&p.NodeUUID, &p.Level, &p.State, &p.LastError, &p.ContiguousCounter, &p.HighestSeenCounter, &p.GapCount); err != nil {
 			return s, err
 		}
 		s.Peers = append(s.Peers, p)
 	}
-	return s, rows.Err()
+	if err = rows.Err(); err != nil {
+		return s, err
+	}
+	if err = rows.Close(); err != nil {
+		return s, err
+	}
+	conflictRows, conflictErr := db.QueryContext(ctx, `SELECT table_name,column_name,authority_level,declared_types_json,origin_nodes_json FROM replication_schema_conflicts ORDER BY table_name,column_name`)
+	if conflictErr != nil {
+		return s, conflictErr
+	}
+	defer conflictRows.Close()
+	for conflictRows.Next() {
+		var conflict ReplicationSchemaConflict
+		var typesRaw, nodesRaw string
+		if conflictErr = conflictRows.Scan(&conflict.TableName, &conflict.ColumnName, &conflict.AuthorityLevel, &typesRaw, &nodesRaw); conflictErr != nil {
+			return s, conflictErr
+		}
+		if conflictErr = json.Unmarshal([]byte(typesRaw), &conflict.DeclaredTypes); conflictErr != nil {
+			return s, conflictErr
+		}
+		if conflictErr = json.Unmarshal([]byte(nodesRaw), &conflict.OriginNodeUUIDs); conflictErr != nil {
+			return s, conflictErr
+		}
+		s.SchemaConflicts = append(s.SchemaConflicts, conflict)
+	}
+	return s, conflictRows.Err()
 }
 
 func (db *DB) ReplicationSyncStats(ctx context.Context) (ReplicationSyncStats, error) {
@@ -398,46 +439,169 @@ func (db *DB) RetireReplicationPeer(ctx context.Context, node string, m Membersh
 	}
 	return db.ApplyMembershipManifest(ctx, m)
 }
+func (db *DB) ReplicationConflicts(ctx context.Context) ([]ReplicationConflict, error) {
+	rows, err := db.QueryContext(ctx, `SELECT change_uuid,origin_node_uuid,origin_counter,table_name,row_key_json,apply_state,coalesce(quarantine_reason,'') FROM replication_changes WHERE apply_state IN('pending','quarantined') AND quarantine_reason IN('foreign_key_dependency','unique_conflict') ORDER BY origin_node_uuid,origin_counter`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var conflicts []ReplicationConflict
+	for rows.Next() {
+		var conflict ReplicationConflict
+		if err = rows.Scan(&conflict.ChangeUUID, &conflict.OriginNodeUUID, &conflict.OriginCounter, &conflict.TableName, &conflict.RowKeyJSON, &conflict.State, &conflict.Reason); err != nil {
+			return nil, err
+		}
+		conflicts = append(conflicts, conflict)
+	}
+	return conflicts, rows.Err()
+}
+
+// RetryReplicationDeferred retries durable FK dependencies after related rows arrive.
+func (db *DB) RetryReplicationDeferred(ctx context.Context) error {
+	if db == nil || db.replication == nil {
+		return ErrReplicationNotInitialized
+	}
+	return db.replication.recoverDeferredEvents(ctx)
+}
+
 func (db *DB) ApplyReplicationMigration(ctx context.Context, m ReplicationMigration) error {
-	if m.ToVersion <= m.FromVersion {
+	if db == nil || db.replication == nil {
+		return ErrReplicationNotInitialized
+	}
+	if m.ToVersion <= m.FromVersion || len(m.Tables) == 0 {
 		return ErrReplicationInvalidConfig
 	}
-	var v int64
-	if err := db.QueryRowContext(ctx, `SELECT schema_version FROM replication_local_state`).Scan(&v); err != nil {
+	var version int64
+	if err := db.QueryRowContext(ctx, `SELECT schema_version FROM replication_local_state`).Scan(&version); err != nil {
 		return err
 	}
-	if v != m.FromVersion {
+	if version != m.FromVersion {
 		return ErrReplicationSchemaMismatch
 	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
+	if err := db.PauseReplication(ctx); err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `UPDATE replication_local_state SET network_enabled=0`); err != nil {
-		return err
-	}
-	for _, q := range m.Statements {
-		if strings.TrimSpace(q) != "" {
-			if _, err = tx.ExecContext(ctx, q); err != nil {
+	db.replication.writer.Lock()
+	defer db.replication.writer.Unlock()
+	return db.replication.withReplicationModeTransaction(ctx, "maintenance", func(tx *sql.Tx) error {
+		var unresolved int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM replication_changes WHERE apply_state NOT IN(?,?)`, "applied", "ignored").Scan(&unresolved); err != nil {
+			return err
+		}
+		if unresolved != 0 {
+			return fmt.Errorf("%w: %d deferred or quarantined events must be resolved before migration", ErrReplicationNotReady, unresolved)
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT descriptor_json FROM replication_table_descriptors ORDER BY table_name`)
+		if err != nil {
+			return err
+		}
+		var previous []replicationTableDescriptor
+		for rows.Next() {
+			var raw string
+			if err = rows.Scan(&raw); err != nil {
+				rows.Close()
+				return err
+			}
+			var d replicationTableDescriptor
+			if err = json.Unmarshal([]byte(raw), &d); err != nil {
+				rows.Close()
+				return err
+			}
+			previous = append(previous, d)
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		if err = materializeHistoricalWireValues(ctx, tx, previous); err != nil {
+			return err
+		}
+		for _, d := range previous {
+			if err = dropCaptureTriggers(ctx, tx, d); err != nil {
 				return err
 			}
 		}
-	}
-	ds := make([]replicationTableDescriptor, 0, len(m.Tables))
-	for _, t := range m.Tables {
-		d, e := tableDescriptor(ctx, tx, t)
-		if e != nil {
-			return e
+		for _, statement := range m.Statements {
+			if strings.TrimSpace(statement) != "" {
+				if _, err = tx.ExecContext(ctx, statement); err != nil {
+					return err
+				}
+			}
 		}
-		ds = append(ds, d)
-	}
-	hash, err := descriptorsHash(ds)
-	if err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE replication_local_state SET schema_version=?,schema_hash=?,updated_at_utc=sqliteseal_utc_now()`, m.ToVersion, hash); err != nil {
-		return err
-	}
-	return tx.Commit()
+		descriptors := make([]replicationTableDescriptor, 0, len(m.Tables))
+		for _, table := range m.Tables {
+			d, descriptorErr := tableDescriptor(ctx, tx, table)
+			if descriptorErr != nil {
+				return descriptorErr
+			}
+			descriptors = append(descriptors, d)
+		}
+		hash, err := descriptorsHash(descriptors)
+		if err != nil {
+			return err
+		}
+		previousByName := make(map[string]replicationTableDescriptor, len(previous))
+		for _, oldDescriptor := range previous {
+			previousByName[oldDescriptor.Table.Name] = oldDescriptor
+		}
+		previousTables := make(map[string]bool, len(previous))
+		for _, oldDescriptor := range previous {
+			previousTables[oldDescriptor.Table.Name] = true
+		}
+		for table := range previousTables {
+			found := false
+			for _, descriptor := range descriptors {
+				if descriptor.Table.Name == table {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: replicated table removal is not automatic", ErrReplicationInvalidConfig)
+			}
+		}
+		if err = publishLocalSchemaDeclarations(ctx, tx, descriptors); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE replication_local_state SET network_enabled=0,schema_version=?,schema_hash=?,blocked_reason=?,updated_at_utc=sqliteseal_utc_now()`, m.ToVersion, hash, "schema migration completed; resume replication explicitly"); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM replication_table_descriptors`); err != nil {
+			return err
+		}
+		now := time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
+		for _, d := range descriptors {
+			if err = installCaptureSchema(ctx, tx, d, hash); err != nil {
+				return err
+			}
+			if !previousTables[d.Table.Name] {
+				if err = captureExistingRows(ctx, tx, d); err != nil {
+					return err
+				}
+			} else {
+				oldSelected := make(map[string]bool)
+				for _, name := range previousByName[d.Table.Name].Table.Columns {
+					oldSelected[name] = true
+				}
+				var added []string
+				for _, name := range d.Table.Columns {
+					if !oldSelected[name] {
+						added = append(added, name)
+					}
+				}
+				if len(added) != 0 {
+					if err = captureExistingColumnValues(ctx, tx, d, added); err != nil {
+						return err
+					}
+				}
+			}
+			raw, marshalErr := json.Marshal(d)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if _, err = tx.ExecContext(ctx, `INSERT INTO replication_table_descriptors VALUES(?,?,?,?,?,?)`, d.Table.Name, d.DescriptorID, string(raw), hash, boolInt(d.Table.AllowExplicitRecreation), now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

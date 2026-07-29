@@ -3,7 +3,6 @@ package sqliteseal
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 )
 
@@ -33,9 +32,7 @@ func (r *replicationRuntime) validateInstalledReplicationSchema(ctx context.Cont
 	if err = rows.Close(); err != nil {
 		return err
 	}
-	if len(installed) == 0 {
-		return errors.New("replication: no installed table descriptors")
-	}
+
 	current := make([]replicationTableDescriptor, 0, len(installed))
 	for _, descriptor := range installed {
 		actual, buildErr := tableDescriptor(ctx, r.db, descriptor.Table)

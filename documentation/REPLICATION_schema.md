@@ -3,9 +3,10 @@
 ## 1. Purpose and scope
 
 This document defines the durable metadata needed to replicate application
-data between independently writable nodes. Every node uses the same
-application schema; this design validates schema compatibility during
-connection setup but does not replicate DDL or schema changes.
+data between independently writable nodes. Nodes converge on a domain-wide additive union of application tables and selected
+columns. Structured declarations are exchanged before data, and missing tables
+or columns are installed locally. Declared-type conflicts use the lowest node
+level recorded in the signed membership manifest.
 
 The fixed tables are:
 
@@ -18,8 +19,8 @@ The fixed tables are:
    restore safety state.
 5. `replication_field_versions` — the winning version of every replicated
    field.
-6. `replication_row_versions` — the deterministic live/deleted state of every
-   replicated row.
+6. `replication_row_versions` — the deterministic live, hard-deleted, or
+   unique-LWW-deleted state of every replicated row.
 7. `replication_origin_cursors` — contiguous synchronization progress for
    every node and event origin.
 8. `replication_origin_gaps` — missing counter ranges detected in an origin's
@@ -29,6 +30,8 @@ The fixed tables are:
     configuration and reconnect state for each remote node.
 11. `replication_rejected_events` — bounded forensic evidence for malformed or
     duplicate-identity events that cannot be inserted into the change log.
+12. `replication_schema_declarations` — latest per-origin table interests and structured definitions.
+13. `replication_schema_conflicts` — durable unresolved equal-level type conflicts.
 
 In addition, every replicated application table has one required generated
 typed `<application_table>__replication_changes` table. SQLiteSeal also
@@ -64,15 +67,13 @@ the generated triggers and replication service.
   Binary values use canonical unpadded Base64url and integers outside the
   interoperable JSON integer range use a canonical decimal string with an
   explicit integer type tag.
-- The application schema itself is not replicated. `schema_version` and
-  `schema_hash` values are compatibility guards; peers with different values
-  must stop data exchange until administrators install the same schema.
+- `schema_version` and `schema_hash` remain immutable event provenance and diagnostics; equality is not an authentication or event-application requirement. Structured declarations determine compatibility.
 - Replication messages are canonical JSON, compressed as one independent gzip
   member per message, and carried in length-prefixed frames over a persistent
   bidirectional TCP connection. gRPC and Protocol Buffers are not used.
 - Foreign-key enforcement must be enabled on every SQLite connection with
   `PRAGMA foreign_keys = ON`.
-- Protocol version 1 creates one row-sized event per trigger firing. An optional
+- Protocol version 2 negotiates schema declarations before synchronization and creates one row-sized event per trigger firing. An optional
   `transaction_uuid` correlates events from one local transaction but does not
   provide atomic multi-row application on receivers.
 
@@ -109,6 +110,7 @@ or atomically with, applying its winning values.
 | `stored_at_utc` | TEXT | Yes | UTC time at which this node durably stored the event. |
 | `source_node_uuid` | TEXT | No | Immediate peer from which this node received the event. It is `NULL` for a locally originated event. |
 | `payload_hash` | TEXT | Yes | Lower-case SHA-256 hex digest of the canonical, uncompressed immutable event payload. |
+| `wire_values_json` | TEXT | No | Original typed canonical row image retained so historical events remain transferable after additive schema changes. |
 | `payload_uncompressed_bytes` | INTEGER | Yes | Exact expanded canonical payload size; it is checked against the configured per-event limit before allocation or decoding. |
 | `origin_signature` | BLOB | No | Optional signature made by the origin over the immutable event envelope when signed-at-rest event verification is enabled. |
 | `apply_state` | TEXT | Yes | Local processing state: `pending`, `applied`, `ignored`, or `quarantined`. This is local metadata and is not part of the signed event payload. |
@@ -190,6 +192,7 @@ not deleted, because change and acknowledgement history refers to them.
 | `incarnation_uuid` | TEXT | Yes | UUID for the currently enrolled installation of the node. It detects cloned or restored installations unexpectedly using the same node identity. |
 | `node_name` | TEXT | Yes | Unique human-readable name, such as `SITE-TORONTO-01`. |
 | `replication_domain` | TEXT | Yes | Domain/environment to which the node belongs. |
+| `node_level` | INTEGER | Yes | Non-negative schema-authority level supplied by the application at initialization. Lower numeric levels have authority over higher levels for declared-type conflicts. |
 | `is_local` | INTEGER | Yes | `1` for this database's node and `0` for a remote node. Exactly one active row should be local. |
 | `membership_state` | TEXT | Yes | One of `joining`, `active`, or `retired`. Retired records remain for historical verification. |
 | `membership_epoch` | INTEGER | Yes | Monotonic administrative membership generation in which this node's current state was established. |
@@ -231,10 +234,15 @@ metadata, but it is not a credential-management mechanism.
 ### Dynamic membership rules
 
 Adding or removing a node is a replication-domain administration operation,
-not an application-schema change. Protocol version 1 uses an authenticated
+not an application-schema change. Protocol version 2 uses an authenticated
 membership manifest supplied and distributed by the operator. SQLiteSeal
 validates its signature or configured authentication, monotonic epoch, domain,
 and complete member set; it does not create or distribute the manifest.
+
+The manifest carries every node's immutable, non-negative `node_level`.
+Duplicate levels are valid. The level is not a primary-node election mechanism;
+it is used only to resolve competing declared types during schema
+reconciliation.
 
 A node is added in `joining` state, receives a snapshot or complete event-log
 replay, catches up its origin cursors, and only then becomes `active`. A node is
@@ -274,8 +282,9 @@ and it must be updated in the same transaction as every local change.
 | `database_generation` | INTEGER | Yes | Monotonic generation changed by controlled database replacement. |
 | `restore_epoch` | INTEGER | Yes | Incremented or reconciled after restore before networking is enabled. |
 | `network_enabled` | INTEGER | Yes | Safety fence. It must be `0` after an uncertain restore, clone, or identity mismatch. |
-| `schema_version` | INTEGER | Yes | Local application schema compatibility version; it is compared, not replicated. |
-| `schema_hash` | TEXT | Yes | SHA-256 hash of the canonical replicated-table descriptor. |
+| `schema_version` | INTEGER | Yes | Application-supplied version retained in event and snapshot provenance; equality with a peer is not required. |
+| `schema_hash` | TEXT | Yes | SHA-256 hash of the currently effective local replicated-table descriptor. It is diagnostic and protects provenance; it is not a peer-equality gate. |
+| `schema_revision` | INTEGER | Yes | Monotonic revision of this node's structured schema declarations. |
 | `created_at_utc` | TEXT | Yes | Time at which local replication state was initialized. |
 | `updated_at_utc` | TEXT | Yes | Last state update time. |
 
@@ -330,7 +339,7 @@ answer and retains deletion tombstones.
 | --- | --- | --- | --- |
 | `table_name` | TEXT | Yes | Replicated application table or entity. |
 | `row_key_json` | TEXT | Yes | Canonical row primary key. |
-| `row_state` | TEXT | Yes | Winning existence state: `live` or `deleted`. |
+| `row_state` | TEXT | Yes | Winning existence state: `live`, `deleted`, or `unique_deleted`. |
 | `winner_hlc_physical_utc_us` | INTEGER | Yes | Winning row-state HLC physical component. |
 | `winner_hlc_logical` | INTEGER | Yes | Winning row-state HLC logical component. |
 | `winner_origin_node_uuid` | TEXT | Yes | Winning row-state origin and deterministic tie-breaker. |
@@ -406,8 +415,8 @@ transaction.
 | `replication_domain` | TEXT | Yes | Domain to which the snapshot belongs. |
 | `membership_epoch` | INTEGER | Yes | Membership generation represented by the snapshot. |
 | `membership_manifest_hash` | TEXT | Yes | Hash of the exact operator-provided membership manifest represented by the snapshot. |
-| `schema_version` | INTEGER | Yes | Application schema compatibility version. |
-| `schema_hash` | TEXT | Yes | Canonical replicated-schema hash. |
+| `schema_version` | INTEGER | Yes | Application schema provenance version captured with the snapshot. |
+| `schema_hash` | TEXT | Yes | Hash of the effective replicated schema captured with the snapshot; it need not equal a peer's pre-reconciliation hash. |
 | `baseline_cursors_gzip` | BLOB | Yes | Gzip-compressed canonical JSON cursor vector from the same consistent read view as the snapshot. |
 | `baseline_cursors_uncompressed_bytes` | INTEGER | Yes | Exact expanded baseline-cursor size, validated before decompression and bounded by policy. |
 | `content_hash` | TEXT | Yes | SHA-256 hash of the complete canonical logical snapshot. |
@@ -534,10 +543,47 @@ Every JSON envelope contains at least:
 - `signature` when origin signing is required
 
 The first messages authenticate both endpoints and exchange node identity,
-incarnation, membership epoch, schema compatibility values, cursor vectors,
-and size limits. Application data exchange starts only after validation.
+incarnation, membership epoch, node levels, structured schema declarations,
+cursor vectors, and size limits. Application data exchange starts only after
+schema reconciliation succeeds.
 Production connections use `tls_tcp`; plain `tcp` is restricted to explicitly
 approved isolated environments.
+
+### Schema declarations and conflicts
+
+`replication_schema_declarations` stores the newest declaration known for each
+`(origin_node_uuid, table_name)`. A declaration records the origin's monotonic
+`schema_revision`, the application's `ReplicatedTable` selection, and, when
+the origin has the table, its projected structured descriptor. A node may
+therefore select a table that is not present locally and learn its definition
+from another active member.
+
+`replication_schema_conflicts` stores the unresolved effective-schema conflicts
+reported through `ReplicationStatus.SchemaConflicts`. Each row names the table
+and column, the lowest authority level currently represented, and the
+conflicting declared types and origin nodes. Rows are recalculated whenever new
+declarations are merged.
+
+Peers calculate the same effective schema from all non-retired declarations:
+
+1. Take the additive union of selected tables and columns, always including
+   primary-key columns.
+2. Create a selected table that is missing locally once a structured definition
+   is available.
+3. Add selected columns that are missing locally.
+4. For a column with different declared types, consider only declarations at
+   the lowest numeric node level that defines that column. If those declarations
+   agree, that type wins. Higher-level declarations cannot override it.
+5. If declarations at that lowest level disagree, record a conflict and leave
+   the session in `schema_pending`. A later declaration from a lower-level node
+   can dictate the type and unblock reconciliation.
+
+Primary keys, constraint policy, and explicit-recreation policy must agree;
+those structural disagreements remain pending rather than being guessed.
+Reconciliation never treats an absent declaration as permission to drop a
+table or column. Supported declared-type changes rebuild the local table inside
+the coordinated writer; schemas with constraints that cannot be preserved
+safely fail closed.
 
 ## 13. SQLite DDL
 
@@ -551,6 +597,7 @@ CREATE TABLE replication_nodes (
     incarnation_uuid       TEXT NOT NULL UNIQUE,
     node_name              TEXT NOT NULL UNIQUE,
     replication_domain     TEXT NOT NULL,
+    node_level             INTEGER NOT NULL CHECK (node_level >= 0),
     is_local               INTEGER NOT NULL DEFAULT 0
                            CHECK (is_local IN (0, 1)),
     membership_state       TEXT NOT NULL DEFAULT 'joining'
@@ -791,6 +838,11 @@ CREATE TABLE replication_changes (
                                AND payload_hash = lower(payload_hash)
                                AND payload_hash NOT GLOB '*[^0-9a-f]*'
                            ),
+    wire_values_json       TEXT
+                           CHECK (
+                               wire_values_json IS NULL
+                               OR json_valid(wire_values_json)
+                           ),
     payload_uncompressed_bytes INTEGER NOT NULL
                            CHECK (payload_uncompressed_bytes >= 0),
     origin_signature       BLOB,
@@ -894,6 +946,8 @@ CREATE TABLE replication_local_state (
     schema_version           INTEGER NOT NULL CHECK (schema_version > 0),
     schema_hash              TEXT NOT NULL
                              CHECK (length(schema_hash) = 64 AND schema_hash = lower(schema_hash)),
+    schema_revision          INTEGER NOT NULL DEFAULT 1
+                             CHECK (schema_revision > 0),
     created_at_utc           TEXT NOT NULL,
     updated_at_utc           TEXT NOT NULL,
     FOREIGN KEY (local_node_uuid, local_incarnation_uuid)
@@ -928,7 +982,7 @@ CREATE INDEX ix_replication_field_versions_event
 CREATE TABLE replication_row_versions (
     table_name                   TEXT NOT NULL,
     row_key_json                 TEXT NOT NULL CHECK (json_valid(row_key_json)),
-    row_state                    TEXT NOT NULL CHECK (row_state IN ('live', 'deleted')),
+    row_state                    TEXT NOT NULL CHECK (row_state IN ('live', 'deleted', 'unique_deleted')),
     winner_hlc_physical_utc_us   INTEGER NOT NULL CHECK (winner_hlc_physical_utc_us >= 0),
     winner_hlc_logical           INTEGER NOT NULL CHECK (winner_hlc_logical >= 0),
     winner_origin_node_uuid      TEXT NOT NULL,
@@ -1072,6 +1126,32 @@ CREATE INDEX ix_replication_rejected_events_claim
         claimed_origin_counter,
         recorded_at_utc
     );
+
+CREATE TABLE replication_schema_declarations (
+    origin_node_uuid       TEXT NOT NULL,
+    schema_revision        INTEGER NOT NULL CHECK (schema_revision > 0),
+    table_name             TEXT NOT NULL,
+    table_json             TEXT NOT NULL CHECK (json_valid(table_json)),
+    descriptor_json        TEXT CHECK (
+                               descriptor_json IS NULL
+                               OR json_valid(descriptor_json)
+                           ),
+    updated_at_utc         TEXT NOT NULL,
+    PRIMARY KEY (origin_node_uuid, table_name),
+    FOREIGN KEY (origin_node_uuid)
+        REFERENCES replication_nodes (node_uuid)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE TABLE replication_schema_conflicts (
+    table_name             TEXT NOT NULL,
+    column_name            TEXT NOT NULL,
+    authority_level        INTEGER NOT NULL,
+    declared_types_json    TEXT NOT NULL CHECK (json_valid(declared_types_json)),
+    origin_nodes_json      TEXT NOT NULL CHECK (json_valid(origin_nodes_json)),
+    updated_at_utc         TEXT NOT NULL,
+    PRIMARY KEY (table_name, column_name)
+);
 ```
 
 ### Generated per-application-table DDL
@@ -1155,8 +1235,11 @@ For a remote change:
 
 1. Authenticate the immediate peer and authorize the claimed origin.
 2. Verify that the authenticated peer equals the event origin, then verify
-   membership state, incarnation, replication domain, schema version and hash,
-   UUID/counter uniqueness, payload hash, and any configured origin signature.
+   membership state, incarnation, replication domain, UUID/counter uniqueness,
+   payload hash, event schema provenance, and any configured origin signature.
+   The event's schema version and hash must be internally valid, but they do not
+   have to equal the receiver's current values; structured schema reconciliation
+   has already made the required table and columns available.
 3. Begin one SQLite transaction and record any counter gap above the local
    contiguous cursor.
 4. Insert the immutable header and typed per-table payload if absent.
@@ -1265,8 +1348,9 @@ Persistent merge state remains in `replication_changes`,
 `replication_field_versions`, and `replication_row_versions`. At startup the
 service builds a descriptor for every replicated application table from
 `PRAGMA table_xinfo`, `foreign_key_list`, `index_list`, `index_xinfo`, and
-normalized table/trigger SQL. It validates the protocol-version-1 supported
-constraint profile and `schema_hash`, quotes every SQLite identifier, and
+normalized table/trigger SQL. It validates the protocol-version-2 supported
+constraint profile, records the effective `schema_hash` for diagnostics and
+provenance, quotes every SQLite identifier, and
 generates the typed capture table, three capture triggers, and parameterized
 merge statements. An event-supplied table or field name is accepted only after
 lookup in that descriptor and is never interpolated directly into SQL.
@@ -1332,7 +1416,7 @@ transaction or a dedicated disposable database and verifies:
 - full-row reconstruction without overwriting a newer unrelated field;
 - identifier quoting and every generated prepared statement.
 
-The descriptor validation also rejects protocol-version-1 unsupported schemas:
+The descriptor validation also rejects unsupported schemas:
 non-primary-key UNIQUE constraints, CHECK constraints spanning replicated
 columns, foreign keys between independently writable replicated rows,
 transmitted generated/hidden columns, mutable primary keys, and non-SQLiteSeal
@@ -1398,3 +1482,50 @@ fail-closed local/remote apply-mode functions used by those triggers. Remote
 apply pins a connection and sets `remote` mode only for the duration of its
 transaction; returning a connection to the pool while remote mode is active is
 a fatal invariant violation.
+
+## 23. Managed constrained schemas
+
+Constraint support is opt-in per table. The default remains fail closed. Set
+`ReplicatedTable.ConstraintPolicy` to `ReplicationConstraintsManaged` only when
+the application accepts the following conflict contract.
+
+- Foreign keys, including composite references and SQLite `CASCADE`, `SET NULL`,
+  and `RESTRICT` actions, are included in the schema fingerprint. A remote row
+  that arrives before its parent is stored as `pending` with reason
+  `foreign_key_dependency`. Later events may pass that gap only when every
+  skipped event is a durable FK dependency. Call `RetryReplicationDeferred`
+  after related data arrives; normal replication recovery also retries it.
+- Ordinary, compound, constraint-created, collation-aware, and partial unique
+  indexes are accepted and included in the schema fingerprint. Expression-based
+  unique indexes remain fail closed. Concurrent claims use deterministic
+  last-write-wins ordered by HLC physical time, HLC logical time, then origin node
+  UUID; network arrival order is never used. The winning row replaces conflicting
+  rows and each loser receives a durable `unique_deleted` replication version.
+  SQLite foreign-key actions still govern removal of a losing row.
+- Application triggers are included in the schema fingerprint. Trigger-caused
+  local row mutations are captured by the same immutable change log. Trigger
+  bodies must still be deterministic across replicas.
+- String and composite primary keys, durable row tombstones, and typed per-row
+  payloads already use the same change log; no separate changelog should be
+  added by the application.
+
+Concurrent offline uniqueness is necessarily lossy: two different rows cannot
+both retain the same constrained username or email. Managed mode makes the
+product policy explicit and convergent: the later replication version wins and
+the earlier logical row is deleted. A genuinely newer event for a
+`unique_deleted` identity may compete again; stale events cannot resurrect it.
+
+Protocol version 2 still does not provide source-transaction atomic visibility.
+It does replicate the selected application schema through structured
+declarations: missing tables and columns are installed, and a lower-level node's
+declared type can cause a supported local table rebuild. Historical events retain
+their original typed wire values so additive schema changes do not require schema
+hash equality or generic event translation.
+
+`ApplyReplicationMigration` remains the controlled API for originating local DDL.
+It pauses networking, runs the statements in maintenance mode, rebuilds capture
+metadata, increments `schema_revision`, and publishes fresh local declarations.
+After `ResumeReplication`, peers reconcile those declarations before exchanging
+more row events. GORM DML is captured transparently, but GORM `AutoMigrate`
+must not independently mutate replicated schemas on live peers because such DDL
+bypasses declaration publication and the coordinated replication writer.

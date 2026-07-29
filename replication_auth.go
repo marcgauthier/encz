@@ -150,7 +150,7 @@ func (r *replicationRuntime) handshakePurpose(connection net.Conn, outbound bool
 func (r *replicationRuntime) newAuthHello(ctx context.Context, session string) (wireHello, error) {
 	var hello wireHello
 	hello.Protocol = replicationProtocolVersion
-	if err := r.db.QueryRowContext(ctx, `SELECT local_node_uuid,local_incarnation_uuid,replication_domain,schema_version,schema_hash,membership_epoch,membership_manifest_hash FROM replication_local_state`).Scan(&hello.NodeUUID, &hello.IncarnationUUID, &hello.Domain, &hello.SchemaVersion, &hello.SchemaHash, &hello.MembershipEpoch, &hello.MembershipHash); err != nil {
+	if err := r.db.QueryRowContext(ctx, `SELECT l.local_node_uuid,l.local_incarnation_uuid,l.replication_domain,n.node_level,l.schema_version,l.schema_hash,l.membership_epoch,l.membership_manifest_hash FROM replication_local_state l JOIN replication_nodes n ON n.node_uuid=l.local_node_uuid`).Scan(&hello.NodeUUID, &hello.IncarnationUUID, &hello.Domain, &hello.Level, &hello.SchemaVersion, &hello.SchemaHash, &hello.MembershipEpoch, &hello.MembershipHash); err != nil {
 		return hello, err
 	}
 	nonce := make([]byte, 32)
@@ -177,23 +177,20 @@ func (r *replicationRuntime) validatePeerHello(ctx context.Context, connection *
 	}
 	var incarnation, domain, credential string
 	var mode ReplicationAuthMode
-	var enabled int
-	if err = r.db.QueryRowContext(ctx, `SELECT incarnation_uuid,replication_domain,enabled,credential_name,auth_mode FROM replication_nodes WHERE node_uuid=?`, peer.NodeUUID).Scan(&incarnation, &domain, &enabled, &credential, &mode); err != nil {
+	var enabled, level int
+	if err = r.db.QueryRowContext(ctx, `SELECT incarnation_uuid,replication_domain,node_level,enabled,credential_name,auth_mode FROM replication_nodes WHERE node_uuid=?`, peer.NodeUUID).Scan(&incarnation, &domain, &level, &enabled, &credential, &mode); err != nil {
 		return "", "", err
 	}
 	if expected != "" && peer.NodeUUID != expected {
 		return "", "", errors.New("replication: unexpected peer identity")
 	}
-	if enabled == 0 || incarnation != peer.IncarnationUUID || domain != peer.Domain {
+	if enabled == 0 || incarnation != peer.IncarnationUUID || domain != peer.Domain || level != peer.Level {
 		return "", "", errors.New("replication: unauthorized peer")
 	}
 	var schema, membership string
 	var schemaVersion, membershipEpoch int64
 	if err = r.db.QueryRowContext(ctx, `SELECT schema_hash,membership_manifest_hash,schema_version,membership_epoch FROM replication_local_state`).Scan(&schema, &membership, &schemaVersion, &membershipEpoch); err != nil {
 		return "", "", err
-	}
-	if peer.SchemaHash != schema || peer.SchemaVersion != schemaVersion {
-		return "", "", ErrReplicationSchemaMismatch
 	}
 	if peer.MembershipHash != membership || peer.MembershipEpoch != membershipEpoch {
 		return "", "", ErrReplicationMembershipMismatch
@@ -214,7 +211,7 @@ func (r *replicationRuntime) validatePeerHello(ctx context.Context, connection *
 }
 
 func sameAuthenticationIdentity(first, second wireHello) bool {
-	return first.Protocol == second.Protocol && first.NodeUUID == second.NodeUUID && first.IncarnationUUID == second.IncarnationUUID && first.Domain == second.Domain && first.SchemaVersion == second.SchemaVersion && first.SchemaHash == second.SchemaHash && first.MembershipEpoch == second.MembershipEpoch && first.MembershipHash == second.MembershipHash && first.Nonce == second.Nonce && first.SentAtUTC == second.SentAtUTC && first.AdministrativeTest == second.AdministrativeTest
+	return first.Protocol == second.Protocol && first.NodeUUID == second.NodeUUID && first.IncarnationUUID == second.IncarnationUUID && first.Domain == second.Domain && first.Level == second.Level && first.SchemaVersion == second.SchemaVersion && first.SchemaHash == second.SchemaHash && first.MembershipEpoch == second.MembershipEpoch && first.MembershipHash == second.MembershipHash && first.Nonce == second.Nonce && first.SentAtUTC == second.SentAtUTC && first.AdministrativeTest == second.AdministrativeTest
 }
 
 func authenticationTranscript(connection *tls.Conn, initiator, acceptor wireHello) ([]byte, error) {

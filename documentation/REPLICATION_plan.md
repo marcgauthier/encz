@@ -123,6 +123,23 @@ write-lock acquisition is needed. `SQLITE_BUSY` is retried with bounded
 backoff before any network acknowledgment, and a retry must rerun the complete
 transaction rather than only its final statement.
 
+2.9 The selected schema is replicated
+
+Each application supplies a non-negative level when initializing a node and a
+list of tables and columns that the node wants to replicate. Before row events
+are exchanged, connected nodes exchange structured, revisioned schema
+declarations and calculate an additive union of the selected tables and columns.
+Missing tables and columns are installed locally.
+
+Schema hashes are immutable event provenance and useful diagnostics; equal
+hashes are not required for a session. When declarations give one column
+different SQLite declared types, the declaration at the lowest numeric node
+level wins. If multiple nodes at that lowest level disagree, no change is
+chosen: the conflict is durable, row synchronization remains `schema_pending`,
+and reconciliation is retried after declarations from another node arrive. A
+node with a still-lower level can dictate the result. Absence never means drop;
+automatic schema reconciliation is additive.
+
 3. Terminology
 
 Term
@@ -176,6 +193,16 @@ Persistent metadata representing a deleted row.
 Cursor vector
 
 A map showing which contiguous events are known for every origin node.
+
+Node level
+
+A non-negative application-assigned schema authority. Lower numeric values have
+priority for declared-type conflicts; duplicate levels are allowed.
+
+Schema declaration
+
+A revisioned statement of one node's selected table, columns, primary key,
+policies, and projected SQLite column definitions.
 
 Gap
 
@@ -383,7 +410,7 @@ Difference between remote HLC physical time and local system time.
 
 Difference between remote reported UTC time and local receipt time.
 
-Protocol version 1 has one domain-wide `maximum_future_skew` setting, defaulting
+Protocol version 2 has one domain-wide `maximum_future_skew` setting, defaulting
 to five minutes. A valid event beyond that limit is durably quarantined without
 changing its HLC, applying its payload, acknowledging it, or advancing its
 origin cursor. It is retried when wall time enters the allowed window. Capping
@@ -396,7 +423,7 @@ different conflict result.
 
 A replication event represents one intercepted row mutation. One application
 transaction may produce several events, all carrying the same optional
-`transaction_uuid`, but protocol version 1 does not promise atomic visibility
+`transaction_uuid`, but protocol version 2 does not promise atomic visibility
 of the complete multi-row application transaction on a receiver.
 
 Each event must contain the following metadata.
@@ -610,7 +637,7 @@ Binary encoding.
 
 Treatment of unknown fields.
 
-Protocol version 1 uses RFC 8785 JSON Canonicalization Scheme after all input
+Protocol version 2 uses RFC 8785 JSON Canonicalization Scheme after all input
 strings and identifiers have been normalized to Unicode NFC. Typed envelopes
 encode signed integers outside the interoperable JSON range and exact decimals
 as canonical decimal strings. Non-finite floats are rejected. UUIDs are
@@ -646,6 +673,9 @@ Replication-domain identifier.
 Current schema version.
 
 Current schema hash.
+
+Current schema-declaration revision and the declarations learned from
+non-retired members.
 
 Software protocol version.
 
@@ -874,8 +904,9 @@ Apply and clear row tombstones.
 Reconstruct a missing row from a full row image and its embedded field
 versions.
 
-Plans are cached in memory and rebuilt whenever the local schema version or
-schema hash changes. Identifiers come only from the validated schema
+Plans are cached in memory and rebuilt whenever schema reconciliation changes
+the effective descriptor or a controlled local migration publishes a new
+schema revision. Identifiers come only from the validated schema
 descriptor and are quoted as SQLite identifiers; event-supplied identifiers
 must never be interpolated into SQL.
 
@@ -1001,7 +1032,7 @@ The row becomes visible again.
 
 Applications that do not permit identity reuse should prohibit re-creation entirely and require a new UUID.
 
-An ordinary `update` is never an explicit recreation. Protocol version 1 adds
+An ordinary `update` is never an explicit recreation. Protocol version 2 adds
 an `is_explicit_recreation` flag, which is false for trigger-captured UPDATE
 events and true only when the application explicitly inserts a previously
 deleted permitted identity through the recreation API. A newer ordinary update
@@ -1054,7 +1085,7 @@ the application tables permanently behind the event log.
 10.9 Supported relational-schema profile
 
 Per-field LWW is guaranteed only for schemas closed under field-wise merge.
-Protocol version 1 therefore rejects replication enablement when a table has:
+Protocol version 2 therefore rejects replication enablement when a table has:
 
 A non-primary-key UNIQUE constraint or unique index.
 
@@ -1145,7 +1176,7 @@ Verify replication domain.
 
 Negotiate protocol capabilities.
 
-Compare schema version and schema hash.
+Exchange schema declarations and reconcile the effective schema.
 
 Exchange clock observations and HLC state.
 
@@ -1175,9 +1206,9 @@ Minimum supported protocol version.
 
 Software version.
 
-Replication schema version.
+Schema provenance version and hash for diagnostics.
 
-Schema hash.
+Node level and structured schema declarations.
 
 Wire encoding and compression, which must be canonical JSON and gzip for this protocol.
 
@@ -1199,33 +1230,25 @@ Canonicalization version.
 
 A session must stop safely when incompatible capabilities could produce incorrect data.
 
-11.4 Schema verification
+11.4 Schema declaration and reconciliation
 
-Before exchanging mutable data, peers compare:
+Before exchanging mutable data, peers exchange all structured declarations they
+know for non-retired members. Each declaration is authenticated through the
+membership-bound session and includes the origin node, node level, schema
+revision, table selection, and projected definition.
 
-Replication schema version.
+The effective table and column set is the additive union. A missing table is
+created once a definition is available, and a missing column is added. For a
+same-name column with different declared types, only declarations at the lowest
+numeric level represented for that column have authority. If they agree, that
+type wins. If two nodes at that level disagree, the conflict is recorded and the
+session remains `schema_pending`; learning a declaration from a lower-level node
+may resolve it. Primary-key and table-policy disagreements also remain pending.
 
-Schema hash.
-
-Canonicalization version.
-
-Replicated table and field definitions.
-
-Type mappings.
-
-Merge-policy version.
-
-A mismatch may be handled by:
-
-Rejecting synchronization.
-
-Allowing a documented backward-compatible mode.
-
-Translating through an explicitly versioned migration layer.
-
-Allowing only snapshot or upgrade operations.
-
-Silent best-effort field mapping is not acceptable.
+Schema version and hash values are validated as provenance but are not compared
+for equality. Canonicalization, merge-policy, authentication, domain, and
+membership incompatibilities still fail closed. Silent best-effort field mapping
+is not acceptable.
 
 11.5 Cursor-vector exchange
 
@@ -1422,7 +1445,7 @@ Report local node ID, incarnation, and replication domain.
 
 Report software and protocol version.
 
-Report schema compatibility, time synchronization, and replication lag without
+Report schema reconciliation status, time synchronization, and replication lag without
 exposing sensitive data.
 
 12.5 Administrative peer test
@@ -1435,7 +1458,7 @@ Validate TCP and TLS connectivity.
 
 Validate authentication and authorization.
 
-Validate schema compatibility and clock health.
+Validate schema negotiation capability, node levels, and clock health.
 
 Perform no data mutation.
 
@@ -1717,15 +1740,18 @@ statement before networking is enabled.
 
 ComputeSchemaHash
 
-Generate the stable schema hash used during negotiation.
+Generate the stable hash of the effective local descriptor for event provenance,
+snapshots, and diagnostics.
 
 ValidateSchemaCompatibility
 
-Decide whether two schema versions can safely exchange events.
+Merge structured declarations, resolve the effective additive schema, and report
+pending conflicts.
 
 TranslateEventSchema
 
-Reject cross-schema event translation in protocol version 1.
+Read retained typed wire values from historical events after additive schema
+changes; do not require the event hash to equal the current local hash.
 
 ApplyReplicationMigration
 
@@ -2488,7 +2514,8 @@ Be written in the same transaction as the authoritative event and apply state.
 
 Be included in schema validation, snapshots, compaction, and recovery.
 
-Be present with an identical descriptor on every peer before synchronization.
+Be generated from each peer's reconciled effective descriptor before row
+synchronization; pre-negotiation descriptors do not have to be identical.
 
 Compaction may delete a typed payload only after the global event header is
 marked compacted and the accepted snapshot proves the payload is no longer
@@ -2522,7 +2549,7 @@ Configure PSK or mTLS credentials.
 
 Establish and authenticate the persistent TCP/JSON session.
 
-Verify replication domain and schema compatibility.
+Verify the replication domain and reconcile structured schema declarations.
 
 Select a compatible snapshot.
 
@@ -2564,7 +2591,7 @@ A dial endpoint has a usable address and port for the listening peer.
 
 Authentication credentials and replication-domain membership agree.
 
-Protocol version 1 does not run a membership consensus algorithm. The operator
+Protocol version 2 does not run a membership consensus algorithm. The operator
 supplies one authenticated membership manifest with a monotonically increasing
 epoch to every active node. SQLiteSeal validates and stores the manifest but
 does not create or distribute it. Compaction and peer retirement remain
@@ -2614,7 +2641,7 @@ Resolution rule applied.
 
 Sensitive field values should not be copied into general diagnostic logs unless authorized.
 
-Applications may mark conflicts for manual review. Protocol version 1 does not
+Applications may mark conflicts for manual review. Protocol version 2 does not
 support custom merge policies; a later protocol may add only versioned,
 deterministic policies negotiated identically by every node.
 
@@ -2636,7 +2663,7 @@ Certificate validation failure.
 
 Authorization denial.
 
-Schema mismatch.
+Schema declaration conflict or reconciliation failure.
 
 Clock-skew violation.
 
@@ -2987,7 +3014,8 @@ policy, and bounded busy handling.
 Acquire the coordinated writer and validate replication metadata, node
 identity, counter, HLC, restore generation, cursors, and gaps.
 
-Build the canonical replicated-schema descriptor and schema hash.
+Build the local selected-table descriptors, schema declarations, and diagnostic
+schema hash.
 
 Register type adapters and generate the prepared merge plan for every
 replicated table.
@@ -3032,7 +3060,7 @@ Authorize the peer and replication domain.
 
 Negotiate protocol and resource limits.
 
-Verify schema compatibility.
+Exchange declarations and reconcile the effective schema.
 
 Exchange time and HLC observations.
 
@@ -3102,9 +3130,9 @@ Periodically reconcile durable gap rows with the SQL `LEAD` audit and continue
 bounded gap responses until each range is filled or snapshot bootstrap is
 explicitly required.
 
-26. Finalized Protocol-Version-1 Decisions
+26. Finalized Protocol-Version-2 Decisions
 
-Protocol version 1 fixes the following interoperability decisions:
+Protocol version 2 fixes the following interoperability decisions:
 
 Node and event identities are canonical lower-case UUID strings; UUIDv7 is
 preferred for new application primary keys and UUIDv4 is accepted.
@@ -3120,7 +3148,7 @@ An event contains exactly one row operation. `transaction_uuid` is diagnostic
 correlation only; remote multi-row atomic visibility is not supported.
 
 BLOBs are inline only up to the configured expanded-value limit. Protocol
-version 1 has no external large-object transfer mechanism.
+version 2 has no external large-object transfer mechanism.
 
 Only direct-origin exchange is supported. Full mesh is required.
 
@@ -3145,10 +3173,12 @@ Membership and retirement use the operator-provided authenticated membership
 manifest. Restore safety uses the external identity guard and otherwise forces
 a new node identity plus snapshot bootstrap.
 
-Schema upgrades are stop-the-world in protocol version 1: disable networking,
-upgrade every node, rebuild descriptors/tables/triggers, verify one schema
-hash, then resume. Rolling schema translation and custom merge policies are
-not supported.
+Selected application schemas are replicated through structured declarations.
+The effective schema is the additive table-and-column union; missing objects are
+installed, and lower numeric node levels dictate declared-type conflicts. An
+equal-lowest-level disagreement remains pending until a lower-level declaration
+resolves it. Schema hashes do not have to match. Destructive drops, arbitrary
+constraint reconciliation, and custom merge policies are not supported.
 
 Set-based merge uses built-in SQLite window functions. Required typed
 per-table capture tables are authoritative payload stores, not optional

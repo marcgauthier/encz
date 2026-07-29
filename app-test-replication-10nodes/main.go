@@ -205,6 +205,7 @@ func run(duration, interval time.Duration) error {
 		}
 		manifestNodes[i] = sqliteseal.MembershipNode{
 			NodeUUID:        nodes[i].id,
+			Level:           i,
 			IncarnationUUID: mustStatus(ctx, nodes[i].db).IncarnationUUID,
 			State:           "active",
 			ListenEnabled:   true,
@@ -521,7 +522,6 @@ func printMeshSyncProgress(ctx context.Context, nodes []*node, startTime time.Ti
 	}
 }
 
-
 func openNode(ctx context.Context, n *node, listen string) error {
 	opts := sqliteseal.Options{
 		Key:         n.key,
@@ -543,6 +543,7 @@ func openNode(ctx context.Context, n *node, listen string) error {
 		NodeUUID:          n.id,
 		NodeName:          n.name,
 		ReplicationDomain: domain,
+		Level:             n.index,
 		ListenAddress:     listen,
 		AuthMode:          sqliteseal.ReplicationAuthPSK,
 		CredentialName:    credential,

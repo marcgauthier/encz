@@ -156,7 +156,7 @@ func isCanonicalUUID(value string) bool {
 	return err == nil
 }
 
-func validateWireEvent(d replicationTableDescriptor, e wireEvent, domain, schema string, version int64, maximumBytes int) error {
+func validateWireEvent(d replicationTableDescriptor, e wireEvent, domain, _ string, _ int64, maximumBytes int) error {
 	if maximumBytes <= 0 {
 		maximumBytes = defaultMaximumEventBytes
 	}
@@ -169,7 +169,7 @@ func validateWireEvent(d replicationTableDescriptor, e wireEvent, domain, schema
 	if e.Operation != "insert" && e.Operation != "update" && e.Operation != "delete" {
 		return errors.New("replication: invalid operation")
 	}
-	if e.TableName != d.Table.Name || e.Domain != domain || e.SchemaHash != schema || e.SchemaVersion != version {
+	if e.TableName != d.Table.Name || e.Domain != domain {
 		return ErrReplicationSchemaMismatch
 	}
 	if e.HLCPhysicalUS <= 0 || e.HLCLogical < 0 {
@@ -215,19 +215,20 @@ func validateWireEvent(d replicationTableDescriptor, e wireEvent, domain, schema
 		}
 		changedSet[name] = true
 	}
-	if len(e.Values) != len(d.Table.Columns) {
-		return errors.New("replication: incomplete typed row image")
-	}
-	for _, name := range d.Table.Columns {
-		value, ok := e.Values[name]
-		if !ok || value.Present != changedSet[name] {
+	for name, value := range e.Values {
+		if !allowed[name] || value.Present != changedSet[name] {
 			return errors.New("replication: field presence mismatch")
 		}
 		if err = validateWireValue(value); err != nil {
 			return fmt.Errorf("replication: invalid field %s: %w", name, err)
 		}
 	}
-	if (e.Operation == "insert" && len(changed) != len(d.Table.Columns)) || (e.Operation == "update" && len(changed) == 0) || (e.Operation == "delete" && len(changed) != 0) {
+	for name := range changedSet {
+		if _, ok := e.Values[name]; !ok {
+			return errors.New("replication: incomplete typed row image")
+		}
+	}
+	if (e.Operation == "insert" && len(changed) == 0) || (e.Operation == "update" && len(changed) == 0) || (e.Operation == "delete" && len(changed) != 0) {
 		return errors.New("replication: operation and changed fields disagree")
 	}
 	hash, size, err := replicationEventHash(e)

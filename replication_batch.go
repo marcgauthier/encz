@@ -3,6 +3,7 @@ package sqliteseal
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -91,9 +92,6 @@ func (r *replicationRuntime) applyRemoteEventsOnce(ctx context.Context, peer str
 		if event.OriginNodeUUID != peer || event.Domain != domain {
 			return errors.New("replication: origin authorization failed")
 		}
-		if event.SchemaHash != schema || event.SchemaVersion != version {
-			return ErrReplicationSchemaMismatch
-		}
 		if event.OriginCounter != contiguous+int64(i)+1 {
 			return errReplicationBatchFallback
 		}
@@ -114,6 +112,9 @@ func (r *replicationRuntime) applyRemoteEventsOnce(ctx context.Context, peer str
 			_ = r.recordRejectedEvent(ctx, peer, event, "invalid_event", "")
 			return validationErr
 		}
+		valuesRaw, _ := json.Marshal(event.Values)
+		event.StoredValuesJSON = string(valuesRaw)
+		event = expandWireEvent(descriptor, event)
 		prepared[i] = preparedRemoteEvent{event: event, descriptor: descriptor}
 	}
 
@@ -200,7 +201,7 @@ func applyNewRemoteEventInBatch(ctx context.Context, tx *sql.Tx, peer string, pr
 	}
 
 	exists := 0
-	tombstoneBlocks := rowState == "deleted" && (rowComparison <= 0 || !event.ExplicitRecreation)
+	tombstoneBlocks := (rowState == "deleted" && (rowComparison <= 0 || !event.ExplicitRecreation)) || (rowState == "unique_deleted" && rowComparison <= 0)
 	if event.Operation != "delete" && !tombstoneBlocks {
 		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM `+quoteReplicationIdent(event.TableName)+` WHERE `+whereSQL, keyArgs...).Scan(&exists); err != nil {
 			return err
@@ -224,6 +225,9 @@ func applyNewRemoteEventInBatch(ctx context.Context, tx *sql.Tx, peer string, pr
 	if event.Operation == "delete" {
 		if rowComparison > 0 {
 			if _, err = tx.ExecContext(ctx, `DELETE FROM `+quoteReplicationIdent(event.TableName)+` WHERE `+whereSQL, keyArgs...); err != nil {
+				if isReplicationConstraint(err) {
+					return errReplicationBatchFallback
+				}
 				return err
 			}
 			applied = true
@@ -234,7 +238,7 @@ func applyNewRemoteEventInBatch(ctx context.Context, tx *sql.Tx, peer string, pr
 		inserted := false
 		if exists == 0 && (event.Operation == "insert" || event.Operation == "update") {
 			if err = insertRemoteWireRow(ctx, tx, descriptor, event); err != nil {
-				if event.Operation == "update" && isReplicationConstraint(err) {
+				if isReplicationConstraint(err) {
 					return errReplicationBatchFallback
 				}
 				return err
@@ -268,6 +272,9 @@ func applyNewRemoteEventInBatch(ctx context.Context, tx *sql.Tx, peer string, pr
 				}
 				if !inserted {
 					if _, err = tx.ExecContext(ctx, `UPDATE `+quoteReplicationIdent(event.TableName)+` SET `+quoteReplicationIdent(column)+`=? WHERE `+whereSQL, append([]any{value}, keyArgs...)...); err != nil {
+						if isReplicationConstraint(err) {
+							return errReplicationBatchFallback
+						}
 						return err
 					}
 				}

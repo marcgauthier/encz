@@ -14,20 +14,22 @@ func (db *DB) validateMembershipManifest(ctx context.Context, manifest Membershi
 		incarnation string
 		listens     bool
 		local       bool
+		level       int
+		state       string
 	}
 	configured := map[string]configuredNode{}
-	rows, err := db.QueryContext(ctx, `SELECT node_uuid,incarnation_uuid,listen_enabled,is_local FROM replication_nodes`)
+	rows, err := db.QueryContext(ctx, `SELECT node_uuid,incarnation_uuid,listen_enabled,is_local,node_level,membership_state FROM replication_nodes`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
-		var id, incarnation string
-		var listens, local int
-		if err = rows.Scan(&id, &incarnation, &listens, &local); err != nil {
+		var id, incarnation, state string
+		var listens, local, level int
+		if err = rows.Scan(&id, &incarnation, &listens, &local, &level, &state); err != nil {
 			rows.Close()
 			return err
 		}
-		configured[id] = configuredNode{incarnation: incarnation, listens: listens == 1, local: local == 1}
+		configured[id] = configuredNode{incarnation: incarnation, listens: listens == 1, local: local == 1, level: level}
 	}
 	if err = rows.Close(); err != nil {
 		return err
@@ -41,6 +43,9 @@ func (db *DB) validateMembershipManifest(ctx context.Context, manifest Membershi
 		if !isCanonicalUUID(node.NodeUUID) || !isCanonicalUUID(node.IncarnationUUID) {
 			return fmt.Errorf("%w: invalid member identity", ErrReplicationMembershipMismatch)
 		}
+		if node.Level < 0 {
+			return fmt.Errorf("%w: invalid member level", ErrReplicationMembershipMismatch)
+		}
 		if node.State != "joining" && node.State != "active" && node.State != "retired" {
 			return fmt.Errorf("%w: invalid member state", ErrReplicationMembershipMismatch)
 		}
@@ -50,6 +55,12 @@ func (db *DB) validateMembershipManifest(ctx context.Context, manifest Membershi
 		registered, ok := configured[node.NodeUUID]
 		if !ok || registered.incarnation != node.IncarnationUUID || registered.listens != node.ListenEnabled {
 			return fmt.Errorf("%w: member registration mismatch", ErrReplicationMembershipMismatch)
+		}
+		if !registered.local && registered.state == "active" && registered.level != node.Level {
+			return fmt.Errorf("%w: member level is immutable for an incarnation", ErrReplicationMembershipMismatch)
+		}
+		if registered.local && registered.level != node.Level {
+			return fmt.Errorf("%w: local member level mismatch", ErrReplicationMembershipMismatch)
 		}
 		if registered.local && node.State == "active" {
 			localActive = true

@@ -22,13 +22,14 @@ import (
 	"time"
 )
 
-const replicationProtocolVersion = 1
+const replicationProtocolVersion = 2
 
 type wireHello struct {
 	Protocol           int    `json:"protocol"`
 	NodeUUID           string `json:"node_uuid"`
 	IncarnationUUID    string `json:"incarnation_uuid"`
 	Domain             string `json:"domain"`
+	Level              int    `json:"level"`
 	SchemaVersion      int64  `json:"schema_version"`
 	SchemaHash         string `json:"schema_hash"`
 	MembershipEpoch    int64  `json:"membership_epoch"`
@@ -61,6 +62,7 @@ type wireEvent struct {
 	CreatedAtUTC       string               `json:"created_at_utc"`
 	PayloadHash        string               `json:"payload_hash"`
 	Values             map[string]wireValue `json:"values"`
+	StoredValuesJSON   string               `json:"-"`
 }
 type wireCursor struct {
 	OriginNodeUUID          string `json:"origin_node_uuid"`
@@ -92,6 +94,8 @@ type wireMessage struct {
 	SnapshotRequired bool                         `json:"snapshot_required,omitempty"`
 	Snapshot         *replicationSnapshotManifest `json:"snapshot,omitempty"`
 	SnapshotChunk    *wireSnapshotChunk           `json:"snapshot_chunk,omitempty"`
+	Schemas          []wireSchemaDeclaration      `json:"schemas,omitempty"`
+	SchemaPending    bool                         `json:"schema_pending,omitempty"`
 	Error            string                       `json:"error,omitempty"`
 }
 type peerRuntimeConfig struct {
@@ -287,6 +291,16 @@ func (r *replicationRuntime) clientSession(c net.Conn, peer wireHello, p peerRun
 	}
 }
 func (r *replicationRuntime) syncCycle(c net.Conn, peer string, p peerRuntimeConfig) error {
+	pending, err := r.schemaSyncClient(c, p)
+	if err != nil {
+		r.setPeerState(peer, "schema_pending", err.Error())
+		return err
+	}
+	if pending {
+		r.setPeerState(peer, "schema_pending", "schema agreement is pending")
+		return nil
+	}
+	r.setPeerState(peer, "connected", "")
 	vector, err := r.buildCursorVector(r.ctx)
 	if err != nil {
 		return err
@@ -382,13 +396,44 @@ func (r *replicationRuntime) syncCycle(c net.Conn, peer string, p peerRuntimeCon
 	return r.recordPeerAck(peer, cursorFromVector(ack.Cursors, local).ContiguousCounter)
 }
 func (r *replicationRuntime) serveSession(c net.Conn, peer wireHello) error {
+	schemaReady := false
 	for {
 		msg, err := readReplicationFrame(c, 8<<20, 32<<20)
 		if err != nil {
 			return err
 		}
 		switch msg.Type {
+		case "schema_request":
+			if err = r.mergeSchemaDeclarations(r.ctx, msg.Schemas); err != nil {
+				_ = writeReplicationFrame(c, wireMessage{Type: "schema_response", Error: err.Error()}, 8<<20)
+				return err
+			}
+			pending, reconcileErr := r.reconcileSchemas(r.ctx)
+			declarations, loadErr := r.loadSchemaDeclarations(r.ctx)
+			if reconcileErr == nil {
+				reconcileErr = loadErr
+			}
+			response := wireMessage{Type: "schema_response", Schemas: declarations, SchemaPending: pending}
+			if reconcileErr != nil {
+				response.Error = reconcileErr.Error()
+				response.SchemaPending = true
+			}
+			schemaReady = !response.SchemaPending
+			if schemaReady {
+				r.setPeerState(peer.NodeUUID, "connected", "")
+			} else {
+				r.setPeerState(peer.NodeUUID, "schema_pending", response.Error)
+			}
+			if err = writeReplicationFrame(c, response, 8<<20); err != nil {
+				return err
+			}
+			continue
 		case "sync_request":
+			if !schemaReady {
+				err = errors.New("replication: schema agreement required before synchronization")
+				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, 8<<20)
+				return err
+			}
 			if err = r.persistPeerCursorVector(r.ctx, peer.NodeUUID, msg.Cursors); err != nil {
 				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, 8<<20)
 				return err
@@ -607,7 +652,7 @@ func (r *replicationRuntime) loadOriginEvents(ctx context.Context, since int64, 
 	if err := r.db.QueryRowContext(ctx, `SELECT local_node_uuid FROM replication_local_state`).Scan(&local); err != nil {
 		return nil, err
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT change_uuid,origin_node_uuid,origin_counter,operation,table_name,row_key_json,changed_fields_json,is_explicit_recreation,hlc_physical_utc_us,hlc_logical,schema_version,schema_hash,replication_domain,created_at_utc,payload_hash FROM replication_changes WHERE origin_node_uuid=? AND origin_counter>? AND apply_state IN('applied','ignored') ORDER BY origin_counter LIMIT ?`, local, since, limit)
+	rows, err := r.db.QueryContext(ctx, `SELECT change_uuid,origin_node_uuid,origin_counter,operation,table_name,row_key_json,changed_fields_json,is_explicit_recreation,hlc_physical_utc_us,hlc_logical,schema_version,schema_hash,replication_domain,created_at_utc,payload_hash,wire_values_json FROM replication_changes WHERE origin_node_uuid=? AND origin_counter>? AND apply_state IN('applied','ignored') ORDER BY origin_counter LIMIT ?`, local, since, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -616,32 +661,44 @@ func (r *replicationRuntime) loadOriginEvents(ctx context.Context, since int64, 
 	for rows.Next() {
 		var e wireEvent
 		var recreate int
-		if err = rows.Scan(&e.ChangeUUID, &e.OriginNodeUUID, &e.OriginCounter, &e.Operation, &e.TableName, &e.RowKeyJSON, &e.ChangedFieldsJSON, &recreate, &e.HLCPhysicalUS, &e.HLCLogical, &e.SchemaVersion, &e.SchemaHash, &e.Domain, &e.CreatedAtUTC, &e.PayloadHash); err != nil {
+		var valuesRaw sql.NullString
+		if err = rows.Scan(&e.ChangeUUID, &e.OriginNodeUUID, &e.OriginCounter, &e.Operation, &e.TableName, &e.RowKeyJSON, &e.ChangedFieldsJSON, &recreate, &e.HLCPhysicalUS, &e.HLCLogical, &e.SchemaVersion, &e.SchemaHash, &e.Domain, &e.CreatedAtUTC, &e.PayloadHash, &valuesRaw); err != nil {
 			return nil, err
 		}
 		e.ExplicitRecreation = recreate == 1
-		d, er := r.descriptor(ctx, e.TableName)
-		if er != nil {
-			return nil, er
+		if valuesRaw.Valid {
+			if err = json.Unmarshal([]byte(valuesRaw.String), &e.Values); err != nil {
+				return nil, err
+			}
 		}
-		cols := []string{}
-		for _, n := range d.Table.Columns {
-			cols = append(cols, quoteReplicationIdent(n+"__value"), quoteReplicationIdent(n+"__present"))
+		if !valuesRaw.Valid {
+			d, descriptorErr := r.descriptor(ctx, e.TableName)
+			if descriptorErr != nil {
+				return nil, descriptorErr
+			}
+			cols := make([]string, 0, len(d.Table.Columns)*2)
+			for _, name := range d.Table.Columns {
+				cols = append(cols, quoteReplicationIdent(name+"__value"), quoteReplicationIdent(name+"__present"))
+			}
+			query := `SELECT ` + strings.Join(cols, ",") + ` FROM ` + quoteReplicationIdent(d.DescriptorID+"__replication_changes") + ` WHERE change_uuid=?`
+			values := make([]any, len(d.Table.Columns)*2)
+			pointers := make([]any, len(values))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if descriptorErr = r.db.QueryRowContext(ctx, query, e.ChangeUUID).Scan(pointers...); descriptorErr != nil {
+				return nil, descriptorErr
+			}
+			e.Values = make(map[string]wireValue, len(d.Table.Columns))
+			for i, name := range d.Table.Columns {
+				present, ok := values[i*2+1].(int64)
+				if !ok {
+					return nil, errors.New("replication: invalid stored presence marker")
+				}
+				e.Values[name] = encodeWireValue(values[i*2], present == 1)
+			}
 		}
-		q := `SELECT ` + strings.Join(cols, ",") + ` FROM ` + quoteReplicationIdent(d.DescriptorID+"__replication_changes") + ` WHERE change_uuid=?`
-		vals := make([]any, len(d.Table.Columns)*2)
-		ptr := make([]any, len(vals))
-		for i := range vals {
-			ptr[i] = &vals[i]
-		}
-		if er = r.db.QueryRowContext(ctx, q, e.ChangeUUID).Scan(ptr...); er != nil {
-			return nil, er
-		}
-		e.Values = map[string]wireValue{}
-		for i, n := range d.Table.Columns {
-			present := vals[i*2+1].(int64) == 1
-			e.Values[n] = encodeWireValue(vals[i*2], present)
-		}
+
 		hash, size, hashErr := replicationEventHash(e)
 		if hashErr != nil {
 			return nil, hashErr
@@ -701,9 +758,6 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 	if e.OriginNodeUUID != peer || e.Domain != domain {
 		return errors.New("replication: origin authorization failed")
 	}
-	if e.SchemaHash != schema || e.SchemaVersion != version {
-		return ErrReplicationSchemaMismatch
-	}
 	d, err := r.descriptor(ctx, e.TableName)
 	if err != nil {
 		_ = r.recordRejectedEvent(ctx, peer, e, "unknown_table", "")
@@ -713,6 +767,9 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 		_ = r.recordRejectedEvent(ctx, peer, e, "invalid_event", "")
 		return err
 	}
+	valuesRaw, _ := json.Marshal(e.Values)
+	e.StoredValuesJSON = string(valuesRaw)
+	e = expandWireEvent(d, e)
 	skew, err := r.maximumFutureSkew(ctx)
 	if err != nil {
 		return err
@@ -737,7 +794,13 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 				return fmt.Errorf("%w: future_clock", ErrReplicationEventQuarantined)
 			}
 			if existingState == "pending" && e.OriginCounter > contiguous+1 {
-				return nil
+				dependencyGap, gapErr := r.foreignKeyDependencyGap(ctx, e.OriginNodeUUID, contiguous+1, e.OriginCounter-1)
+				if gapErr != nil {
+					return gapErr
+				}
+				if !dependencyGap {
+					return nil
+				}
 			}
 			deferred = true
 		} else {
@@ -759,7 +822,13 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 		return r.quarantineRemoteEvent(ctx, peer, local, d, e, "future_clock")
 	}
 	if e.OriginCounter > contiguous+1 {
-		return r.deferOutOfOrderEvent(ctx, peer, local, d, e)
+		dependencyGap, gapErr := r.foreignKeyDependencyGap(ctx, e.OriginNodeUUID, contiguous+1, e.OriginCounter-1)
+		if gapErr != nil {
+			return gapErr
+		}
+		if !dependencyGap {
+			return r.deferOutOfOrderEvent(ctx, peer, local, d, e)
+		}
 	}
 	conn, err := r.db.Conn(ctx)
 	if err != nil {
@@ -793,6 +862,9 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 			return err
 		}
 	}
+	if _, err = tx.ExecContext(ctx, `SAVEPOINT sqliteseal_materialize`); err != nil {
+		return err
+	}
 	_, args, err := wireKey(d, e)
 	if err != nil {
 		return err
@@ -815,13 +887,16 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 	if e.Operation == "delete" {
 		if rowCmp > 0 {
 			if _, err = tx.ExecContext(ctx, `DELETE FROM `+quoteReplicationIdent(e.TableName)+` WHERE `+whereSQL, args...); err != nil {
+				if handled, result := handleManagedConstraint(ctx, tx, local, d, e, now, deferred, err); handled {
+					return result
+				}
 				return err
 			}
 			applied = true
 		}
 	} else {
 		inserted := false
-		if rowState == "deleted" && (rowCmp <= 0 || !e.ExplicitRecreation) {
+		if (rowState == "deleted" && (rowCmp <= 0 || !e.ExplicitRecreation)) || (rowState == "unique_deleted" && rowCmp <= 0) {
 			rowCmp = -1
 		} else {
 			var exists int
@@ -830,6 +905,9 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 			}
 			if exists == 0 && e.Operation == "update" {
 				if err = insertRemoteWireRow(ctx, tx, d, e); err != nil {
+					if handled, result := handleManagedConstraint(ctx, tx, local, d, e, now, deferred, err); handled {
+						return result
+					}
 					if !isReplicationConstraint(err) {
 						return err
 					}
@@ -850,6 +928,9 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 			}
 			if exists == 0 && e.Operation == "insert" {
 				if err = insertRemoteWireRow(ctx, tx, d, e); err != nil {
+					if handled, result := handleManagedConstraint(ctx, tx, local, d, e, now, deferred, err); handled {
+						return result
+					}
 					return err
 				}
 				exists = 1
@@ -879,6 +960,9 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 					}
 					if !inserted {
 						if _, er = tx.ExecContext(ctx, `UPDATE `+quoteReplicationIdent(e.TableName)+` SET `+quoteReplicationIdent(n)+`=? WHERE `+whereSQL, append([]any{v}, args...)...); er != nil {
+							if handled, result := handleManagedConstraint(ctx, tx, local, d, e, now, deferred, er); handled {
+								return result
+							}
 							return er
 						}
 					}
@@ -915,6 +999,45 @@ func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer stri
 	}
 	return tx.Commit()
 }
+func (r *replicationRuntime) foreignKeyDependencyGap(ctx context.Context, origin string, first, last int64) (bool, error) {
+	if last < first {
+		return true, nil
+	}
+	var count int64
+	err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM replication_changes WHERE origin_node_uuid=? AND origin_counter BETWEEN ? AND ? AND apply_state='pending' AND quarantine_reason='foreign_key_dependency'`, origin, first, last).Scan(&count)
+	return count == last-first+1, err
+}
+
+func handleManagedConstraint(ctx context.Context, tx *sql.Tx, local string, d replicationTableDescriptor, e wireEvent, now string, deferred bool, constraintErr error) (bool, error) {
+	if d.Table.ConstraintPolicy != ReplicationConstraintsManaged {
+		return false, nil
+	}
+	reason := replicationConstraintReason(constraintErr)
+	if reason == "" {
+		return false, nil
+	}
+	if reason == "unique_conflict" {
+		return materializeManagedUniqueLWW(ctx, tx, local, d, e, now, constraintErr)
+	}
+	if deferred {
+		return true, nil
+	}
+	if _, err := tx.ExecContext(ctx, `ROLLBACK TO sqliteseal_materialize`); err != nil {
+		return true, err
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE sqliteseal_materialize`); err != nil {
+		return true, err
+	}
+	state := "pending"
+	if _, err := tx.ExecContext(ctx, `UPDATE replication_changes SET apply_state=?,quarantine_reason=? WHERE change_uuid=?`, state, reason, e.ChangeUUID); err != nil {
+		return true, err
+	}
+	if err := advanceRemoteCursor(ctx, tx, local, e.OriginNodeUUID, e.OriginCounter, now); err != nil {
+		return true, err
+	}
+	return true, tx.Commit()
+}
+
 func (r *replicationRuntime) recordRejectedEvent(ctx context.Context, peer string, e wireEvent, reason, existingHash string) error {
 	evidence := []byte(fmt.Sprintf(
 		`{"existing_payload_hash":%q,"received_payload_hash":%q}`,
@@ -936,7 +1059,20 @@ func (r *replicationRuntime) recordRejectedEvent(ctx context.Context, peer strin
 	return err
 }
 
+func expandWireEvent(d replicationTableDescriptor, e wireEvent) wireEvent {
+	for _, name := range d.Table.Columns {
+		if _, ok := e.Values[name]; !ok {
+			e.Values[name] = wireValue{Present: false, Type: "null"}
+		}
+	}
+	return e
+}
 func persistWirePayload(ctx context.Context, tx *sql.Tx, d replicationTableDescriptor, e wireEvent) error {
+	if e.StoredValuesJSON != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE replication_changes SET wire_values_json=? WHERE change_uuid=?`, e.StoredValuesJSON, e.ChangeUUID); err != nil {
+			return err
+		}
+	}
 	cols := []string{"change_uuid", "field_versions_json"}
 	marks := []string{"?", "?"}
 	args := []any{e.ChangeUUID, "{}"}

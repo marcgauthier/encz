@@ -3,6 +3,7 @@ package sqliteseal
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -17,6 +18,9 @@ func (r *replicationRuntime) ensureReplicationMetadataCompatibility(ctx context.
 		name  string
 		ddl   string
 	}{
+		{"replication_nodes", "node_level", `ALTER TABLE replication_nodes ADD COLUMN node_level INTEGER NOT NULL DEFAULT 0`},
+		{"replication_local_state", "schema_revision", `ALTER TABLE replication_local_state ADD COLUMN schema_revision INTEGER NOT NULL DEFAULT 1`},
+		{"replication_changes", "wire_values_json", `ALTER TABLE replication_changes ADD COLUMN wire_values_json TEXT`},
 		{"replication_local_state", "maximum_future_skew_us", `ALTER TABLE replication_local_state ADD COLUMN maximum_future_skew_us INTEGER NOT NULL DEFAULT 300000000`},
 		{"replication_snapshots", "baseline_cursors_uncompressed_bytes", `ALTER TABLE replication_snapshots ADD COLUMN baseline_cursors_uncompressed_bytes INTEGER NOT NULL DEFAULT 0`},
 		{"replication_snapshots", "snapshot_auth_mode", `ALTER TABLE replication_snapshots ADD COLUMN snapshot_auth_mode TEXT NOT NULL DEFAULT 'session'`},
@@ -37,7 +41,8 @@ func (r *replicationRuntime) ensureReplicationMetadataCompatibility(ctx context.
 			}
 		}
 	}
-	return nil
+	_, err := r.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS replication_schema_declarations(origin_node_uuid TEXT NOT NULL,schema_revision INTEGER NOT NULL,table_name TEXT NOT NULL,table_json TEXT NOT NULL,descriptor_json TEXT,updated_at_utc TEXT NOT NULL,PRIMARY KEY(origin_node_uuid,table_name)); CREATE TABLE IF NOT EXISTS replication_schema_conflicts(table_name TEXT NOT NULL,column_name TEXT NOT NULL,authority_level INTEGER NOT NULL,declared_types_json TEXT NOT NULL,origin_nodes_json TEXT NOT NULL,updated_at_utc TEXT NOT NULL,PRIMARY KEY(table_name,column_name));`)
+	return err
 }
 
 func replicationColumnExists(ctx context.Context, db interface {
@@ -109,6 +114,10 @@ func mergeRemoteHLC(ctx context.Context, tx *sql.Tx, physical, logical, nowUS in
 }
 
 func (r *replicationRuntime) withRemoteTransaction(ctx context.Context, fn func(*sql.Tx) error) error {
+	return r.withReplicationModeTransaction(ctx, "remote", fn)
+}
+
+func (r *replicationRuntime) withReplicationModeTransaction(ctx context.Context, mode string, fn func(*sql.Tx) error) error {
 	conn, err := r.db.Conn(ctx)
 	if err != nil {
 		return err
@@ -121,7 +130,7 @@ func (r *replicationRuntime) withRemoteTransaction(ctx context.Context, fn func(
 			return ErrReplicationNotReady
 		}
 		var modeErr error
-		restore, modeErr = setReplicationConnectionMode(sqlite, "remote")
+		restore, modeErr = setReplicationConnectionMode(sqlite, mode)
 		return modeErr
 	}); err != nil {
 		return err
@@ -170,7 +179,8 @@ func (r *replicationRuntime) deferOutOfOrderEvent(ctx context.Context, peer, loc
 func (r *replicationRuntime) loadStoredWireEvent(ctx context.Context, changeUUID string) (wireEvent, replicationTableDescriptor, error) {
 	var event wireEvent
 	var recreation int
-	err := r.db.QueryRowContext(ctx, `SELECT change_uuid,origin_node_uuid,origin_counter,operation,table_name,row_key_json,changed_fields_json,is_explicit_recreation,hlc_physical_utc_us,hlc_logical,schema_version,schema_hash,replication_domain,created_at_utc,payload_hash FROM replication_changes WHERE change_uuid=?`, changeUUID).Scan(&event.ChangeUUID, &event.OriginNodeUUID, &event.OriginCounter, &event.Operation, &event.TableName, &event.RowKeyJSON, &event.ChangedFieldsJSON, &recreation, &event.HLCPhysicalUS, &event.HLCLogical, &event.SchemaVersion, &event.SchemaHash, &event.Domain, &event.CreatedAtUTC, &event.PayloadHash)
+	var valuesJSON sql.NullString
+	err := r.db.QueryRowContext(ctx, `SELECT change_uuid,origin_node_uuid,origin_counter,operation,table_name,row_key_json,changed_fields_json,is_explicit_recreation,hlc_physical_utc_us,hlc_logical,schema_version,schema_hash,replication_domain,created_at_utc,payload_hash,wire_values_json FROM replication_changes WHERE change_uuid=?`, changeUUID).Scan(&event.ChangeUUID, &event.OriginNodeUUID, &event.OriginCounter, &event.Operation, &event.TableName, &event.RowKeyJSON, &event.ChangedFieldsJSON, &recreation, &event.HLCPhysicalUS, &event.HLCLogical, &event.SchemaVersion, &event.SchemaHash, &event.Domain, &event.CreatedAtUTC, &event.PayloadHash, &valuesJSON)
 	if err != nil {
 		return event, replicationTableDescriptor{}, err
 	}
@@ -178,6 +188,12 @@ func (r *replicationRuntime) loadStoredWireEvent(ctx context.Context, changeUUID
 	descriptor, err := r.descriptor(ctx, event.TableName)
 	if err != nil {
 		return event, descriptor, err
+	}
+	if valuesJSON.Valid {
+		if err = json.Unmarshal([]byte(valuesJSON.String), &event.Values); err != nil {
+			return event, descriptor, err
+		}
+		return event, descriptor, nil
 	}
 	columns := []string{}
 	for _, name := range descriptor.Table.Columns {

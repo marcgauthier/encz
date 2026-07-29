@@ -6,6 +6,13 @@
 
 `SQLiteSeal` is a Go driver for encrypted, zero-trust SQLite databases featuring built-in **masterless active-active replication**. Built on top of `github.com/mattn/go-sqlite3`, it adds transparent page-level encryption to SQLite database files, stores envelope-protected key material in a `*.encz` sidecar manifest, and enables decentralized, peer-to-peer multi-master synchronization across nodes without requiring a centralized primary or consensus server.
 
+> [!IMPORTANT]
+> SQLiteSeal's core use as an encrypted replacement for SQLite is stable and
+> suitable for production use when deployed according to the documented
+> operational and key-management requirements. The replication functions in
+> the Go package are still under active development and must not be used in
+> production yet.
+
 ## Documentation
 
 Detailed documentation guides are available in the [`documentation/`](documentation) directory:
@@ -213,12 +220,10 @@ func main() {
 	}
 	defer dbB.Close()
 
-	// Create identical application schema on both nodes
-	schema := `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);`
+	// Node A defines the table. Node B selects it for replication without
+	// creating it locally; schema negotiation creates it after the nodes connect.
+	schema := `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE);`
 	if _, err := dbA.Exec(schema); err != nil {
-		log.Fatal(err)
-	}
-	if _, err := dbB.Exec(schema); err != nil {
 		log.Fatal(err)
 	}
 
@@ -226,11 +231,12 @@ func main() {
 	err = dbA.InitializeReplication(ctx, sqliteseal.LocalNodeConfig{
 		NodeUUID:          nodeIDA,
 		NodeName:          "node-a",
+		Level:             0,
 		ReplicationDomain: "demo-domain",
 		ListenAddress:     "127.0.0.1:9444",
 		AuthMode:          sqliteseal.ReplicationAuthPSK,
 		CredentialName:    "demo-psk",
-	}, []sqliteseal.ReplicatedTable{{Name: "users"}})
+	}, []sqliteseal.ReplicatedTable{{Name: "users", ConstraintPolicy: sqliteseal.ReplicationConstraintsManaged}})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -239,11 +245,12 @@ func main() {
 	err = dbB.InitializeReplication(ctx, sqliteseal.LocalNodeConfig{
 		NodeUUID:          nodeIDB,
 		NodeName:          "node-b",
+		Level:             1,
 		ReplicationDomain: "demo-domain",
 		ListenAddress:     "127.0.0.1:9445",
 		AuthMode:          sqliteseal.ReplicationAuthPSK,
 		CredentialName:    "demo-psk",
-	}, []sqliteseal.ReplicatedTable{{Name: "users"}})
+	}, []sqliteseal.ReplicatedTable{{Name: "users", ConstraintPolicy: sqliteseal.ReplicationConstraintsManaged}})
 	if err != nil {
 		log.Fatal(err)
 	}

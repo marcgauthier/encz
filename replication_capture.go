@@ -22,7 +22,7 @@ func installCaptureSchema(ctx context.Context, tx *sql.Tx, d replicationTableDes
 		}
 		defs = append(defs, quoteReplicationIdent(n+"__value")+" "+typ, quoteReplicationIdent(n+"__present")+" INTEGER NOT NULL CHECK("+quoteReplicationIdent(n+"__present")+" IN(0,1))")
 	}
-	createSQL := "CREATE TABLE " + payload + "(" + strings.Join(defs, ",") + ")"
+	createSQL := "CREATE TABLE IF NOT EXISTS " + payload + "(" + strings.Join(defs, ",") + ")"
 	if _, err := tx.ExecContext(ctx, createSQL); err != nil {
 		return fmt.Errorf("create capture table for %s: %w", d.Table.Name, err)
 	}
@@ -101,6 +101,19 @@ func installCaptureSchema(ctx context.Context, tx *sql.Tx, d replicationTableDes
 		conditions = append(conditions, "OLD."+quoteReplicationIdent(n)+" IS NOT NEW."+quoteReplicationIdent(n))
 	}
 	return makeTrigger("update", "NEW", updateChanged(), " AND ("+strings.Join(conditions, " OR ")+")")
+}
+
+func dropCaptureTriggers(ctx context.Context, tx *sql.Tx, d replicationTableDescriptor) error {
+	names := []string{"insert", "update", "delete", "immutable_pk", "event_hash", "nfc_insert", "nfc_update"}
+	for _, column := range d.Table.Columns {
+		names = append(names, "fv_"+column)
+	}
+	for _, suffix := range names {
+		if _, err := tx.ExecContext(ctx, `DROP TRIGGER IF EXISTS `+quoteReplicationIdent("sqliteseal_"+d.DescriptorID+"_"+suffix)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func installEventHashTrigger(ctx context.Context, tx *sql.Tx, d replicationTableDescriptor, payload string) error {

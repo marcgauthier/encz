@@ -63,17 +63,21 @@ func TestReplicationMTLSEndToEndAndAdministrativePeerTest(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = db.Close() })
-		if _, err = db.Exec(`CREATE TABLE items(id TEXT PRIMARY KEY,name TEXT)`); err != nil {
+		ddl := `CREATE TABLE items(id TEXT PRIMARY KEY,name TEXT)`
+		if name == "mtls-b" {
+			ddl = `CREATE TABLE items(id TEXT PRIMARY KEY,name TEXT,note TEXT)`
+		}
+		if _, err = db.Exec(ddl); err != nil {
 			t.Fatal(err)
 		}
 		return db
 	}
 	a := open("mtls-a", certA)
 	b := open("mtls-b", certB)
-	if err := a.InitializeReplication(ctx, LocalNodeConfig{NodeUUID: nodeA, NodeName: "node-a", ReplicationDomain: domain, AuthMode: ReplicationAuthMTLS, CredentialName: "a-cert"}, []ReplicatedTable{{Name: "items"}}); err != nil {
+	if err := a.InitializeReplication(ctx, LocalNodeConfig{NodeUUID: nodeA, Level: 0, NodeName: "node-a", ReplicationDomain: domain, AuthMode: ReplicationAuthMTLS, CredentialName: "a-cert"}, []ReplicatedTable{{Name: "items"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.InitializeReplication(ctx, LocalNodeConfig{NodeUUID: nodeB, NodeName: "node-b", ReplicationDomain: domain, ListenAddress: address, AuthMode: ReplicationAuthMTLS, CredentialName: "b-cert"}, []ReplicatedTable{{Name: "items"}}); err != nil {
+	if err := b.InitializeReplication(ctx, LocalNodeConfig{NodeUUID: nodeB, Level: 1, NodeName: "node-b", ReplicationDomain: domain, ListenAddress: address, AuthMode: ReplicationAuthMTLS, CredentialName: "b-cert"}, []ReplicatedTable{{Name: "items"}}); err != nil {
 		t.Fatal(err)
 	}
 	statusA, err := a.ReplicationStatus(ctx)
@@ -91,8 +95,8 @@ func TestReplicationMTLSEndToEndAndAdministrativePeerTest(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := MembershipManifest{Epoch: 2, Domain: domain, PolicyHash: "mtls-policy", Nodes: []MembershipNode{
-		{NodeUUID: nodeA, IncarnationUUID: statusA.IncarnationUUID, State: "active", ListenEnabled: false, RoleByPeer: map[string]ReplicationConnectionRole{nodeB: ReplicationDial}},
-		{NodeUUID: nodeB, IncarnationUUID: statusB.IncarnationUUID, State: "active", ListenEnabled: true, RoleByPeer: map[string]ReplicationConnectionRole{nodeA: ReplicationAccept}},
+		{NodeUUID: nodeA, Level: 0, IncarnationUUID: statusA.IncarnationUUID, State: "active", ListenEnabled: false, RoleByPeer: map[string]ReplicationConnectionRole{nodeB: ReplicationDial}},
+		{NodeUUID: nodeB, Level: 1, IncarnationUUID: statusB.IncarnationUUID, State: "active", ListenEnabled: true, RoleByPeer: map[string]ReplicationConnectionRole{nodeA: ReplicationAccept}},
 	}}
 	if err = b.ApplyMembershipManifest(ctx, manifest); err != nil {
 		t.Fatal(err)
@@ -103,7 +107,10 @@ func TestReplicationMTLSEndToEndAndAdministrativePeerTest(t *testing.T) {
 	if err = a.TestReplicationPeer(ctx, nodeB); err != nil {
 		t.Fatalf("administrative mTLS test: %v", err)
 	}
-	if _, err = a.Exec(`INSERT INTO items VALUES('one','authenticated')`); err != nil {
+	if statusA.SchemaHash == statusB.SchemaHash {
+		t.Fatal("test peers unexpectedly began with the same schema hash")
+	}
+	if _, err = a.Exec(`INSERT INTO items(id,name) VALUES('one','authenticated')`); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(10 * time.Second)
@@ -117,6 +124,10 @@ func TestReplicationMTLSEndToEndAndAdministrativePeerTest(t *testing.T) {
 			t.Fatalf("mTLS replication did not converge: %v", err)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	found, err := replicationColumnExists(ctx, a, "items", "note")
+	if err != nil || !found {
+		t.Fatalf("negotiated column was not installed: found=%v err=%v", found, err)
 	}
 }
 

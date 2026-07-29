@@ -374,7 +374,7 @@ func (r *replicationRuntime) createTransferSnapshot(ctx context.Context) (replic
 	return r.snapshotByUUID(ctx, info.SnapshotUUID)
 }
 
-func validateSnapshotDocument(raw []byte, manifest replicationSnapshotManifest, expectedCreator, domain, membershipHash, schemaHash string, membershipEpoch, schemaVersion int64) (replicationSnapshotDocument, error) {
+func validateSnapshotDocument(raw []byte, manifest replicationSnapshotManifest, expectedCreator, domain, membershipHash, _ string, membershipEpoch, _ int64) (replicationSnapshotDocument, error) {
 	var document replicationSnapshotDocument
 	if len(raw) == 0 || len(raw) > maximumReplicationSnapshotBytes || int64(len(raw)) != manifest.ContentSizeBytes || snapshotHash(raw) != manifest.ContentHash {
 		return document, errors.New("replication: snapshot content integrity failure")
@@ -389,7 +389,7 @@ func validateSnapshotDocument(raw []byte, manifest replicationSnapshotManifest, 
 	if document.FormatVersion != replicationSnapshotFormatVersion || !isCanonicalUUID(document.SnapshotUUID) || document.SnapshotUUID != manifest.SnapshotUUID || document.CreatedByNodeUUID != expectedCreator || document.CreatedByNodeUUID != manifest.CreatedByNodeUUID {
 		return document, errors.New("replication: invalid snapshot identity")
 	}
-	if document.ReplicationDomain != domain || document.ReplicationDomain != manifest.ReplicationDomain || document.MembershipEpoch != membershipEpoch || document.MembershipEpoch != manifest.MembershipEpoch || document.MembershipManifestHash != membershipHash || document.MembershipManifestHash != manifest.MembershipManifestHash || document.SchemaVersion != schemaVersion || document.SchemaVersion != manifest.SchemaVersion || document.SchemaHash != schemaHash || document.SchemaHash != manifest.SchemaHash || document.CreatedAtUTC != manifest.CreatedAtUTC {
+	if document.ReplicationDomain != domain || document.ReplicationDomain != manifest.ReplicationDomain || document.MembershipEpoch != membershipEpoch || document.MembershipEpoch != manifest.MembershipEpoch || document.MembershipManifestHash != membershipHash || document.MembershipManifestHash != manifest.MembershipManifestHash || document.SchemaVersion != manifest.SchemaVersion || document.SchemaHash != manifest.SchemaHash || document.CreatedAtUTC != manifest.CreatedAtUTC {
 		return document, ErrReplicationSchemaMismatch
 	}
 	if _, err = time.Parse("2006-01-02T15:04:05.000000Z", document.CreatedAtUTC); err != nil {
@@ -455,7 +455,7 @@ func validateSnapshotStructure(document replicationSnapshotDocument, descriptors
 	}
 	for _, version := range document.RowVersions {
 		canonicalKey, err := canonicalJSON([]byte(version.RowKeyJSON))
-		if err != nil || string(canonicalKey) != version.RowKeyJSON || byTable[version.TableName].Table.Name == "" || version.RowState != "live" && version.RowState != "deleted" || version.HLCPhysicalUS <= 0 || version.HLCLogical < 0 || !isCanonicalUUID(version.OriginNodeUUID) || !isCanonicalUUID(version.ChangeUUID) {
+		if err != nil || string(canonicalKey) != version.RowKeyJSON || byTable[version.TableName].Table.Name == "" || version.RowState != "live" && version.RowState != "deleted" && version.RowState != "unique_deleted" || version.HLCPhysicalUS <= 0 || version.HLCLogical < 0 || !isCanonicalUUID(version.OriginNodeUUID) || !isCanonicalUUID(version.ChangeUUID) {
 			return errors.New("replication: invalid snapshot row version")
 		}
 	}
@@ -564,7 +564,7 @@ func (r *replicationRuntime) installSessionSnapshot(ctx context.Context, expecte
 			}
 		}
 		for _, version := range document.RowVersions {
-			if _, ok := byTable[version.TableName]; !ok || version.RowState != "live" && version.RowState != "deleted" {
+			if _, ok := byTable[version.TableName]; !ok || version.RowState != "live" && version.RowState != "deleted" && version.RowState != "unique_deleted" {
 				return errors.New("replication: invalid row version")
 			}
 			if _, insertErr := tx.ExecContext(ctx, `INSERT INTO replication_row_versions VALUES(?,?,?,?,?,?,?,?,?)`, version.TableName, version.RowKeyJSON, version.RowState, version.HLCPhysicalUS, version.HLCLogical, version.OriginNodeUUID, version.ChangeUUID, version.ChangedAtUTC, version.UpdatedAtUTC); insertErr != nil {
