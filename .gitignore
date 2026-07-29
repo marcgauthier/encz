@@ -1,0 +1,16 @@
+# Database and lock files generated during tests/benchmarks
+*.db
+*.db-wal
+*.db-shm
+*.db.encz
+*.db.encz.lock
+
+# Test outputs and coverage
+**/runs/
+coverage*.out
+
+# Binaries
+app-test/app-test
+app-test-replication/app-test-replication
+app-test-replication-10nodes/app-test-replication-10nodes
+app-test-replication-continuous/app-test-replication-continuous

@@ -65,18 +65,25 @@ canonical manifest and signature.
 
 - `ReplicationStatus` reports identity, schema and membership guards, effective
   listener address, peer sessions, cursors, gaps, and blocked state.
+- `ReplicationSyncStats` reports local generation counter and per-origin tracking cursors across all tracked peer origin nodes.
 - `PauseReplication` closes sessions while local writes continue to capture.
 - `ResumeReplication` restores listeners and dial workers.
 - `SyncReplicationPeer` wakes a configured peer immediately.
 - `WaitForReplication` waits for a durable contiguous origin counter and is
   useful for bounded read-your-write behavior.
-- `ReloadReplicationCredentials` closes existing sessions and forces them to
-  authenticate with newly supplied operator credentials.
+- `ReloadReplicationCredentials` closes existing sessions, rebuilds listeners, clears replay state, and forces re-authentication with newly supplied operator credentials.
+- `TestReplicationPeer` performs a TLS-bound administrative authentication, identity, membership, and schema check without registering a data session or exchanging events.
 
 Frames are canonical JSON objects encoded as independent gzip members with a
 four-byte big-endian compressed-length prefix. Production sessions require TLS. PSK sessions use mutual role-separated proofs over both fresh nonces, a server-issued session UUID, timestamps, membership and schema guards, and TLS exporter material. Authentication transcripts are freshness-checked and replay-cached. mTLS sessions additionally require explicit certificate-to-node authorization. Received events must come directly
 from their authenticated origin. Duplicate delivery is idempotent, and
 per-field winners compare HLC physical time, logical time, then origin UUID.
+
+Each authenticated synchronization round exchanges the complete per-origin cursor vector and bounded durable gap requests. Above-gap events remain durable in `pending` state and are materialized only after the missing prefix commits. Responses are batch-bounded and advertise continuation with `more`. When retained history cannot fill a requested range, the peers create and transfer a fresh consistent logical snapshot in bounded, individually hashed chunks. The receiver verifies the canonical content hash, session-authenticated creator, membership and schema guards before atomically installing application rows, field versions, tombstones, and baseline cursors. A snapshot cannot be created while local gaps remain and cannot overwrite a node that has produced local-origin history.
+
+## Snapshots
+
+`CreateReplicationSnapshot` creates a ready session-authenticated logical snapshot and returns its identity, schema hash, content hash, creation time, and uncompressed size. Snapshot files are stored beside the database under the `.replication-snapshots` directory and referenced from `replication_snapshots.storage_uri`. Normal peer synchronization automatically creates and installs a fresh snapshot when retained events cannot repair a cursor. Manual/offline export and `external_signature` import remain a separate phase.
 
 ## Two-node verifier
 

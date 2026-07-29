@@ -28,6 +28,10 @@ type replicationAuthTranscript struct {
 }
 
 func (r *replicationRuntime) handshake(connection net.Conn, outbound bool, expected string) (wireHello, error) {
+	return r.handshakePurpose(connection, outbound, expected, false)
+}
+
+func (r *replicationRuntime) handshakePurpose(connection net.Conn, outbound bool, expected string, administrativeTest bool) (wireHello, error) {
 	ctx, cancel := context.WithTimeout(r.ctx, 10*time.Second)
 	defer cancel()
 	_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
@@ -44,6 +48,7 @@ func (r *replicationRuntime) handshake(connection net.Conn, outbound bool, expec
 	var peer wireHello
 	if outbound {
 		initiator, err := r.newAuthHello(ctx, "")
+		initiator.AdministrativeTest = administrativeTest
 		if err != nil {
 			return peer, err
 		}
@@ -61,6 +66,9 @@ func (r *replicationRuntime) handshake(connection net.Conn, outbound bool, expec
 		credential, mode, err := r.validatePeerHello(ctx, tlsConnection, peer, expected)
 		if err != nil {
 			return peer, err
+		}
+		if peer.AdministrativeTest != administrativeTest {
+			return peer, errors.New("replication: authentication purpose mismatch")
 		}
 		if !isCanonicalUUID(peer.SessionUUID) {
 			return peer, errors.New("replication: invalid session identity")
@@ -102,6 +110,7 @@ func (r *replicationRuntime) handshake(connection net.Conn, outbound bool, expec
 			return peer, err
 		}
 		acceptor, err := r.newAuthHello(ctx, replicationUUID())
+		acceptor.AdministrativeTest = peer.AdministrativeTest
 		if err != nil {
 			return peer, err
 		}
@@ -205,7 +214,7 @@ func (r *replicationRuntime) validatePeerHello(ctx context.Context, connection *
 }
 
 func sameAuthenticationIdentity(first, second wireHello) bool {
-	return first.Protocol == second.Protocol && first.NodeUUID == second.NodeUUID && first.IncarnationUUID == second.IncarnationUUID && first.Domain == second.Domain && first.SchemaVersion == second.SchemaVersion && first.SchemaHash == second.SchemaHash && first.MembershipEpoch == second.MembershipEpoch && first.MembershipHash == second.MembershipHash && first.Nonce == second.Nonce && first.SentAtUTC == second.SentAtUTC
+	return first.Protocol == second.Protocol && first.NodeUUID == second.NodeUUID && first.IncarnationUUID == second.IncarnationUUID && first.Domain == second.Domain && first.SchemaVersion == second.SchemaVersion && first.SchemaHash == second.SchemaHash && first.MembershipEpoch == second.MembershipEpoch && first.MembershipHash == second.MembershipHash && first.Nonce == second.Nonce && first.SentAtUTC == second.SentAtUTC && first.AdministrativeTest == second.AdministrativeTest
 }
 
 func authenticationTranscript(connection *tls.Conn, initiator, acceptor wireHello) ([]byte, error) {

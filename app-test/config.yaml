@@ -1,0 +1,26 @@
+# Leave duration empty to run until Ctrl-C.
+duration: ""
+workers: 8
+operations_per_second: 100
+rows_per_table: 2000
+initial_rows_per_table: 20
+seed: 20260725
+
+database_file: live.db
+master_key: "SQLiteSeal-live-test-key-change-me-2026"
+cipher: aes-256-gcm
+journal_mode: WAL
+busy_timeout: 5s
+decrypted_page_cache: 128MB
+
+progress_interval: 1s
+audit_interval: 1m
+reopen_interval: 5m
+backup_interval: 10m
+rekey_interval: 15m
+
+workload:
+  insert_pct: 20
+  update_pct: 25
+  select_pct: 35
+  join_pct: 20

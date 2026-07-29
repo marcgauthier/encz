@@ -79,6 +79,15 @@ func (r *replicationRuntime) validateIdentityGuard() error {
 	return nil
 }
 func (r *replicationRuntime) updateIdentityGuard() error {
+	var node string
+	if err := r.db.QueryRow(`SELECT local_node_uuid FROM replication_local_state`).Scan(&node); err != nil {
+		return err
+	}
+	if value, ok := replicationGuardWriters.Load(node); ok {
+		writer := value.(*replicationGuardWriter)
+		writer.mu.Lock()
+		defer writer.mu.Unlock()
+	}
 	var g replicationIdentityGuard
 	if err := r.db.QueryRow(`SELECT local_node_uuid,local_incarnation_uuid,database_generation,last_origin_counter FROM replication_local_state`).Scan(&g.NodeUUID, &g.IncarnationUUID, &g.DatabaseGeneration, &g.Counter); err != nil {
 		return err

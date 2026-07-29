@@ -10,7 +10,7 @@ import (
 
 func TestReplicationFrameRoundTripAndLimits(t *testing.T) {
 	var b bytes.Buffer
-	want := wireMessage{Type: "pull", Since: 7}
+	want := wireMessage{Type: "sync_request", Cursors: []wireCursor{{OriginNodeUUID: "node-a", ContiguousCounter: 7, HighestSeenCounter: 9}}}
 	if err := writeReplicationFrame(&b, want, 1024); err != nil {
 		t.Fatal(err)
 	}
@@ -18,7 +18,7 @@ func TestReplicationFrameRoundTripAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Type != want.Type || got.Since != 7 {
+	if got.Type != want.Type || len(got.Cursors) != 1 || got.Cursors[0].ContiguousCounter != 7 {
 		t.Fatalf("got %+v", got)
 	}
 	var oversized bytes.Buffer

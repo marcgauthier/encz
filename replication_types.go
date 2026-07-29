@@ -19,6 +19,7 @@ var (
 	ErrReplicationPeerNotFound       = errors.New("sqliteseal: replication peer not found")
 	ErrReplicationNotReady           = errors.New("sqliteseal: replication is not ready")
 	ErrReplicationEventQuarantined   = errors.New("sqliteseal: replication event is quarantined")
+	ErrReplicationSnapshotRequired   = errors.New("sqliteseal: replication snapshot is required")
 )
 
 type ReplicationAuthMode string
@@ -107,4 +108,17 @@ type ReplicationSnapshotInfo struct {
 	SnapshotUUID, SchemaHash, ContentHash string
 	CreatedAt                             time.Time
 	SizeBytes                             int64
+}
+
+type ReplicationOriginProgress struct {
+	OriginNodeUUID     string `json:"origin_node_uuid"`
+	ContiguousCounter  int64  `json:"contiguous_counter"`
+	HighestSeenCounter int64  `json:"highest_seen_counter"`
+	GapCount           int64  `json:"gap_count"`
+}
+
+type ReplicationSyncStats struct {
+	LocalNodeUUID     string                      `json:"local_node_uuid"`
+	LastOriginCounter int64                       `json:"last_origin_counter"`
+	PeerCursors       []ReplicationOriginProgress `json:"peer_cursors"`
 }

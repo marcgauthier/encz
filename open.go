@@ -20,6 +20,8 @@ type DB struct {
 	replication    *replicationRuntime
 }
 
+const defaultReplicationBusyTimeoutMillis = 30_000
+
 func OpenWithOptions(path string, opts Options) (*DB, error) {
 	if err := mustRegister(); err != nil {
 		return nil, err
@@ -27,6 +29,10 @@ func OpenWithOptions(path string, opts Options) (*DB, error) {
 	resolved, manifestPath, registryHandle, err := resolveOpenOptions(path, opts)
 	if err != nil {
 		return nil, err
+	}
+	if resolved.BusyTimeoutMillis == nil && opts.Replication != nil {
+		timeout := defaultReplicationBusyTimeoutMillis
+		resolved.BusyTimeoutMillis = &timeout
 	}
 	sqlDB, err := openSQLDB(buildDSN(path, resolved))
 	if err != nil {

@@ -3,6 +3,7 @@ package sqliteseal
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -294,7 +295,7 @@ func (db *DB) ReplicationStatus(ctx context.Context) (ReplicationStatus, error) 
 	}
 	s.Initialized = true
 	s.Ready = s.NetworkEnabled && s.BlockedReason == ""
-	rows, err := db.QueryContext(ctx, `SELECT p.peer_node_uuid,p.session_state,coalesce(p.last_error,''),coalesce(c.contiguous_counter,0),coalesce(c.highest_seen_counter,0),(SELECT count(*) FROM replication_origin_gaps g WHERE g.origin_node_uuid=p.peer_node_uuid) FROM replication_peer_connections p LEFT JOIN replication_origin_cursors c ON c.origin_node_uuid=p.peer_node_uuid`)
+	rows, err := db.QueryContext(ctx, `SELECT p.peer_node_uuid,p.session_state,coalesce(p.last_error,''),coalesce(c.contiguous_counter,0),coalesce(c.highest_seen_counter,0),(SELECT count(*) FROM replication_origin_gaps g WHERE g.tracking_node_uuid=l.local_node_uuid AND g.origin_node_uuid=p.peer_node_uuid) FROM replication_peer_connections p CROSS JOIN replication_local_state l LEFT JOIN replication_origin_cursors c ON c.tracking_node_uuid=l.local_node_uuid AND c.origin_node_uuid=p.peer_node_uuid`)
 	if err != nil {
 		return s, err
 	}
@@ -308,19 +309,64 @@ func (db *DB) ReplicationStatus(ctx context.Context) (ReplicationStatus, error) 
 	}
 	return s, rows.Err()
 }
+
+func (db *DB) ReplicationSyncStats(ctx context.Context) (ReplicationSyncStats, error) {
+	var st ReplicationSyncStats
+	err := db.QueryRowContext(ctx, `SELECT local_node_uuid, last_origin_counter FROM replication_local_state WHERE state_id=1`).Scan(&st.LocalNodeUUID, &st.LastOriginCounter)
+	if err == sql.ErrNoRows {
+		return st, ErrReplicationNotInitialized
+	}
+	if err != nil {
+		return st, err
+	}
+	rows, err := db.QueryContext(ctx, `SELECT c.origin_node_uuid, c.contiguous_counter, c.highest_seen_counter, (SELECT count(*) FROM replication_origin_gaps g WHERE g.tracking_node_uuid=c.tracking_node_uuid AND g.origin_node_uuid=c.origin_node_uuid) FROM replication_origin_cursors c WHERE c.tracking_node_uuid=? ORDER BY c.origin_node_uuid`, st.LocalNodeUUID)
+	if err != nil {
+		return st, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p ReplicationOriginProgress
+		if err = rows.Scan(&p.OriginNodeUUID, &p.ContiguousCounter, &p.HighestSeenCounter, &p.GapCount); err != nil {
+			return st, err
+		}
+		st.PeerCursors = append(st.PeerCursors, p)
+	}
+	return st, rows.Err()
+}
 func (db *DB) TestReplicationPeer(ctx context.Context, node string) error {
-	var addr string
-	if err := db.QueryRowContext(ctx, `SELECT address FROM replication_peer_connections WHERE peer_node_uuid=?`, node).Scan(&addr); err == sql.ErrNoRows {
+	if db.replication == nil || db.replication.opts == nil || db.replication.opts.Credentials == nil {
+		return ErrReplicationNotReady
+	}
+	var address, credential string
+	var timeoutMS int64
+	if err := db.QueryRowContext(ctx, `SELECT p.address,n.credential_name,p.connect_timeout_ms FROM replication_peer_connections p JOIN replication_nodes n ON n.node_uuid=p.peer_node_uuid WHERE p.peer_node_uuid=?`, node).Scan(&address, &credential, &timeoutMS); err == sql.ErrNoRows {
 		return ErrReplicationPeerNotFound
 	} else if err != nil {
 		return err
 	}
-	d := net.Dialer{Timeout: 5 * time.Second}
-	c, err := d.DialContext(ctx, "tcp", addr)
+	configuration, err := db.replication.opts.Credentials.TLSConfig(ctx, credential, false)
 	if err != nil {
 		return err
 	}
-	return c.Close()
+	timeout := time.Duration(timeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	dialer := net.Dialer{Timeout: timeout}
+	raw, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return err
+	}
+	tlsConnection := tls.Client(raw, configuration.Clone())
+	defer tlsConnection.Close()
+	peer, err := db.replication.handshakePurpose(tlsConnection, true, node, true)
+	if err != nil {
+		return err
+	}
+	if !peer.AdministrativeTest || peer.NodeUUID != node {
+		return errors.New("replication: administrative peer identity mismatch")
+	}
+	return nil
 }
 func (db *DB) ReloadReplicationCredentials(context.Context) error {
 	if db.replication.opts == nil || db.replication.opts.Credentials == nil {

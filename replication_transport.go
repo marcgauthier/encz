@@ -25,18 +25,19 @@ import (
 const replicationProtocolVersion = 1
 
 type wireHello struct {
-	Protocol        int    `json:"protocol"`
-	NodeUUID        string `json:"node_uuid"`
-	IncarnationUUID string `json:"incarnation_uuid"`
-	Domain          string `json:"domain"`
-	SchemaVersion   int64  `json:"schema_version"`
-	SchemaHash      string `json:"schema_hash"`
-	MembershipEpoch int64  `json:"membership_epoch"`
-	MembershipHash  string `json:"membership_hash"`
-	Nonce           string `json:"nonce"`
-	SessionUUID     string `json:"session_uuid,omitempty"`
-	SentAtUTC       string `json:"sent_at_utc"`
-	Proof           string `json:"proof,omitempty"`
+	Protocol           int    `json:"protocol"`
+	NodeUUID           string `json:"node_uuid"`
+	IncarnationUUID    string `json:"incarnation_uuid"`
+	Domain             string `json:"domain"`
+	SchemaVersion      int64  `json:"schema_version"`
+	SchemaHash         string `json:"schema_hash"`
+	MembershipEpoch    int64  `json:"membership_epoch"`
+	MembershipHash     string `json:"membership_hash"`
+	Nonce              string `json:"nonce"`
+	SessionUUID        string `json:"session_uuid,omitempty"`
+	SentAtUTC          string `json:"sent_at_utc"`
+	AdministrativeTest bool   `json:"administrative_test,omitempty"`
+	Proof              string `json:"proof,omitempty"`
 }
 type wireValue struct {
 	Present bool   `json:"present"`
@@ -61,13 +62,37 @@ type wireEvent struct {
 	PayloadHash        string               `json:"payload_hash"`
 	Values             map[string]wireValue `json:"values"`
 }
+type wireCursor struct {
+	OriginNodeUUID          string `json:"origin_node_uuid"`
+	ContiguousCounter       int64  `json:"contiguous_counter"`
+	HighestSeenCounter      int64  `json:"highest_seen_counter"`
+	EarliestRetainedCounter int64  `json:"earliest_retained_counter,omitempty"`
+	BaselineSnapshotUUID    string `json:"baseline_snapshot_uuid,omitempty"`
+	RequiresSnapshot        bool   `json:"requires_snapshot,omitempty"`
+}
+type wireGap struct {
+	OriginNodeUUID string `json:"origin_node_uuid"`
+	StartCounter   int64  `json:"start_counter"`
+	EndCounter     int64  `json:"end_counter"`
+}
+type wireSnapshotChunk struct {
+	SnapshotUUID string `json:"snapshot_uuid"`
+	Offset       int64  `json:"offset"`
+	Data         []byte `json:"data,omitempty"`
+	ChunkHash    string `json:"chunk_hash,omitempty"`
+	Done         bool   `json:"done,omitempty"`
+}
 type wireMessage struct {
-	Type   string      `json:"type"`
-	Hello  *wireHello  `json:"hello,omitempty"`
-	Since  int64       `json:"since,omitempty"`
-	Cursor int64       `json:"cursor,omitempty"`
-	Events []wireEvent `json:"events,omitempty"`
-	Error  string      `json:"error,omitempty"`
+	Type             string                       `json:"type"`
+	Hello            *wireHello                   `json:"hello,omitempty"`
+	Cursors          []wireCursor                 `json:"cursors,omitempty"`
+	Gaps             []wireGap                    `json:"gaps,omitempty"`
+	Events           []wireEvent                  `json:"events,omitempty"`
+	More             bool                         `json:"more,omitempty"`
+	SnapshotRequired bool                         `json:"snapshot_required,omitempty"`
+	Snapshot         *replicationSnapshotManifest `json:"snapshot,omitempty"`
+	SnapshotChunk    *wireSnapshotChunk           `json:"snapshot_chunk,omitempty"`
+	Error            string                       `json:"error,omitempty"`
 }
 type peerRuntimeConfig struct {
 	NodeUUID, IncarnationUUID, Address, CredentialName string
@@ -152,9 +177,13 @@ func (r *replicationRuntime) acceptLoop(ln net.Listener) {
 				r.log("replication inbound handshake: %v", err)
 				return
 			}
+			if peer.AdministrativeTest {
+				r.log("replication administrative authentication succeeded for %s", peer.NodeUUID)
+				return
+			}
 			r.setPeerAuthenticated(peer.NodeUUID, peer.SessionUUID)
 			r.trackConnection(peer.NodeUUID, c, true)
-			defer r.trackConnection(peer.NodeUUID, nil, false)
+			defer r.trackConnection(peer.NodeUUID, c, false)
 			_ = r.serveSession(c, peer)
 		}()
 	}
@@ -192,8 +221,9 @@ func (r *replicationRuntime) dialLoop(p peerRuntimeConfig) {
 					if err == nil {
 						r.trackConnection(p.NodeUUID, tc, true)
 						r.setPeerAuthenticated(p.NodeUUID, peer.SessionUUID)
+						backoff = time.Second
 						err = r.clientSession(tc, peer, p)
-						r.trackConnection(p.NodeUUID, nil, false)
+						r.trackConnection(p.NodeUUID, tc, false)
 					}
 				}
 				_ = tc.Close()
@@ -257,8 +287,15 @@ func (r *replicationRuntime) clientSession(c net.Conn, peer wireHello, p peerRun
 	}
 }
 func (r *replicationRuntime) syncCycle(c net.Conn, peer string, p peerRuntimeConfig) error {
-	since, _ := r.cursorFor(peer)
-	if err := writeReplicationFrame(c, wireMessage{Type: "pull", Since: since}, p.MaxCompressed); err != nil {
+	vector, err := r.buildCursorVector(r.ctx)
+	if err != nil {
+		return err
+	}
+	gaps, err := r.localGapRequests(r.ctx, peer)
+	if err != nil {
+		return err
+	}
+	if err = writeReplicationFrame(c, wireMessage{Type: "sync_request", Cursors: vector, Gaps: gaps}, p.MaxCompressed); err != nil {
 		return err
 	}
 	resp, err := readReplicationFrame(c, p.MaxCompressed, p.MaxUncompressed)
@@ -268,26 +305,81 @@ func (r *replicationRuntime) syncCycle(c net.Conn, peer string, p peerRuntimeCon
 	if resp.Error != "" {
 		return errors.New(resp.Error)
 	}
-	for i := range resp.Events {
-		if err = r.applyRemoteEvent(r.ctx, peer, resp.Events[i]); err != nil {
+	if resp.Type != "sync_response" {
+		return errors.New("replication: invalid synchronization response")
+	}
+	if err = r.persistPeerCursorVector(r.ctx, peer, resp.Cursors); err != nil {
+		return err
+	}
+	if resp.SnapshotRequired {
+		if resp.Snapshot == nil {
+			return ErrReplicationSnapshotRequired
+		}
+		raw, fetchErr := requestSnapshotChunks(c, *resp.Snapshot, p.MaxCompressed, p.MaxUncompressed)
+		if fetchErr != nil {
+			return fetchErr
+		}
+		if err = r.installSessionSnapshot(r.ctx, peer, *resp.Snapshot, raw); err != nil {
 			return err
 		}
+		return nil
 	}
-	localEvents, err := r.loadOriginEvents(r.ctx, resp.Cursor, p.MaxBatch)
+	if err = r.applyRemoteEvents(r.ctx, peer, resp.Events); err != nil {
+		return err
+	}
+	if err = r.recoverDeferredEvents(r.ctx); err != nil {
+		return err
+	}
+	vector, err = r.buildCursorVector(r.ctx)
 	if err != nil {
 		return err
 	}
-	if err = writeReplicationFrame(c, wireMessage{Type: "push", Events: localEvents}, p.MaxCompressed); err != nil {
+	var local string
+	if err = r.db.QueryRowContext(r.ctx, `SELECT local_node_uuid FROM replication_local_state`).Scan(&local); err != nil {
+		return err
+	}
+	peerCursor := cursorFromVector(resp.Cursors, local)
+	snapshotRequired, err := r.localHistoryUnavailable(r.ctx, peerCursor.ContiguousCounter, resp.Gaps)
+	if err != nil {
+		return err
+	}
+	localEvents, err := r.loadOriginEvents(r.ctx, peerCursor.ContiguousCounter, p.MaxBatch)
+	if err != nil {
+		return err
+	}
+	var uploadManifest *replicationSnapshotManifest
+	var uploadRaw []byte
+	if snapshotRequired {
+		manifest, raw, snapshotErr := r.createTransferSnapshot(r.ctx)
+		if snapshotErr != nil {
+			return snapshotErr
+		}
+		uploadManifest, uploadRaw = &manifest, raw
+	}
+	push := wireMessage{Type: "sync_push", Cursors: vector, Events: localEvents, Gaps: resp.Gaps, More: moreOriginEvents(localEvents, vector, local), SnapshotRequired: snapshotRequired, Snapshot: uploadManifest}
+	if err = writeReplicationFrame(c, push, p.MaxCompressed); err != nil {
 		return err
 	}
 	ack, err := readReplicationFrame(c, p.MaxCompressed, p.MaxUncompressed)
 	if err != nil {
 		return err
 	}
+	if snapshotRequired && ack.Type == "snapshot_fetch" {
+		ack, err = answerSnapshotFetch(c, ack, *uploadManifest, uploadRaw, p.MaxCompressed, p.MaxUncompressed)
+		if err != nil {
+			return err
+		}
+	}
 	if ack.Error != "" {
 		return errors.New(ack.Error)
 	}
-	return r.recordPeerAck(peer, ack.Cursor)
+	if ack.Type != "sync_ack" {
+		return errors.New("replication: invalid synchronization acknowledgment")
+	}
+	if err = r.persistPeerCursorVector(r.ctx, peer, ack.Cursors); err != nil {
+		return err
+	}
+	return r.recordPeerAck(peer, cursorFromVector(ack.Cursors, local).ContiguousCounter)
 }
 func (r *replicationRuntime) serveSession(c net.Conn, peer wireHello) error {
 	for {
@@ -296,26 +388,81 @@ func (r *replicationRuntime) serveSession(c net.Conn, peer wireHello) error {
 			return err
 		}
 		switch msg.Type {
-		case "pull":
-			events, e := r.loadOriginEvents(r.ctx, msg.Since, 500)
-			cur, _ := r.cursorFor(peer.NodeUUID)
+		case "sync_request":
+			if err = r.persistPeerCursorVector(r.ctx, peer.NodeUUID, msg.Cursors); err != nil {
+				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, 8<<20)
+				return err
+			}
+			var local string
+			if err = r.db.QueryRowContext(r.ctx, `SELECT local_node_uuid FROM replication_local_state`).Scan(&local); err != nil {
+				return err
+			}
+			requested := cursorFromVector(msg.Cursors, local)
+			snapshotRequired, e := r.localHistoryUnavailable(r.ctx, requested.ContiguousCounter, msg.Gaps)
+			vector, vectorErr := r.buildCursorVector(r.ctx)
+			if e == nil {
+				e = vectorErr
+			}
+			var events []wireEvent
+			var snapshotManifest *replicationSnapshotManifest
+			var snapshotRaw []byte
+			if e == nil && !snapshotRequired {
+				events, e = r.loadOriginEvents(r.ctx, requested.ContiguousCounter, 500)
+			} else if e == nil {
+				manifest, raw, snapshotErr := r.createTransferSnapshot(r.ctx)
+				if snapshotErr != nil {
+					e = snapshotErr
+				} else {
+					snapshotManifest, snapshotRaw = &manifest, raw
+				}
+			}
+			gaps, gapErr := r.localGapRequests(r.ctx, peer.NodeUUID)
+			if e == nil {
+				e = gapErr
+			}
 			if e != nil {
 				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: e.Error()}, 8<<20)
 			} else {
-				e = writeReplicationFrame(c, wireMessage{Type: "events", Events: events, Cursor: cur}, 8<<20)
+				e = writeReplicationFrame(c, wireMessage{Type: "sync_response", Cursors: vector, Gaps: gaps, Events: events, More: moreOriginEvents(events, vector, local), SnapshotRequired: snapshotRequired, Snapshot: snapshotManifest}, 8<<20)
 			}
 			if e != nil {
 				return e
 			}
-		case "push":
-			for i := range msg.Events {
-				if err = r.applyRemoteEvent(r.ctx, peer.NodeUUID, msg.Events[i]); err != nil {
+			if snapshotRequired {
+				if e = provideSnapshotChunks(c, *snapshotManifest, snapshotRaw, 8<<20, 32<<20); e != nil {
+					return e
+				}
+			}
+		case "sync_push":
+			if err = r.persistPeerCursorVector(r.ctx, peer.NodeUUID, msg.Cursors); err != nil {
+				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, 8<<20)
+				return err
+			}
+			if msg.SnapshotRequired {
+				if msg.Snapshot == nil {
+					return errors.New("replication: snapshot offer is missing")
+				}
+				raw, receiveErr := requestSnapshotChunks(c, *msg.Snapshot, 8<<20, 32<<20)
+				if receiveErr != nil {
+					return receiveErr
+				}
+				if err = r.installSessionSnapshot(r.ctx, peer.NodeUUID, *msg.Snapshot, raw); err != nil {
+					return err
+				}
+			} else {
+				if err = r.applyRemoteEvents(r.ctx, peer.NodeUUID, msg.Events); err != nil {
 					_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, 8<<20)
 					return err
 				}
+				if err = r.recoverDeferredEvents(r.ctx); err != nil {
+					return err
+				}
 			}
-			cur, _ := r.cursorFor(peer.NodeUUID)
-			if err = writeReplicationFrame(c, wireMessage{Type: "ack", Cursor: cur}, 8<<20); err != nil {
+			vector, e := r.buildCursorVector(r.ctx)
+			if e != nil {
+				return e
+			}
+			if err = writeReplicationFrame(c, wireMessage{Type: "sync_ack", Cursors: vector}, 8<<20); err != nil {
 				return err
 			}
 		default:
@@ -540,6 +687,12 @@ func compareReplicationVersion(ph, ll int64, origin string, cph, cll int64, cori
 func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, e wireEvent) error {
 	r.writer.Lock()
 	defer r.writer.Unlock()
+	return retryReplicationBusy(ctx, func() error {
+		return r.applyRemoteEventOnce(ctx, peer, e)
+	})
+}
+
+func (r *replicationRuntime) applyRemoteEventOnce(ctx context.Context, peer string, e wireEvent) error {
 	var domain, schema, local string
 	var version int64
 	if err := r.db.QueryRowContext(ctx, `SELECT replication_domain,schema_hash,schema_version,local_node_uuid FROM replication_local_state`).Scan(&domain, &schema, &version, &local); err != nil {
@@ -565,6 +718,11 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 		return err
 	}
 	future := e.HLCPhysicalUS > time.Now().UTC().Add(skew).UnixMicro()
+	contiguous, err := r.cursorFor(e.OriginNodeUUID)
+	if err != nil {
+		return err
+	}
+	deferred := false
 	var existing, existingState string
 	err = r.db.QueryRowContext(ctx, `SELECT payload_hash,apply_state FROM replication_changes WHERE origin_node_uuid=? AND origin_counter=?`, e.OriginNodeUUID, e.OriginCounter).Scan(&existing, &existingState)
 	if err == nil {
@@ -578,9 +736,10 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 			if existingState == "quarantined" && future {
 				return fmt.Errorf("%w: future_clock", ErrReplicationEventQuarantined)
 			}
-			if err = r.removeDeferredEvent(ctx, d, e.ChangeUUID); err != nil {
-				return err
+			if existingState == "pending" && e.OriginCounter > contiguous+1 {
+				return nil
 			}
+			deferred = true
 		} else {
 			tx, beginErr := r.db.BeginTx(ctx, nil)
 			if beginErr != nil {
@@ -598,6 +757,9 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 	}
 	if future {
 		return r.quarantineRemoteEvent(ctx, peer, local, d, e, "future_clock")
+	}
+	if e.OriginCounter > contiguous+1 {
+		return r.deferOutOfOrderEvent(ctx, peer, local, d, e)
 	}
 	conn, err := r.db.Conn(ctx)
 	if err != nil {
@@ -623,11 +785,13 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
-	if _, err = tx.ExecContext(ctx, `INSERT INTO replication_changes(change_uuid,origin_node_uuid,origin_counter,operation,table_name,row_key_json,changed_fields_json,is_explicit_recreation,hlc_physical_utc_us,hlc_logical,schema_version,schema_hash,replication_domain,created_at_utc,stored_at_utc,source_node_uuid,payload_hash,apply_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')`, e.ChangeUUID, e.OriginNodeUUID, e.OriginCounter, e.Operation, e.TableName, e.RowKeyJSON, e.ChangedFieldsJSON, boolInt(e.ExplicitRecreation), e.HLCPhysicalUS, e.HLCLogical, e.SchemaVersion, e.SchemaHash, e.Domain, e.CreatedAtUTC, now, peer, e.PayloadHash); err != nil {
-		return err
-	}
-	if err = persistWirePayload(ctx, tx, d, e); err != nil {
-		return err
+	if !deferred {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO replication_changes(change_uuid,origin_node_uuid,origin_counter,operation,table_name,row_key_json,changed_fields_json,is_explicit_recreation,hlc_physical_utc_us,hlc_logical,schema_version,schema_hash,replication_domain,created_at_utc,stored_at_utc,source_node_uuid,payload_hash,apply_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')`, e.ChangeUUID, e.OriginNodeUUID, e.OriginCounter, e.Operation, e.TableName, e.RowKeyJSON, e.ChangedFieldsJSON, boolInt(e.ExplicitRecreation), e.HLCPhysicalUS, e.HLCLogical, e.SchemaVersion, e.SchemaHash, e.Domain, e.CreatedAtUTC, now, peer, e.PayloadHash); err != nil {
+			return err
+		}
+		if err = persistWirePayload(ctx, tx, d, e); err != nil {
+			return err
+		}
 	}
 	_, args, err := wireKey(d, e)
 	if err != nil {
@@ -656,6 +820,7 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 			applied = true
 		}
 	} else {
+		inserted := false
 		if rowState == "deleted" && (rowCmp <= 0 || !e.ExplicitRecreation) {
 			rowCmp = -1
 		} else {
@@ -663,24 +828,32 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 			if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM `+quoteReplicationIdent(e.TableName)+` WHERE `+whereSQL, args...).Scan(&exists); err != nil {
 				return err
 			}
-			if exists == 0 && e.Operation == "insert" {
-				cols := []string{}
-				marks := []string{}
-				vargs := []any{}
-				for _, n := range d.Table.Columns {
-					w := e.Values[n]
-					v, er := decodeWireValue(w)
-					if er != nil {
-						return er
+			if exists == 0 && e.Operation == "update" {
+				if err = insertRemoteWireRow(ctx, tx, d, e); err != nil {
+					if !isReplicationConstraint(err) {
+						return err
 					}
-					cols = append(cols, quoteReplicationIdent(n))
-					marks = append(marks, "?")
-					vargs = append(vargs, v)
+					if deferred {
+						return nil
+					}
+					if _, err = tx.ExecContext(ctx, `UPDATE replication_changes SET quarantine_reason='missing_base_row' WHERE change_uuid=?`, e.ChangeUUID); err != nil {
+						return err
+					}
+					if err = advanceRemoteCursor(ctx, tx, local, e.OriginNodeUUID, e.OriginCounter, now); err != nil {
+						return err
+					}
+					return tx.Commit()
 				}
-				if _, err = tx.ExecContext(ctx, `INSERT INTO `+quoteReplicationIdent(e.TableName)+`(`+strings.Join(cols, ",")+`) VALUES(`+strings.Join(marks, ",")+`)`, vargs...); err != nil {
+				exists = 1
+				inserted = true
+				applied = true
+			}
+			if exists == 0 && e.Operation == "insert" {
+				if err = insertRemoteWireRow(ctx, tx, d, e); err != nil {
 					return err
 				}
 				exists = 1
+				inserted = true
 				applied = true
 			}
 			if exists > 0 {
@@ -689,21 +862,25 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 					if !w.Present {
 						continue
 					}
-					var ph, ll int64
-					var origin string
-					verErr := tx.QueryRowContext(ctx, `SELECT winner_hlc_physical_utc_us,winner_hlc_logical,winner_origin_node_uuid FROM replication_field_versions WHERE table_name=? AND row_key_json=? AND field_name=?`, e.TableName, e.RowKeyJSON, n).Scan(&ph, &ll, &origin)
-					if verErr != nil && verErr != sql.ErrNoRows {
-						return verErr
-					}
-					if verErr == nil && compareReplicationVersion(e.HLCPhysicalUS, e.HLCLogical, e.OriginNodeUUID, ph, ll, origin) <= 0 {
-						continue
+					if !inserted {
+						var ph, ll int64
+						var origin string
+						verErr := tx.QueryRowContext(ctx, `SELECT winner_hlc_physical_utc_us,winner_hlc_logical,winner_origin_node_uuid FROM replication_field_versions WHERE table_name=? AND row_key_json=? AND field_name=?`, e.TableName, e.RowKeyJSON, n).Scan(&ph, &ll, &origin)
+						if verErr != nil && verErr != sql.ErrNoRows {
+							return verErr
+						}
+						if verErr == nil && compareReplicationVersion(e.HLCPhysicalUS, e.HLCLogical, e.OriginNodeUUID, ph, ll, origin) <= 0 {
+							continue
+						}
 					}
 					v, er := decodeWireValue(w)
 					if er != nil {
 						return er
 					}
-					if _, er = tx.ExecContext(ctx, `UPDATE `+quoteReplicationIdent(e.TableName)+` SET `+quoteReplicationIdent(n)+`=? WHERE `+whereSQL, append([]any{v}, args...)...); er != nil {
-						return er
+					if !inserted {
+						if _, er = tx.ExecContext(ctx, `UPDATE `+quoteReplicationIdent(e.TableName)+` SET `+quoteReplicationIdent(n)+`=? WHERE `+whereSQL, append([]any{v}, args...)...); er != nil {
+							return er
+						}
 					}
 					_, er = tx.ExecContext(ctx, `INSERT INTO replication_field_versions VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(table_name,row_key_json,field_name) DO UPDATE SET winner_hlc_physical_utc_us=excluded.winner_hlc_physical_utc_us,winner_hlc_logical=excluded.winner_hlc_logical,winner_origin_node_uuid=excluded.winner_origin_node_uuid,winner_change_uuid=excluded.winner_change_uuid,winner_changed_at_utc=excluded.winner_changed_at_utc,updated_at_utc=excluded.updated_at_utc`, e.TableName, e.RowKeyJSON, n, e.HLCPhysicalUS, e.HLCLogical, e.OriginNodeUUID, e.ChangeUUID, e.CreatedAtUTC, nil, now)
 					if er != nil {
@@ -727,7 +904,7 @@ func (r *replicationRuntime) applyRemoteEvent(ctx context.Context, peer string, 
 	if applied {
 		state = "applied"
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE replication_changes SET apply_state=? WHERE change_uuid=?`, state, e.ChangeUUID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE replication_changes SET apply_state=?,quarantine_reason=NULL WHERE change_uuid=?`, state, e.ChangeUUID); err != nil {
 		return err
 	}
 	if err = mergeRemoteHLC(ctx, tx, e.HLCPhysicalUS, e.HLCLogical, time.Now().UTC().UnixMicro(), now); err != nil {
@@ -817,7 +994,7 @@ func advanceRemoteCursor(ctx context.Context, tx *sql.Tx, local, origin string, 
 	}
 	for {
 		var exists int
-		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM replication_changes WHERE origin_node_uuid=? AND origin_counter=? AND apply_state<>'quarantined'`, origin, contiguous+1).Scan(&exists); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM replication_changes WHERE origin_node_uuid=? AND origin_counter=? AND apply_state IN('applied','ignored')`, origin, contiguous+1).Scan(&exists); err != nil {
 			return err
 		}
 		if exists == 0 {
@@ -825,15 +1002,52 @@ func advanceRemoteCursor(ctx context.Context, tx *sql.Tx, local, origin string, 
 		}
 		contiguous++
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO replication_origin_cursors VALUES(?,?,?,?,NULL,0,?) ON CONFLICT(tracking_node_uuid,origin_node_uuid) DO UPDATE SET contiguous_counter=excluded.contiguous_counter,highest_seen_counter=excluded.highest_seen_counter,updated_at_utc=excluded.updated_at_utc`, local, origin, contiguous, highest, now)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO replication_origin_cursors VALUES(?,?,?,?,NULL,0,?) ON CONFLICT(tracking_node_uuid,origin_node_uuid) DO UPDATE SET contiguous_counter=excluded.contiguous_counter,highest_seen_counter=excluded.highest_seen_counter,updated_at_utc=excluded.updated_at_utc`, local, origin, contiguous, highest, now); err != nil {
+		return err
+	}
+	return auditOriginGaps(ctx, tx, local, origin, contiguous, now)
+}
+func auditOriginGaps(ctx context.Context, tx *sql.Tx, local, origin string, contiguous int64, now string) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS sqliteseal_gap_audit(
+		gap_start_counter INTEGER PRIMARY KEY,gap_end_counter INTEGER NOT NULL)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sqliteseal_gap_audit`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `WITH observed(counter) AS (
+		SELECT ?
+		UNION
+		SELECT origin_counter FROM replication_changes WHERE origin_node_uuid=? AND origin_counter>?
+	), ranges AS (
+		SELECT counter+1 AS gap_start_counter,lead(counter) OVER (ORDER BY counter)-1 AS gap_end_counter FROM observed
+	)
+	INSERT INTO sqliteseal_gap_audit(gap_start_counter,gap_end_counter)
+	SELECT gap_start_counter,gap_end_counter FROM ranges WHERE gap_end_counter>=gap_start_counter`, contiguous, origin, contiguous); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO replication_origin_gaps(
+		tracking_node_uuid,origin_node_uuid,gap_start_counter,gap_end_counter,detected_at_utc,last_requested_at_utc,request_count)
+		SELECT ?,?,gap_start_counter,gap_end_counter,?,NULL,0 FROM sqliteseal_gap_audit WHERE true
+		ON CONFLICT(tracking_node_uuid,origin_node_uuid,gap_start_counter) DO UPDATE SET gap_end_counter=excluded.gap_end_counter`, local, origin, now); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM replication_origin_gaps
+		WHERE tracking_node_uuid=? AND origin_node_uuid=?
+		AND NOT EXISTS(SELECT 1 FROM sqliteseal_gap_audit a WHERE a.gap_start_counter=replication_origin_gaps.gap_start_counter)`, local, origin)
 	return err
 }
+
 func (r *replicationRuntime) recordPeerAck(peer string, cursor int64) error {
 	if cursor <= 0 {
 		return nil
 	}
-	_, err := r.db.Exec(`INSERT OR IGNORE INTO replication_change_acks SELECT change_uuid,?,'applied',sqliteseal_utc_now() FROM replication_changes WHERE origin_node_uuid=(SELECT local_node_uuid FROM replication_local_state) AND origin_counter<=?`, peer, cursor)
-	return err
+	r.writer.Lock()
+	defer r.writer.Unlock()
+	return retryReplicationBusy(r.ctx, func() error {
+		_, err := r.db.ExecContext(r.ctx, `INSERT OR IGNORE INTO replication_change_acks SELECT change_uuid,?,'applied',sqliteseal_utc_now() FROM replication_changes WHERE origin_node_uuid=(SELECT local_node_uuid FROM replication_local_state) AND origin_counter<=?`, peer, cursor)
+		return err
+	})
 }
 
 func (db *DB) PauseReplication(ctx context.Context) error {

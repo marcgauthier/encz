@@ -12,28 +12,54 @@ import (
 )
 
 func (r *replicationRuntime) ensureReplicationMetadataCompatibility(ctx context.Context) error {
-	rows, err := r.db.QueryContext(ctx, `PRAGMA table_info(replication_local_state)`)
-	if err != nil {
-		return err
+	columns := []struct {
+		table string
+		name  string
+		ddl   string
+	}{
+		{"replication_local_state", "maximum_future_skew_us", `ALTER TABLE replication_local_state ADD COLUMN maximum_future_skew_us INTEGER NOT NULL DEFAULT 300000000`},
+		{"replication_snapshots", "baseline_cursors_uncompressed_bytes", `ALTER TABLE replication_snapshots ADD COLUMN baseline_cursors_uncompressed_bytes INTEGER NOT NULL DEFAULT 0`},
+		{"replication_snapshots", "snapshot_auth_mode", `ALTER TABLE replication_snapshots ADD COLUMN snapshot_auth_mode TEXT NOT NULL DEFAULT 'session'`},
+		{"replication_snapshots", "creator_signing_key_id", `ALTER TABLE replication_snapshots ADD COLUMN creator_signing_key_id TEXT`},
+		{"replication_snapshots", "creator_signature", `ALTER TABLE replication_snapshots ADD COLUMN creator_signature BLOB`},
+		{"replication_snapshots", "storage_uri", `ALTER TABLE replication_snapshots ADD COLUMN storage_uri TEXT`},
+		{"replication_snapshots", "installed_by_node_uuid", `ALTER TABLE replication_snapshots ADD COLUMN installed_by_node_uuid TEXT`},
+		{"replication_snapshots", "verified_at_utc", `ALTER TABLE replication_snapshots ADD COLUMN verified_at_utc TEXT`},
 	}
-	found := false
+	for _, column := range columns {
+		found, err := replicationColumnExists(ctx, r.db, column.table, column.name)
+		if err != nil {
+			return err
+		}
+		if !found {
+			if _, err = r.db.ExecContext(ctx, column.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func replicationColumnExists(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+quoteReplicationIdent(table)+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
 	for rows.Next() {
 		var cid, notnull, pk int
 		var name, typ string
 		var defaultValue any
 		if err = rows.Scan(&cid, &name, &typ, &notnull, &defaultValue, &pk); err != nil {
-			rows.Close()
-			return err
+			return false, err
 		}
-		found = found || name == "maximum_future_skew_us"
+		if name == column {
+			return true, nil
+		}
 	}
-	if err = rows.Close(); err != nil {
-		return err
-	}
-	if !found {
-		_, err = r.db.ExecContext(ctx, `ALTER TABLE replication_local_state ADD COLUMN maximum_future_skew_us INTEGER NOT NULL DEFAULT 300000000`)
-	}
-	return err
+	return false, rows.Err()
 }
 
 func (r *replicationRuntime) maximumFutureSkew(ctx context.Context) (time.Duration, error) {
@@ -112,14 +138,14 @@ func (r *replicationRuntime) withRemoteTransaction(ctx context.Context, fn func(
 	return tx.Commit()
 }
 
-func (r *replicationRuntime) quarantineRemoteEvent(ctx context.Context, peer, local string, d replicationTableDescriptor, event wireEvent, reason string) error {
+func (r *replicationRuntime) storeDeferredRemoteEvent(ctx context.Context, peer, local string, d replicationTableDescriptor, event wireEvent, state, reason string) error {
 	now := time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
 	_, size, err := replicationEventHash(event)
 	if err != nil {
 		return err
 	}
-	err = r.withRemoteTransaction(ctx, func(tx *sql.Tx) error {
-		_, insertErr := tx.ExecContext(ctx, `INSERT INTO replication_changes(change_uuid,origin_node_uuid,origin_counter,operation,table_name,row_key_json,changed_fields_json,is_explicit_recreation,hlc_physical_utc_us,hlc_logical,schema_version,schema_hash,replication_domain,created_at_utc,stored_at_utc,source_node_uuid,payload_hash,payload_uncompressed_bytes,apply_state,quarantine_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'quarantined',?)`, event.ChangeUUID, event.OriginNodeUUID, event.OriginCounter, event.Operation, event.TableName, event.RowKeyJSON, event.ChangedFieldsJSON, boolInt(event.ExplicitRecreation), event.HLCPhysicalUS, event.HLCLogical, event.SchemaVersion, event.SchemaHash, event.Domain, event.CreatedAtUTC, now, peer, event.PayloadHash, size, reason)
+	return r.withRemoteTransaction(ctx, func(tx *sql.Tx) error {
+		_, insertErr := tx.ExecContext(ctx, `INSERT INTO replication_changes(change_uuid,origin_node_uuid,origin_counter,operation,table_name,row_key_json,changed_fields_json,is_explicit_recreation,hlc_physical_utc_us,hlc_logical,schema_version,schema_hash,replication_domain,created_at_utc,stored_at_utc,source_node_uuid,payload_hash,payload_uncompressed_bytes,apply_state,quarantine_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, event.ChangeUUID, event.OriginNodeUUID, event.OriginCounter, event.Operation, event.TableName, event.RowKeyJSON, event.ChangedFieldsJSON, boolInt(event.ExplicitRecreation), event.HLCPhysicalUS, event.HLCLogical, event.SchemaVersion, event.SchemaHash, event.Domain, event.CreatedAtUTC, now, peer, event.PayloadHash, size, state, reason)
 		if insertErr != nil {
 			return insertErr
 		}
@@ -128,20 +154,17 @@ func (r *replicationRuntime) quarantineRemoteEvent(ctx context.Context, peer, lo
 		}
 		return advanceRemoteCursor(ctx, tx, local, event.OriginNodeUUID, event.OriginCounter, now)
 	})
-	if err != nil {
+}
+
+func (r *replicationRuntime) quarantineRemoteEvent(ctx context.Context, peer, local string, d replicationTableDescriptor, event wireEvent, reason string) error {
+	if err := r.storeDeferredRemoteEvent(ctx, peer, local, d, event, "quarantined", reason); err != nil {
 		return err
 	}
 	return fmt.Errorf("%w: %s", ErrReplicationEventQuarantined, reason)
 }
 
-func (r *replicationRuntime) removeDeferredEvent(ctx context.Context, descriptor replicationTableDescriptor, changeUUID string) error {
-	return r.withRemoteTransaction(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM `+quoteReplicationIdent(descriptor.DescriptorID+"__replication_changes")+` WHERE change_uuid=?`, changeUUID); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx, `DELETE FROM replication_changes WHERE change_uuid=? AND apply_state IN('pending','quarantined')`, changeUUID)
-		return err
-	})
+func (r *replicationRuntime) deferOutOfOrderEvent(ctx context.Context, peer, local string, d replicationTableDescriptor, event wireEvent) error {
+	return r.storeDeferredRemoteEvent(ctx, peer, local, d, event, "pending", "origin_gap")
 }
 
 func (r *replicationRuntime) loadStoredWireEvent(ctx context.Context, changeUUID string) (wireEvent, replicationTableDescriptor, error) {
@@ -191,7 +214,7 @@ func joinReplicationSQL(parts []string) string {
 }
 
 func (r *replicationRuntime) recoverDeferredEvents(ctx context.Context) error {
-	rows, err := r.db.QueryContext(ctx, `SELECT change_uuid FROM replication_changes WHERE apply_state IN('pending','quarantined') ORDER BY stored_at_utc`)
+	rows, err := r.db.QueryContext(ctx, `SELECT change_uuid FROM replication_changes WHERE apply_state IN('pending','quarantined') ORDER BY origin_node_uuid,origin_counter`)
 	if err != nil {
 		return err
 	}
