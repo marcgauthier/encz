@@ -437,6 +437,16 @@ node's local identity, credentials, origin counter, HLC state, or encryption
 keys. After installation, the destination requests only events above the
 baseline cursors.
 
+Format-version-1 canonical JSON is streamed to and from local snapshot files.
+Creation, transfer, validation, and installation never retain the complete
+snapshot document in memory; the bound is one transfer chunk or logical row
+plus descriptor and cursor metadata. A receiver verifies both the raw SHA-256
+and the SHA-256 of the canonical bytes it re-emits while decoding. Installation
+uses a second streaming pass inside one transaction, so a late decode, schema,
+or SQL failure restores the destination's prior rows and replication metadata.
+Incomplete temporary files are removed. Partial downloads are not persisted
+across sessions and restart from offset zero after reconnection.
+
 A snapshot transferred on a live connection is authenticated by that
 user-provided TLS/PSK or mTLS session and needs no additional signing key. A
 snapshot exported for manual or offline import must use `external_signature`
@@ -462,6 +472,7 @@ node, interpreted from the point of view of the local node.
 | `reconnect_initial_ms` | INTEGER | Yes | Initial retry delay after a failed or broken outbound connection. |
 | `reconnect_max_ms` | INTEGER | Yes | Maximum exponential-backoff delay. |
 | `reconnect_jitter_percent` | INTEGER | Yes | Random jitter applied to retries to prevent every node reconnecting simultaneously. |
+| `max_snapshot_bytes` | INTEGER | Yes | Maximum uncompressed logical snapshot generated for or accepted from this peer; defaults to 256 MiB. |
 | `max_compressed_frame_bytes` | INTEGER | Yes | Maximum accepted compressed frame length. |
 | `max_uncompressed_message_bytes` | INTEGER | Yes | Maximum JSON size after gzip decompression, protecting against compression bombs. |
 | `max_events_per_batch` | INTEGER | Yes | Maximum event count in one event-batch message or one merge batch. |
@@ -492,7 +503,29 @@ Connection roles are interpreted as follows:
 - `dial`: this node opens the connection. If it fails or later breaks, this node
   retries indefinitely using exponential backoff capped by
   `reconnect_max_ms`, with jitter. A successful authenticated session resets
-  `consecutive_failures`.
+  `consecutive_failures` and clears `next_retry_at_utc`. The unjittered delay
+  for failure number `n` is
+  `min(reconnect_max_ms, reconnect_initial_ms * 2^(n-1))`, calculated with
+  overflow-safe saturation.
+- `reconnect_jitter_percent` defaults to 20. A value of zero disables jitter.
+  Otherwise the sampled delay is uniformly distributed between
+  `base * (1 - percent/100)` and
+  `min(reconnect_max_ms, base * (1 + percent/100))`.
+- `next_retry_at_utc` is the exact sampled deadline and survives process
+  restart. An overdue deadline is attempted immediately. A stored future
+  deadline farther away than `reconnect_max_ms` is clamped and rewritten,
+  which bounds recovery after a backward wall-clock adjustment.
+- Peer upsert, credential reload, replication resume, membership activation,
+  and an explicit peer sync clear a pending deadline and wake the per-peer
+  scheduler immediately. Planned local closes, pause, disable, retirement,
+  role changes, and shutdown do not increment the failure count.
+- Existing authenticated schema, synchronization, acknowledgement, and
+  snapshot frames are the application heartbeat; no separate ping frame is
+  required. The dial side starts a synchronization round at
+  `heartbeat_interval_ms`, and both sides enforce sliding read and write
+  deadlines of `heartbeat_timeout_ms` after authentication.
+- TCP keepalive is enabled when supported by the platform. It supplements the
+  application deadline; inability to configure it does not reject a session.
 - `accept`: this node never attempts an outbound connection to that peer. If
   the session breaks, it keeps its listener available and waits for the peer to
   come back online and connect again.
@@ -680,6 +713,8 @@ CREATE TABLE replication_peer_connections (
                                   CHECK (reconnect_max_ms >= reconnect_initial_ms),
     reconnect_jitter_percent      INTEGER NOT NULL DEFAULT 20
                                   CHECK (reconnect_jitter_percent BETWEEN 0 AND 100),
+    max_snapshot_bytes            INTEGER NOT NULL DEFAULT 268435456
+                                  CHECK (max_snapshot_bytes > 0),
     max_compressed_frame_bytes    INTEGER NOT NULL DEFAULT 8388608
                                   CHECK (max_compressed_frame_bytes > 0),
     max_uncompressed_message_bytes INTEGER NOT NULL DEFAULT 33554432

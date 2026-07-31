@@ -320,7 +320,7 @@ func openNode(ctx context.Context, n *node, listen string) error {
 }
 
 func peer(n node, addr string, role sqliteseal.ReplicationConnectionRole, listens bool) sqliteseal.PeerConfig {
-	return sqliteseal.PeerConfig{NodeUUID: n.id, IncarnationUUID: mustStatus(context.Background(), n.db).IncarnationUUID, NodeName: n.name, Address: addr, ListenEnabled: listens, Role: role, AuthMode: sqliteseal.ReplicationAuthPSK, CredentialName: credential, Enabled: true}
+	return sqliteseal.PeerConfig{NodeUUID: n.id, IncarnationUUID: mustStatus(context.Background(), n.db).IncarnationUUID, NodeName: n.name, Address: addr, ListenEnabled: listens, Role: role, AuthMode: sqliteseal.ReplicationAuthPSK, CredentialName: credential, Enabled: true, HeartbeatInterval: 150 * time.Millisecond, HeartbeatTimeout: 5 * time.Second}
 }
 
 func mustStatus(ctx context.Context, db *sqliteseal.DB) sqliteseal.ReplicationStatus {

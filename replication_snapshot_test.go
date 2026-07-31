@@ -2,6 +2,7 @@ package sqliteseal
 
 import (
 	"context"
+	"os"
 	"testing"
 )
 
@@ -41,11 +42,12 @@ func TestReplicationSnapshotRoundTrip(t *testing.T) {
 	if info.SnapshotUUID == "" || info.ContentHash == "" || info.SizeBytes <= 0 {
 		t.Fatalf("invalid snapshot info: %+v", info)
 	}
-	manifest, raw, err := source.replication.latestSnapshot(ctx)
+	snapshot, err := source.replication.snapshotByUUIDFile(ctx, info.SnapshotUUID, defaultMaximumReplicationSnapshotBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = target.replication.installSessionSnapshot(ctx, sourceID, manifest, raw); err != nil {
+	path := copySnapshotForInstall(t, target, snapshot)
+	if err = target.replication.installSessionSnapshotFile(ctx, sourceID, snapshot.Manifest, path, defaultMaximumReplicationSnapshotBytes); err != nil {
 		t.Fatal(err)
 	}
 	var name string
@@ -82,22 +84,41 @@ func TestReplicationSnapshotRejectsTamperingAndLocalHistory(t *testing.T) {
 	if _, err := source.Exec(`INSERT INTO items VALUES('one','value','note')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := source.CreateReplicationSnapshot(ctx); err != nil {
-		t.Fatal(err)
-	}
-	manifest, raw, err := source.replication.latestSnapshot(ctx)
+	info, err := source.CreateReplicationSnapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tampered := append([]byte(nil), raw...)
-	tampered[len(tampered)-1] ^= 1
-	if err = target.replication.installSessionSnapshot(ctx, sourceID, manifest, tampered); err == nil {
+	snapshot, err := source.replication.snapshotByUUIDFile(ctx, info.SnapshotUUID, defaultMaximumReplicationSnapshotBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperedPath := copySnapshotForInstall(t, target, snapshot)
+	tampered, err := os.OpenFile(tamperedPath, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tampered.Seek(-1, 2); err != nil {
+		t.Fatal(err)
+	}
+	var last [1]byte
+	if _, err = tampered.Read(last[:]); err != nil {
+		t.Fatal(err)
+	}
+	last[0] ^= 1
+	if _, err = tampered.WriteAt(last[:], snapshot.Manifest.ContentSizeBytes-1); err != nil {
+		t.Fatal(err)
+	}
+	if err = tampered.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = target.replication.installSessionSnapshotFile(ctx, sourceID, snapshot.Manifest, tamperedPath, defaultMaximumReplicationSnapshotBytes); err == nil {
 		t.Fatal("tampered snapshot installed")
 	}
 	if _, err = target.Exec(`INSERT INTO items VALUES('local','value','note')`); err != nil {
 		t.Fatal(err)
 	}
-	if err = target.replication.installSessionSnapshot(ctx, sourceID, manifest, raw); err == nil {
+	path := copySnapshotForInstall(t, target, snapshot)
+	if err = target.replication.installSessionSnapshotFile(ctx, sourceID, snapshot.Manifest, path, defaultMaximumReplicationSnapshotBytes); err == nil {
 		t.Fatal("snapshot overwrote local-origin history")
 	}
 }

@@ -23,16 +23,15 @@ type replicationRuntime struct {
 	mu          sync.Mutex
 	listeners   []net.Listener
 	connections map[string]net.Conn
-	dialers     map[string]bool
+	dialers     map[string]*replicationDialerControl
 	authReplay  map[string]time.Time
-	kick        chan struct{}
 	writer      sync.Mutex
 	wg          sync.WaitGroup
 }
 
 func (db *DB) openReplication(opts *ReplicationRuntimeOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &replicationRuntime{db: db, opts: opts, ctx: ctx, cancel: cancel, connections: make(map[string]net.Conn), dialers: make(map[string]bool), authReplay: make(map[string]time.Time), kick: make(chan struct{}, 1)}
+	r := &replicationRuntime{db: db, opts: opts, ctx: ctx, cancel: cancel, connections: make(map[string]net.Conn), dialers: make(map[string]*replicationDialerControl), authReplay: make(map[string]time.Time)}
 	db.replication = r
 	var n int
 	err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='replication_local_state'`).Scan(&n)
@@ -191,6 +190,13 @@ func (db *DB) UpsertReplicationPeer(ctx context.Context, p PeerConfig) error {
 		return ErrReplicationInvalidConfig
 	}
 	defaultsPeer(&p)
+	if p.ConnectTimeout.Milliseconds() <= 0 || p.HeartbeatInterval.Milliseconds() <= 0 ||
+		p.HeartbeatTimeout.Milliseconds() <= p.HeartbeatInterval.Milliseconds() ||
+		p.ReconnectInitial.Milliseconds() <= 0 || p.ReconnectMaximum.Milliseconds() < p.ReconnectInitial.Milliseconds() ||
+		p.ReconnectJitterPercent == nil || *p.ReconnectJitterPercent < 0 || *p.ReconnectJitterPercent > 100 ||
+		p.MaxSnapshotBytes <= 0 {
+		return ErrReplicationInvalidConfig
+	}
 	var domain string
 	if err := db.QueryRowContext(ctx, `SELECT replication_domain FROM replication_local_state WHERE state_id=1`).Scan(&domain); err != nil {
 		return ErrReplicationNotInitialized
@@ -205,11 +211,15 @@ func (db *DB) UpsertReplicationPeer(ctx context.Context, p PeerConfig) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO replication_peer_connections(peer_node_uuid,connection_role,enabled,reconnect_enabled,address,connect_timeout_ms,heartbeat_interval_ms,heartbeat_timeout_ms,reconnect_initial_ms,reconnect_max_ms,max_compressed_frame_bytes,max_uncompressed_message_bytes,max_events_per_batch,max_inflight_events,max_inflight_bytes,session_state,consecutive_failures,updated_at_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'disabled',0,?) ON CONFLICT(peer_node_uuid) DO UPDATE SET connection_role=excluded.connection_role,address=excluded.address,updated_at_utc=excluded.updated_at_utc`, p.NodeUUID, string(p.Role), 0, boolInt(p.Role == ReplicationDial), p.Address, p.ConnectTimeout.Milliseconds(), p.HeartbeatInterval.Milliseconds(), p.HeartbeatTimeout.Milliseconds(), p.ReconnectInitial.Milliseconds(), p.ReconnectMaximum.Milliseconds(), p.MaxCompressedBytes, p.MaxUncompressedBytes, p.MaxEventsPerBatch, p.MaxInflightEvents, p.MaxInflightBytes, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO replication_peer_connections(peer_node_uuid,connection_role,enabled,reconnect_enabled,address,connect_timeout_ms,heartbeat_interval_ms,heartbeat_timeout_ms,reconnect_initial_ms,reconnect_max_ms,reconnect_jitter_percent,max_snapshot_bytes,max_compressed_frame_bytes,max_uncompressed_message_bytes,max_events_per_batch,max_inflight_events,max_inflight_bytes,session_state,next_retry_at_utc,consecutive_failures,updated_at_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'disabled',NULL,0,?) ON CONFLICT(peer_node_uuid) DO UPDATE SET connection_role=excluded.connection_role,reconnect_enabled=excluded.reconnect_enabled,address=excluded.address,connect_timeout_ms=excluded.connect_timeout_ms,heartbeat_interval_ms=excluded.heartbeat_interval_ms,heartbeat_timeout_ms=excluded.heartbeat_timeout_ms,reconnect_initial_ms=excluded.reconnect_initial_ms,reconnect_max_ms=excluded.reconnect_max_ms,reconnect_jitter_percent=excluded.reconnect_jitter_percent,max_snapshot_bytes=excluded.max_snapshot_bytes,max_compressed_frame_bytes=excluded.max_compressed_frame_bytes,max_uncompressed_message_bytes=excluded.max_uncompressed_message_bytes,max_events_per_batch=excluded.max_events_per_batch,max_inflight_events=excluded.max_inflight_events,max_inflight_bytes=excluded.max_inflight_bytes,next_retry_at_utc=NULL,updated_at_utc=excluded.updated_at_utc`, p.NodeUUID, string(p.Role), 0, boolInt(p.Role == ReplicationDial), p.Address, p.ConnectTimeout.Milliseconds(), p.HeartbeatInterval.Milliseconds(), p.HeartbeatTimeout.Milliseconds(), p.ReconnectInitial.Milliseconds(), p.ReconnectMaximum.Milliseconds(), *p.ReconnectJitterPercent, p.MaxSnapshotBytes, p.MaxCompressedBytes, p.MaxUncompressedBytes, p.MaxEventsPerBatch, p.MaxInflightEvents, p.MaxInflightBytes, now)
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	db.replication.restartPeer(p.NodeUUID)
+	return nil
 }
 func defaultsPeer(p *PeerConfig) {
 	if p.ConnectTimeout <= 0 {
@@ -219,13 +229,28 @@ func defaultsPeer(p *PeerConfig) {
 		p.HeartbeatInterval = 15 * time.Second
 	}
 	if p.HeartbeatTimeout <= p.HeartbeatInterval {
-		p.HeartbeatTimeout = 45 * time.Second
+		const maximumDuration = time.Duration(1<<63 - 1)
+		if p.HeartbeatInterval > maximumDuration/3 {
+			p.HeartbeatTimeout = maximumDuration
+		} else {
+			p.HeartbeatTimeout = 3 * p.HeartbeatInterval
+		}
 	}
 	if p.ReconnectInitial <= 0 {
 		p.ReconnectInitial = time.Second
 	}
-	if p.ReconnectMaximum < p.ReconnectInitial {
+	if p.ReconnectMaximum <= 0 {
 		p.ReconnectMaximum = time.Minute
+		if p.ReconnectMaximum < p.ReconnectInitial {
+			p.ReconnectMaximum = p.ReconnectInitial
+		}
+	}
+	if p.ReconnectJitterPercent == nil {
+		jitter := 20
+		p.ReconnectJitterPercent = &jitter
+	}
+	if p.MaxSnapshotBytes == 0 {
+		p.MaxSnapshotBytes = defaultMaximumReplicationSnapshotBytes
 	}
 	if p.MaxCompressedBytes <= 0 {
 		p.MaxCompressedBytes = 8 << 20
@@ -242,6 +267,17 @@ func defaultsPeer(p *PeerConfig) {
 	if p.MaxInflightBytes <= 0 {
 		p.MaxInflightBytes = 64 << 20
 	}
+}
+
+func (r *replicationRuntime) restartPeer(nodeUUID string) {
+	r.clearPeerRetryAndWake(nodeUUID, true)
+	r.mu.Lock()
+	connection := r.connections[nodeUUID]
+	r.mu.Unlock()
+	if connection != nil {
+		_ = connection.Close()
+	}
+	r.start()
 }
 
 func (db *DB) ApplyMembershipManifest(ctx context.Context, m MembershipManifest) error {
@@ -279,11 +315,12 @@ func (db *DB) ApplyMembershipManifest(ctx context.Context, m MembershipManifest)
 	if _, err = tx.ExecContext(ctx, `UPDATE replication_local_state SET membership_epoch=?,membership_manifest_hash=?,network_enabled=1,blocked_reason=NULL,updated_at_utc=sqliteseal_utc_now()`, m.Epoch, h); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE replication_peer_connections SET enabled=CASE WHEN peer_node_uuid IN(SELECT node_uuid FROM replication_nodes WHERE enabled=1 AND is_local=0) THEN 1 ELSE 0 END,session_state=CASE WHEN peer_node_uuid IN(SELECT node_uuid FROM replication_nodes WHERE enabled=1 AND is_local=0) THEN 'disconnected' ELSE 'disabled' END`); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE replication_peer_connections SET enabled=CASE WHEN peer_node_uuid IN(SELECT node_uuid FROM replication_nodes WHERE enabled=1 AND is_local=0) THEN 1 ELSE 0 END,session_state=CASE WHEN peer_node_uuid IN(SELECT node_uuid FROM replication_nodes WHERE enabled=1 AND is_local=0) THEN 'disconnected' ELSE 'disabled' END,next_retry_at_utc=CASE WHEN peer_node_uuid IN(SELECT node_uuid FROM replication_nodes WHERE enabled=1 AND is_local=0) THEN NULL ELSE next_retry_at_utc END`); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err == nil {
 		_ = db.replication.closeUnauthorizedSessions(ctx)
+		db.replication.wakeAllDialers(false)
 		db.replication.start()
 	}
 	return err
@@ -311,15 +348,29 @@ func (db *DB) ReplicationStatus(ctx context.Context) (ReplicationStatus, error) 
 	}
 	s.Initialized = true
 	s.Ready = s.NetworkEnabled && s.BlockedReason == ""
-	rows, err := db.QueryContext(ctx, `SELECT p.peer_node_uuid,n.node_level,p.session_state,coalesce(p.last_error,''),coalesce(c.contiguous_counter,0),coalesce(c.highest_seen_counter,0),(SELECT count(*) FROM replication_origin_gaps g WHERE g.tracking_node_uuid=l.local_node_uuid AND g.origin_node_uuid=p.peer_node_uuid) FROM replication_peer_connections p JOIN replication_nodes n ON n.node_uuid=p.peer_node_uuid CROSS JOIN replication_local_state l LEFT JOIN replication_origin_cursors c ON c.tracking_node_uuid=l.local_node_uuid AND c.origin_node_uuid=p.peer_node_uuid`)
+	rows, err := db.QueryContext(ctx, `SELECT p.peer_node_uuid,n.node_level,p.session_state,coalesce(p.last_error,''),p.connected_at_utc,p.next_retry_at_utc,p.consecutive_failures,coalesce(c.contiguous_counter,0),coalesce(c.highest_seen_counter,0),(SELECT count(*) FROM replication_origin_gaps g WHERE g.tracking_node_uuid=l.local_node_uuid AND g.origin_node_uuid=p.peer_node_uuid) FROM replication_peer_connections p JOIN replication_nodes n ON n.node_uuid=p.peer_node_uuid CROSS JOIN replication_local_state l LEFT JOIN replication_origin_cursors c ON c.tracking_node_uuid=l.local_node_uuid AND c.origin_node_uuid=p.peer_node_uuid`)
 	if err != nil {
 		return s, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var p ReplicationPeerStatus
-		if err = rows.Scan(&p.NodeUUID, &p.Level, &p.State, &p.LastError, &p.ContiguousCounter, &p.HighestSeenCounter, &p.GapCount); err != nil {
+		var connectedAt, nextRetryAt sql.NullString
+		if err = rows.Scan(&p.NodeUUID, &p.Level, &p.State, &p.LastError, &connectedAt, &nextRetryAt, &p.ConsecutiveFailures, &p.ContiguousCounter, &p.HighestSeenCounter, &p.GapCount); err != nil {
 			return s, err
+		}
+		if connectedAt.Valid {
+			p.ConnectedAt, err = parseReplicationTimestamp(connectedAt.String)
+			if err != nil {
+				return s, err
+			}
+		}
+		if nextRetryAt.Valid {
+			next, parseErr := parseReplicationTimestamp(nextRetryAt.String)
+			if parseErr != nil {
+				return s, parseErr
+			}
+			p.NextRetryAt = &next
 		}
 		s.Peers = append(s.Peers, p)
 	}
@@ -413,6 +464,7 @@ func (db *DB) ReloadReplicationCredentials(context.Context) error {
 	if db.replication.opts == nil || db.replication.opts.Credentials == nil {
 		return ErrReplicationNotReady
 	}
+	db.replication.wakeAllDialers(true)
 	db.replication.mu.Lock()
 	for _, connection := range db.replication.connections {
 		_ = connection.Close()

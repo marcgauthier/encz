@@ -29,6 +29,8 @@ func (r *replicationRuntime) ensureReplicationMetadataCompatibility(ctx context.
 		{"replication_snapshots", "storage_uri", `ALTER TABLE replication_snapshots ADD COLUMN storage_uri TEXT`},
 		{"replication_snapshots", "installed_by_node_uuid", `ALTER TABLE replication_snapshots ADD COLUMN installed_by_node_uuid TEXT`},
 		{"replication_snapshots", "verified_at_utc", `ALTER TABLE replication_snapshots ADD COLUMN verified_at_utc TEXT`},
+		{"replication_peer_connections", "reconnect_jitter_percent", `ALTER TABLE replication_peer_connections ADD COLUMN reconnect_jitter_percent INTEGER NOT NULL DEFAULT 20`},
+		{"replication_peer_connections", "max_snapshot_bytes", `ALTER TABLE replication_peer_connections ADD COLUMN max_snapshot_bytes INTEGER NOT NULL DEFAULT 268435456`},
 	}
 	for _, column := range columns {
 		found, err := replicationColumnExists(ctx, r.db, column.table, column.name)

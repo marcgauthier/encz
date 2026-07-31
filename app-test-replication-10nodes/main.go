@@ -172,15 +172,17 @@ func run(duration, interval time.Duration) error {
 				role = sqliteseal.ReplicationDial
 			}
 			peerCfg := sqliteseal.PeerConfig{
-				NodeUUID:        nodes[j].id,
-				IncarnationUUID: mustStatus(ctx, nodes[j].db).IncarnationUUID,
-				NodeName:        nodes[j].name,
-				Address:         addrs[j],
-				ListenEnabled:   true,
-				Role:            role,
-				AuthMode:        sqliteseal.ReplicationAuthPSK,
-				CredentialName:  credential,
-				Enabled:         true,
+				NodeUUID:          nodes[j].id,
+				IncarnationUUID:   mustStatus(ctx, nodes[j].db).IncarnationUUID,
+				NodeName:          nodes[j].name,
+				Address:           addrs[j],
+				ListenEnabled:     true,
+				Role:              role,
+				AuthMode:          sqliteseal.ReplicationAuthPSK,
+				CredentialName:    credential,
+				Enabled:           true,
+				HeartbeatInterval: 150 * time.Millisecond,
+				HeartbeatTimeout:  5 * time.Second,
 			}
 			if err = nodes[i].db.UpsertReplicationPeer(ctx, peerCfg); err != nil {
 				return fmt.Errorf("upsert peer on %s for %s: %w", nodes[i].name, nodes[j].name, err)

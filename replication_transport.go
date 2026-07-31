@@ -99,11 +99,17 @@ type wireMessage struct {
 	Error            string                       `json:"error,omitempty"`
 }
 type peerRuntimeConfig struct {
-	NodeUUID, IncarnationUUID, Address, CredentialName string
-	Role                                               ReplicationConnectionRole
-	Auth                                               ReplicationAuthMode
-	ConnectTimeout, Heartbeat                          time.Duration
-	MaxCompressed, MaxUncompressed, MaxBatch           int
+	NodeUUID, IncarnationUUID, Address, CredentialName  string
+	Role                                                ReplicationConnectionRole
+	Auth                                                ReplicationAuthMode
+	Enabled, ReconnectEnabled                           bool
+	ConnectTimeout, HeartbeatInterval, HeartbeatTimeout time.Duration
+	ReconnectInitial, ReconnectMaximum                  time.Duration
+	ReconnectJitterPercent                              int
+	NextRetryAt                                         *time.Time
+	ConsecutiveFailures                                 int64
+	MaxSnapshotBytes                                    int64
+	MaxCompressed, MaxUncompressed, MaxBatch            int
 }
 
 func (r *replicationRuntime) start() {
@@ -136,25 +142,56 @@ func (r *replicationRuntime) start() {
 		r.wg.Add(1)
 		go r.acceptLoop(ln)
 	}
-	rows, err := r.db.Query(`SELECT p.peer_node_uuid,n.incarnation_uuid,p.address,n.credential_name,p.connection_role,n.auth_mode,p.connect_timeout_ms,p.heartbeat_interval_ms,p.max_compressed_frame_bytes,p.max_uncompressed_message_bytes,p.max_events_per_batch FROM replication_peer_connections p JOIN replication_nodes n ON n.node_uuid=p.peer_node_uuid WHERE p.enabled=1 AND p.connection_role='dial'`)
+	rows, err := r.db.Query(`SELECT peer_node_uuid FROM replication_peer_connections WHERE enabled=1 AND connection_role='dial'`)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var p peerRuntimeConfig
-		var ct, hb int64
-		if rows.Scan(&p.NodeUUID, &p.IncarnationUUID, &p.Address, &p.CredentialName, &p.Role, &p.Auth, &ct, &hb, &p.MaxCompressed, &p.MaxUncompressed, &p.MaxBatch) != nil {
+		var nodeUUID string
+		if rows.Scan(&nodeUUID) != nil {
 			continue
 		}
-		p.ConnectTimeout = time.Duration(ct) * time.Millisecond
-		p.Heartbeat = time.Duration(hb) * time.Millisecond
-		if !r.dialers[p.NodeUUID] {
-			r.dialers[p.NodeUUID] = true
+		if r.dialers[nodeUUID] == nil {
+			control := newReplicationDialerControl()
+			r.dialers[nodeUUID] = control
 			r.wg.Add(1)
-			go r.dialLoop(p)
+			go r.dialLoop(nodeUUID, control)
 		}
 	}
+}
+
+func (r *replicationRuntime) loadPeerRuntimeConfig(ctx context.Context, nodeUUID string) (peerRuntimeConfig, error) {
+	var p peerRuntimeConfig
+	var enabled, reconnectEnabled int
+	var connectTimeoutMS, heartbeatIntervalMS, heartbeatTimeoutMS, reconnectInitialMS, reconnectMaximumMS int64
+	var nextRetry sql.NullString
+	err := r.db.QueryRowContext(ctx, `SELECT p.peer_node_uuid,n.incarnation_uuid,p.address,n.credential_name,p.connection_role,n.auth_mode,p.enabled,p.reconnect_enabled,p.connect_timeout_ms,p.heartbeat_interval_ms,p.heartbeat_timeout_ms,p.reconnect_initial_ms,p.reconnect_max_ms,p.reconnect_jitter_percent,p.next_retry_at_utc,p.consecutive_failures,p.max_snapshot_bytes,p.max_compressed_frame_bytes,p.max_uncompressed_message_bytes,p.max_events_per_batch
+		FROM replication_peer_connections p JOIN replication_nodes n ON n.node_uuid=p.peer_node_uuid WHERE p.peer_node_uuid=?`, nodeUUID).
+		Scan(&p.NodeUUID, &p.IncarnationUUID, &p.Address, &p.CredentialName, &p.Role, &p.Auth, &enabled, &reconnectEnabled, &connectTimeoutMS, &heartbeatIntervalMS, &heartbeatTimeoutMS, &reconnectInitialMS, &reconnectMaximumMS, &p.ReconnectJitterPercent, &nextRetry, &p.ConsecutiveFailures, &p.MaxSnapshotBytes, &p.MaxCompressed, &p.MaxUncompressed, &p.MaxBatch)
+	if err != nil {
+		return p, err
+	}
+	p.Enabled = enabled == 1
+	p.ReconnectEnabled = reconnectEnabled == 1
+	p.ConnectTimeout = time.Duration(connectTimeoutMS) * time.Millisecond
+	p.HeartbeatInterval = time.Duration(heartbeatIntervalMS) * time.Millisecond
+	p.HeartbeatTimeout = time.Duration(heartbeatTimeoutMS) * time.Millisecond
+	p.ReconnectInitial = time.Duration(reconnectInitialMS) * time.Millisecond
+	p.ReconnectMaximum = time.Duration(reconnectMaximumMS) * time.Millisecond
+	if nextRetry.Valid {
+		retryAt, parseErr := parseReplicationTimestamp(nextRetry.String)
+		if parseErr != nil {
+			return p, fmt.Errorf("%w: invalid next retry timestamp", ErrReplicationInvalidConfig)
+		}
+		p.NextRetryAt = &retryAt
+	}
+	if p.ConnectTimeout <= 0 || p.HeartbeatInterval <= 0 || p.HeartbeatTimeout <= p.HeartbeatInterval ||
+		p.ReconnectInitial <= 0 || p.ReconnectMaximum < p.ReconnectInitial || p.ReconnectJitterPercent < 0 || p.ReconnectJitterPercent > 100 ||
+		p.ConsecutiveFailures < 0 || p.MaxSnapshotBytes <= 0 || p.MaxCompressed <= 0 || p.MaxUncompressed < p.MaxCompressed || p.MaxBatch <= 0 {
+		return p, ErrReplicationInvalidConfig
+	}
+	return p, nil
 }
 func (r *replicationRuntime) blocked(err error) {
 	_, _ = r.db.Exec(`UPDATE replication_local_state SET blocked_reason=?`, err.Error())
@@ -185,64 +222,117 @@ func (r *replicationRuntime) acceptLoop(ln net.Listener) {
 				r.log("replication administrative authentication succeeded for %s", peer.NodeUUID)
 				return
 			}
+			config, err := r.loadPeerRuntimeConfig(r.ctx, peer.NodeUUID)
+			if err != nil || !config.Enabled || config.Role != ReplicationAccept {
+				if err == nil {
+					err = ErrReplicationInvalidConfig
+				}
+				r.log("replication inbound peer configuration: %v", err)
+				return
+			}
+			if err = configureReplicationTCPKeepalive(c, config.HeartbeatInterval, config.HeartbeatTimeout); err != nil {
+				r.log("replication TCP keepalive for %s: %v", peer.NodeUUID, err)
+			}
 			r.setPeerAuthenticated(peer.NodeUUID, peer.SessionUUID)
 			r.trackConnection(peer.NodeUUID, c, true)
 			defer r.trackConnection(peer.NodeUUID, c, false)
-			_ = r.serveSession(c, peer)
+			sessionErr := r.serveSession(newReplicationLivenessConn(c, config.HeartbeatTimeout), peer, config)
+			r.setPeerDisconnected(peer.NodeUUID, peer.SessionUUID, sessionErr)
 		}()
 	}
 }
-func (r *replicationRuntime) dialLoop(p peerRuntimeConfig) {
+func (r *replicationRuntime) dialLoop(nodeUUID string, control *replicationDialerControl) {
 	defer r.wg.Done()
-	defer func() { r.mu.Lock(); delete(r.dialers, p.NodeUUID); r.mu.Unlock() }()
-	backoff := time.Second
-	for {
-		select {
-		case <-r.ctx.Done():
+	defer func() {
+		r.mu.Lock()
+		if r.dialers[nodeUUID] == control {
+			delete(r.dialers, nodeUUID)
+		}
+		r.mu.Unlock()
+		if r.ctx.Err() != nil {
 			return
-		default:
 		}
-		var enabled int
-		if r.db.QueryRow(`SELECT network_enabled FROM replication_local_state`).Scan(&enabled) != nil || enabled == 0 {
-			select {
-			case <-r.ctx.Done():
+		config, err := r.loadPeerRuntimeConfig(r.ctx, nodeUUID)
+		if err == nil && config.Enabled && config.ReconnectEnabled && config.Role == ReplicationDial {
+			r.start()
+		}
+	}()
+	for {
+		if r.ctx.Err() != nil {
+			return
+		}
+		if !r.networkIsEnabled() {
+			if !waitForReplicationDialerWake(r.ctx, control) {
 				return
-			case <-time.After(200 * time.Millisecond):
-				continue
 			}
+			continue
 		}
+		p, err := r.loadPeerRuntimeConfig(r.ctx, nodeUUID)
+		if err != nil {
+			r.setPeerStateIfNotConnected(nodeUUID, "disconnected", sanitizedReplicationConnectionError(err))
+			return
+		}
+		if !p.Enabled || !p.ReconnectEnabled || p.Role != ReplicationDial {
+			return
+		}
+		next, err := r.clampPersistedRetry(p, time.Now().UTC())
+		if err != nil {
+			r.setPeerStateIfNotConnected(nodeUUID, "disconnected", sanitizedReplicationConnectionError(err))
+			if !r.fallbackRetryWait(control, p) {
+				return
+			}
+			continue
+		}
+		if wait := time.Until(next); wait > 0 {
+			if !waitForReplicationDialer(r.ctx, control, wait) {
+				return
+			}
+			continue
+		}
+		revision := r.controlRevision(control)
+		r.setPeerConnecting(p.NodeUUID)
 		tlsCfg, err := r.opts.Credentials.TLSConfig(r.ctx, p.CredentialName, false)
+		var sessionUUID string
 		if err == nil {
 			d := net.Dialer{Timeout: p.ConnectTimeout}
-			var raw net.Conn
-			raw, err = d.DialContext(r.ctx, "tcp", p.Address)
+			raw, dialErr := d.DialContext(r.ctx, "tcp", p.Address)
+			err = dialErr
 			if err == nil {
+				if keepaliveErr := configureReplicationTCPKeepalive(raw, p.HeartbeatInterval, p.HeartbeatTimeout); keepaliveErr != nil {
+					r.log("replication TCP keepalive for %s: %v", p.NodeUUID, keepaliveErr)
+				}
 				tc := tls.Client(raw, tlsCfg.Clone())
-				err = tc.HandshakeContext(r.ctx)
+				var peer wireHello
+				peer, err = r.handshake(tc, true, p.NodeUUID)
 				if err == nil {
-					var peer wireHello
-					peer, err = r.handshake(tc, true, p.NodeUUID)
+					sessionUUID = peer.SessionUUID
+					r.trackConnection(p.NodeUUID, tc, true)
+					r.setPeerAuthenticated(p.NodeUUID, sessionUUID)
+					err = r.clientSession(newReplicationLivenessConn(tc, p.HeartbeatTimeout), peer, p, control)
+					r.trackConnection(p.NodeUUID, tc, false)
 					if err == nil {
-						r.trackConnection(p.NodeUUID, tc, true)
-						r.setPeerAuthenticated(p.NodeUUID, peer.SessionUUID)
-						backoff = time.Second
-						err = r.clientSession(tc, peer, p)
-						r.trackConnection(p.NodeUUID, tc, false)
+						err = errors.New("replication: session ended")
 					}
 				}
 				_ = tc.Close()
 			}
 		}
-		if err != nil {
-			r.setPeerState(p.NodeUUID, "disconnected", err.Error())
+		if err == nil {
+			err = errors.New("replication: connection attempt ended")
 		}
-		select {
-		case <-r.ctx.Done():
-			return
-		case <-time.After(backoff):
+		if r.suppressDialFailure(nodeUUID, control, revision) {
+			continue
 		}
-		if backoff < 10*time.Second {
-			backoff *= 2
+		_, recorded, scheduleErr := r.recordDialFailure(p, sessionUUID, err)
+		if scheduleErr != nil {
+			r.log("replication retry scheduling for %s: %v", p.NodeUUID, scheduleErr)
+			if !r.fallbackRetryWait(control, p) {
+				return
+			}
+			continue
+		}
+		if !recorded {
+			continue
 		}
 	}
 }
@@ -259,10 +349,16 @@ func (r *replicationRuntime) trackConnection(peer string, c net.Conn, add bool) 
 	}
 }
 func (r *replicationRuntime) setPeerAuthenticated(peer, session string) {
-	_, _ = r.db.Exec(`UPDATE replication_peer_connections SET session_state='connected',last_session_uuid=?,last_error=NULL,connected_at_utc=sqliteseal_utc_now(),consecutive_failures=0,updated_at_utc=sqliteseal_utc_now() WHERE peer_node_uuid=?`, session, peer)
+	_, _ = r.db.Exec(`UPDATE replication_peer_connections SET session_state='connected',last_session_uuid=?,last_error=NULL,connected_at_utc=sqliteseal_utc_now(),next_retry_at_utc=NULL,consecutive_failures=0,updated_at_utc=sqliteseal_utc_now() WHERE peer_node_uuid=?`, session, peer)
 }
 func (r *replicationRuntime) setPeerState(peer, state, lastErr string) {
 	_, _ = r.db.Exec(`UPDATE replication_peer_connections SET session_state=?,last_error=?,connected_at_utc=CASE WHEN ?='connected' THEN sqliteseal_utc_now() ELSE connected_at_utc END,updated_at_utc=sqliteseal_utc_now() WHERE peer_node_uuid=?`, state, lastErr, state, peer)
+}
+func (r *replicationRuntime) setPeerStateIfNotConnected(peer, state, lastErr string) {
+	_, _ = r.db.Exec(`UPDATE replication_peer_connections SET session_state=?,last_error=?,updated_at_utc=sqliteseal_utc_now() WHERE peer_node_uuid=? AND session_state!='connected'`, state, lastErr, peer)
+}
+func (r *replicationRuntime) setPeerDisconnected(peer, session string, sessionErr error) {
+	_, _ = r.db.Exec(`UPDATE replication_peer_connections SET session_state='disconnected',last_error=?,updated_at_utc=sqliteseal_utc_now() WHERE peer_node_uuid=? AND session_state IN('connected','schema_pending') AND last_session_uuid=?`, sanitizedReplicationConnectionError(sessionErr), peer, session)
 }
 
 func wipeBytes(b []byte) {
@@ -271,12 +367,8 @@ func wipeBytes(b []byte) {
 	}
 }
 
-func (r *replicationRuntime) clientSession(c net.Conn, peer wireHello, p peerRuntimeConfig) error {
-	interval := p.Heartbeat
-	if interval <= 0 || interval > time.Second {
-		interval = 150 * time.Millisecond
-	}
-	ticker := time.NewTicker(interval)
+func (r *replicationRuntime) clientSession(c net.Conn, peer wireHello, p peerRuntimeConfig, control *replicationDialerControl) error {
+	ticker := time.NewTicker(p.HeartbeatInterval)
 	defer ticker.Stop()
 	for {
 		if err := r.syncCycle(c, peer.NodeUUID, p); err != nil {
@@ -285,12 +377,15 @@ func (r *replicationRuntime) clientSession(c net.Conn, peer wireHello, p peerRun
 		select {
 		case <-r.ctx.Done():
 			return r.ctx.Err()
-		case <-r.kick:
+		case <-control.wake:
 		case <-ticker.C:
 		}
 	}
 }
 func (r *replicationRuntime) syncCycle(c net.Conn, peer string, p peerRuntimeConfig) error {
+	if p.MaxSnapshotBytes <= 0 {
+		p.MaxSnapshotBytes = defaultMaximumReplicationSnapshotBytes
+	}
 	pending, err := r.schemaSyncClient(c, p)
 	if err != nil {
 		r.setPeerState(peer, "schema_pending", err.Error())
@@ -329,11 +424,11 @@ func (r *replicationRuntime) syncCycle(c net.Conn, peer string, p peerRuntimeCon
 		if resp.Snapshot == nil {
 			return ErrReplicationSnapshotRequired
 		}
-		raw, fetchErr := requestSnapshotChunks(c, *resp.Snapshot, p.MaxCompressed, p.MaxUncompressed)
+		temporaryPath, fetchErr := r.requestSnapshotChunks(c, *resp.Snapshot, p.MaxSnapshotBytes, p.MaxCompressed, p.MaxUncompressed)
 		if fetchErr != nil {
 			return fetchErr
 		}
-		if err = r.installSessionSnapshot(r.ctx, peer, *resp.Snapshot, raw); err != nil {
+		if err = r.installSessionSnapshotFile(r.ctx, peer, *resp.Snapshot, temporaryPath, p.MaxSnapshotBytes); err != nil {
 			return err
 		}
 		return nil
@@ -362,13 +457,14 @@ func (r *replicationRuntime) syncCycle(c net.Conn, peer string, p peerRuntimeCon
 		return err
 	}
 	var uploadManifest *replicationSnapshotManifest
-	var uploadRaw []byte
+	var uploadSnapshot *replicationSnapshotFile
 	if snapshotRequired {
-		manifest, raw, snapshotErr := r.createTransferSnapshot(r.ctx)
+		snapshot, snapshotErr := r.createTransferSnapshotFile(r.ctx, p.MaxSnapshotBytes)
 		if snapshotErr != nil {
 			return snapshotErr
 		}
-		uploadManifest, uploadRaw = &manifest, raw
+		uploadSnapshot = &snapshot
+		uploadManifest = &snapshot.Manifest
 	}
 	push := wireMessage{Type: "sync_push", Cursors: vector, Events: localEvents, Gaps: resp.Gaps, More: moreOriginEvents(localEvents, vector, local), SnapshotRequired: snapshotRequired, Snapshot: uploadManifest}
 	if err = writeReplicationFrame(c, push, p.MaxCompressed); err != nil {
@@ -379,7 +475,7 @@ func (r *replicationRuntime) syncCycle(c net.Conn, peer string, p peerRuntimeCon
 		return err
 	}
 	if snapshotRequired && ack.Type == "snapshot_fetch" {
-		ack, err = answerSnapshotFetch(c, ack, *uploadManifest, uploadRaw, p.MaxCompressed, p.MaxUncompressed)
+		ack, err = answerSnapshotFetch(c, ack, *uploadSnapshot, p.MaxCompressed, p.MaxUncompressed)
 		if err != nil {
 			return err
 		}
@@ -395,17 +491,20 @@ func (r *replicationRuntime) syncCycle(c net.Conn, peer string, p peerRuntimeCon
 	}
 	return r.recordPeerAck(peer, cursorFromVector(ack.Cursors, local).ContiguousCounter)
 }
-func (r *replicationRuntime) serveSession(c net.Conn, peer wireHello) error {
+func (r *replicationRuntime) serveSession(c net.Conn, peer wireHello, p peerRuntimeConfig) error {
+	if p.MaxSnapshotBytes <= 0 {
+		p.MaxSnapshotBytes = defaultMaximumReplicationSnapshotBytes
+	}
 	schemaReady := false
 	for {
-		msg, err := readReplicationFrame(c, 8<<20, 32<<20)
+		msg, err := readReplicationFrame(c, p.MaxCompressed, p.MaxUncompressed)
 		if err != nil {
 			return err
 		}
 		switch msg.Type {
 		case "schema_request":
 			if err = r.mergeSchemaDeclarations(r.ctx, msg.Schemas); err != nil {
-				_ = writeReplicationFrame(c, wireMessage{Type: "schema_response", Error: err.Error()}, 8<<20)
+				_ = writeReplicationFrame(c, wireMessage{Type: "schema_response", Error: err.Error()}, p.MaxCompressed)
 				return err
 			}
 			pending, reconcileErr := r.reconcileSchemas(r.ctx)
@@ -424,18 +523,18 @@ func (r *replicationRuntime) serveSession(c net.Conn, peer wireHello) error {
 			} else {
 				r.setPeerState(peer.NodeUUID, "schema_pending", response.Error)
 			}
-			if err = writeReplicationFrame(c, response, 8<<20); err != nil {
+			if err = writeReplicationFrame(c, response, p.MaxCompressed); err != nil {
 				return err
 			}
 			continue
 		case "sync_request":
 			if !schemaReady {
 				err = errors.New("replication: schema agreement required before synchronization")
-				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, 8<<20)
+				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, p.MaxCompressed)
 				return err
 			}
 			if err = r.persistPeerCursorVector(r.ctx, peer.NodeUUID, msg.Cursors); err != nil {
-				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, 8<<20)
+				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, p.MaxCompressed)
 				return err
 			}
 			var local string
@@ -450,15 +549,16 @@ func (r *replicationRuntime) serveSession(c net.Conn, peer wireHello) error {
 			}
 			var events []wireEvent
 			var snapshotManifest *replicationSnapshotManifest
-			var snapshotRaw []byte
+			var snapshotFile *replicationSnapshotFile
 			if e == nil && !snapshotRequired {
 				events, e = r.loadOriginEvents(r.ctx, requested.ContiguousCounter, 500)
 			} else if e == nil {
-				manifest, raw, snapshotErr := r.createTransferSnapshot(r.ctx)
+				snapshot, snapshotErr := r.createTransferSnapshotFile(r.ctx, p.MaxSnapshotBytes)
 				if snapshotErr != nil {
 					e = snapshotErr
 				} else {
-					snapshotManifest, snapshotRaw = &manifest, raw
+					snapshotFile = &snapshot
+					snapshotManifest = &snapshot.Manifest
 				}
 			}
 			gaps, gapErr := r.localGapRequests(r.ctx, peer.NodeUUID)
@@ -466,37 +566,37 @@ func (r *replicationRuntime) serveSession(c net.Conn, peer wireHello) error {
 				e = gapErr
 			}
 			if e != nil {
-				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: e.Error()}, 8<<20)
+				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: e.Error()}, p.MaxCompressed)
 			} else {
-				e = writeReplicationFrame(c, wireMessage{Type: "sync_response", Cursors: vector, Gaps: gaps, Events: events, More: moreOriginEvents(events, vector, local), SnapshotRequired: snapshotRequired, Snapshot: snapshotManifest}, 8<<20)
+				e = writeReplicationFrame(c, wireMessage{Type: "sync_response", Cursors: vector, Gaps: gaps, Events: events, More: moreOriginEvents(events, vector, local), SnapshotRequired: snapshotRequired, Snapshot: snapshotManifest}, p.MaxCompressed)
 			}
 			if e != nil {
 				return e
 			}
 			if snapshotRequired {
-				if e = provideSnapshotChunks(c, *snapshotManifest, snapshotRaw, 8<<20, 32<<20); e != nil {
+				if e = provideSnapshotChunks(c, *snapshotFile, p.MaxCompressed, p.MaxUncompressed); e != nil {
 					return e
 				}
 			}
 		case "sync_push":
 			if err = r.persistPeerCursorVector(r.ctx, peer.NodeUUID, msg.Cursors); err != nil {
-				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, 8<<20)
+				_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, p.MaxCompressed)
 				return err
 			}
 			if msg.SnapshotRequired {
 				if msg.Snapshot == nil {
 					return errors.New("replication: snapshot offer is missing")
 				}
-				raw, receiveErr := requestSnapshotChunks(c, *msg.Snapshot, 8<<20, 32<<20)
+				temporaryPath, receiveErr := r.requestSnapshotChunks(c, *msg.Snapshot, p.MaxSnapshotBytes, p.MaxCompressed, p.MaxUncompressed)
 				if receiveErr != nil {
 					return receiveErr
 				}
-				if err = r.installSessionSnapshot(r.ctx, peer.NodeUUID, *msg.Snapshot, raw); err != nil {
+				if err = r.installSessionSnapshotFile(r.ctx, peer.NodeUUID, *msg.Snapshot, temporaryPath, p.MaxSnapshotBytes); err != nil {
 					return err
 				}
 			} else {
 				if err = r.applyRemoteEvents(r.ctx, peer.NodeUUID, msg.Events); err != nil {
-					_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, 8<<20)
+					_ = writeReplicationFrame(c, wireMessage{Type: "error", Error: err.Error()}, p.MaxCompressed)
 					return err
 				}
 				if err = r.recoverDeferredEvents(r.ctx); err != nil {
@@ -507,7 +607,7 @@ func (r *replicationRuntime) serveSession(c net.Conn, peer wireHello) error {
 			if e != nil {
 				return e
 			}
-			if err = writeReplicationFrame(c, wireMessage{Type: "sync_ack", Cursors: vector}, 8<<20); err != nil {
+			if err = writeReplicationFrame(c, wireMessage{Type: "sync_ack", Cursors: vector}, p.MaxCompressed); err != nil {
 				return err
 			}
 		default:
@@ -1205,6 +1305,7 @@ func (db *DB) ResumeReplication(ctx context.Context) error {
 	if _, err := db.ExecContext(ctx, `UPDATE replication_local_state SET network_enabled=1,blocked_reason=NULL,updated_at_utc=sqliteseal_utc_now()`); err != nil {
 		return err
 	}
+	db.replication.wakeAllDialers(false)
 	db.replication.start()
 	return nil
 }
@@ -1216,10 +1317,7 @@ func (db *DB) SyncReplicationPeer(ctx context.Context, node string) error {
 	if n == 0 {
 		return ErrReplicationPeerNotFound
 	}
-	select {
-	case db.replication.kick <- struct{}{}:
-	default:
-	}
+	db.replication.clearPeerRetryAndWake(node, false)
 	return nil
 }
 func (db *DB) WaitForReplication(ctx context.Context, node, origin string, counter int64) error {

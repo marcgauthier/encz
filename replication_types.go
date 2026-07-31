@@ -82,6 +82,8 @@ type PeerConfig struct {
 	Role                                                                                                           ReplicationConnectionRole
 	AuthMode                                                                                                       ReplicationAuthMode
 	ConnectTimeout, HeartbeatInterval, HeartbeatTimeout, ReconnectInitial, ReconnectMaximum                        time.Duration
+	ReconnectJitterPercent                                                                                         *int
+	MaxSnapshotBytes                                                                                               int64
 	MaxCompressedBytes, MaxUncompressedBytes, MaxEventsPerBatch, MaxInflightEvents, MaxInflightBytes               int
 }
 type MembershipNode struct {
@@ -103,6 +105,8 @@ type ReplicationPeerStatus struct {
 	NodeUUID, State, LastError                      string
 	Level                                           int
 	ConnectedAt                                     time.Time
+	NextRetryAt                                     *time.Time
+	ConsecutiveFailures                             int64
 	ContiguousCounter, HighestSeenCounter, GapCount int64
 }
 type ReplicationStatus struct {

@@ -150,6 +150,10 @@ func main() {
 
 `SQLiteSeal` includes built-in peer-to-peer active-active replication. The example below sets up two encrypted database nodes (`Node A` and `Node B`) running locally, configures multi-master synchronization on a `users` table, and demonstrates bidirectional replication.
 
+The current Go test suite passes. The accurate claim is: ENCZ can replicate
+most conventional SQLite tables with an immutable globally unique key, not
+every possible SQLite table.
+
 ```go
 package main
 

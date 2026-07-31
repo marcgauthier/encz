@@ -85,6 +85,41 @@ epoch and activates networking. Every active node must receive the same canonica
 `MembershipNode.Level` must match the immutable local level configured at
 initialization; duplicate levels are allowed.
 
+`PeerConfig.HeartbeatInterval` is the maximum idle interval between complete
+synchronization rounds and defaults to 15 seconds. `HeartbeatTimeout` defaults
+to three times that interval (45 seconds with the default interval) and must be
+greater than the interval. After authentication, all schema, synchronization,
+acknowledgement, and snapshot traffic refreshes sliding socket read and write
+deadlines. A stalled or half-open session is closed when the timeout expires;
+the dial side then reconnects normally. Operating-system TCP keepalive is also
+enabled on a best-effort basis. Updating connection or heartbeat settings with
+`UpsertReplicationPeer` closes the current session so the new settings take
+effect immediately. Use `SyncReplicationPeer` when an application needs to
+wake a peer before its next heartbeat interval.
+
+Outbound reconnects use `PeerConfig.ReconnectInitial` (default one second) and
+`ReconnectMaximum` (default one minute). The unjittered delay doubles after
+each consecutive failure and is capped at the maximum. A nil
+`ReconnectJitterPercent` selects the 20 percent default; a pointer to zero
+disables jitter, and other values must be from 0 through 100. Jitter is sampled
+symmetrically around the unjittered delay, with the upper bound capped by
+`ReconnectMaximum`.
+
+The selected retry time and consecutive failure count are persisted. Reopening
+the database honors a pending retry instead of creating a reconnect storm; an
+overdue retry runs immediately, and an implausibly distant stored retry is
+clamped to the configured maximum. `UpsertReplicationPeer`,
+`ReloadReplicationCredentials`, `ResumeReplication`, membership activation,
+and `SyncReplicationPeer` clear a pending delay and wake the affected dialer.
+`ReplicationPeerStatus` exposes `NextRetryAt`, `ConsecutiveFailures`, and the
+most recent `ConnectedAt` time for operational monitoring.
+
+`PeerConfig.MaxSnapshotBytes` bounds each snapshot accepted from or generated
+for that peer. Zero selects the 256 MiB default; negative values are invalid,
+and operators must explicitly configure a larger value on both peers for
+larger snapshots. The limit is independent of the per-frame limits because a
+snapshot is transferred as many bounded frames.
+
 ### Schema reconciliation
 
 Before exchanging row events, peers exchange the structured schema declarations
@@ -140,7 +175,24 @@ Each authenticated synchronization round exchanges the complete per-origin curso
 
 ## Snapshots
 
-`CreateReplicationSnapshot` creates a ready session-authenticated logical snapshot and returns its identity, schema hash, content hash, creation time, and uncompressed size. Snapshot files are stored beside the database under the `.replication-snapshots` directory and referenced from `replication_snapshots.storage_uri`. Normal peer synchronization automatically creates and installs a fresh snapshot when retained events cannot repair a cursor. Manual/offline export and `external_signature` import remain a separate phase.
+`CreateReplicationSnapshot` creates a ready session-authenticated logical
+snapshot and returns its identity, schema hash, content hash, creation time, and
+uncompressed size. Creation writes canonical format-version-1 JSON directly to
+a restricted temporary file while reading one consistent SQLite transaction;
+it hashes and size-checks the stream before atomically publishing the file.
+Snapshot files are stored beside the database under the
+`.replication-snapshots` directory and referenced from
+`replication_snapshots.storage_uri`.
+
+Normal peer synchronization transfers the file in 64 KiB individually hashed
+chunks without reading the full snapshot into memory. The receiver writes and
+hashes a temporary file, validates canonical JSON and all snapshot records in a
+streaming pass, then streams them again into one atomic SQLite transaction.
+Memory is bounded by a chunk, one logical row, and small schema/cursor metadata.
+Interrupted or rejected transfers remove their temporary files; reconnection
+starts that snapshot transfer again at offset zero. Automatic synchronization
+creates a fresh snapshot when retained events cannot repair a cursor.
+Manual/offline export and `external_signature` import remain a separate phase.
 
 ## Two-node verifier
 

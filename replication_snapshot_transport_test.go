@@ -2,7 +2,9 @@ package sqliteseal
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -48,7 +50,7 @@ func runSnapshotSyncCycle(t *testing.T, dialer, acceptor *DB, dialerID, acceptor
 	client, server := net.Pipe()
 	done := make(chan error, 1)
 	go func() {
-		done <- acceptor.replication.serveSession(server, wireHello{NodeUUID: dialerID})
+		done <- acceptor.replication.serveSession(server, wireHello{NodeUUID: dialerID}, peerRuntimeConfig{MaxSnapshotBytes: defaultMaximumReplicationSnapshotBytes, MaxCompressed: 8 << 20, MaxUncompressed: 32 << 20, MaxBatch: 500})
 	}()
 	config := peerRuntimeConfig{MaxCompressed: 8 << 20, MaxUncompressed: 32 << 20, MaxBatch: 500}
 	if err := dialer.replication.syncCycle(client, acceptorID, config); err != nil {
@@ -96,5 +98,54 @@ func TestReplicationSyncCycleUploadsSnapshot(t *testing.T) {
 	var name string
 	if err := target.QueryRow(`SELECT name FROM items WHERE id='one'`).Scan(&name); err != nil || name != "uploaded-snapshot" {
 		t.Fatalf("name=%q err=%v", name, err)
+	}
+}
+
+func TestReplicationSyncCycleStreamsMultiMegabyteSnapshot(t *testing.T) {
+	ctx, source, target, sourceID := setupEventValidationNodes(t)
+	targetID, gotSourceID := registerSnapshotPeers(t, ctx, target, source)
+	if gotSourceID != sourceID {
+		t.Fatal("unexpected source identity")
+	}
+	const rowCount = 2048
+	const noteBytes = 1 << 10
+	payload := strings.Repeat("x", noteBytes)
+	tx, err := source.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statement, err := tx.PrepareContext(ctx, `INSERT INTO items VALUES(?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < rowCount; index++ {
+		if _, err = statement.ExecContext(ctx, fmt.Sprintf("row-%04d", index), "streamed", payload); err != nil {
+			_ = statement.Close()
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err = statement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var sourceCount int64
+	if err = source.QueryRow(`SELECT count(*) FROM items`).Scan(&sourceCount); err != nil || sourceCount != rowCount {
+		t.Fatalf("source rows=%d err=%v", sourceCount, err)
+	}
+	compactFirstLocalEvent(t, ctx, source, sourceID)
+	var installed int64
+	runSnapshotSyncCycle(t, target, source, targetID, sourceID)
+	if err = target.QueryRow(`SELECT count(*) FROM replication_snapshots WHERE snapshot_state='installed'`).Scan(&installed); err != nil {
+		t.Fatal(err)
+	}
+	var count, total int64
+	if err = target.QueryRow(`SELECT count(*),coalesce(sum(length(note)),0) FROM items`).Scan(&count, &total); err != nil {
+		t.Fatal(err)
+	}
+	if count != rowCount || total != rowCount*noteBytes {
+		t.Fatalf("streamed rows=%d bytes=%d installed=%d", count, total, installed)
 	}
 }

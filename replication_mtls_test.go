@@ -88,10 +88,12 @@ func TestReplicationMTLSEndToEndAndAdministrativePeerTest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = a.UpsertReplicationPeer(ctx, PeerConfig{NodeUUID: nodeB, IncarnationUUID: statusB.IncarnationUUID, NodeName: "node-b", Address: address, CredentialName: "b-cert", ListenEnabled: true, Role: ReplicationDial, AuthMode: ReplicationAuthMTLS}); err != nil {
+	zeroJitter := 0
+	dialPeer := PeerConfig{NodeUUID: nodeB, IncarnationUUID: statusB.IncarnationUUID, NodeName: "node-b", Address: address, CredentialName: "b-cert", ListenEnabled: true, Role: ReplicationDial, AuthMode: ReplicationAuthMTLS, HeartbeatInterval: 100 * time.Millisecond, HeartbeatTimeout: 2 * time.Second, ReconnectInitial: 100 * time.Millisecond, ReconnectMaximum: 500 * time.Millisecond, ReconnectJitterPercent: &zeroJitter}
+	if err = a.UpsertReplicationPeer(ctx, dialPeer); err != nil {
 		t.Fatal(err)
 	}
-	if err = b.UpsertReplicationPeer(ctx, PeerConfig{NodeUUID: nodeA, IncarnationUUID: statusA.IncarnationUUID, NodeName: "node-a", Address: "127.0.0.1:1", CredentialName: "a-cert", ListenEnabled: false, Role: ReplicationAccept, AuthMode: ReplicationAuthMTLS}); err != nil {
+	if err = b.UpsertReplicationPeer(ctx, PeerConfig{NodeUUID: nodeA, IncarnationUUID: statusA.IncarnationUUID, NodeName: "node-a", Address: "127.0.0.1:1", CredentialName: "a-cert", ListenEnabled: false, Role: ReplicationAccept, AuthMode: ReplicationAuthMTLS, HeartbeatInterval: 100 * time.Millisecond, HeartbeatTimeout: 2 * time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	manifest := MembershipManifest{Epoch: 2, Domain: domain, PolicyHash: "mtls-policy", Nodes: []MembershipNode{
@@ -101,11 +103,53 @@ func TestReplicationMTLSEndToEndAndAdministrativePeerTest(t *testing.T) {
 	if err = b.ApplyMembershipManifest(ctx, manifest); err != nil {
 		t.Fatal(err)
 	}
+	if err = b.PauseReplication(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err = a.ApplyMembershipManifest(ctx, manifest); err != nil {
+		t.Fatal(err)
+	}
+	retryDeadline := time.Now().Add(3 * time.Second)
+	for {
+		var failures int64
+		var nextRetry string
+		err = a.QueryRow(`SELECT consecutive_failures,coalesce(next_retry_at_utc,'') FROM replication_peer_connections WHERE peer_node_uuid=?`, nodeB).Scan(&failures, &nextRetry)
+		if err == nil && failures >= 1 && nextRetry != "" {
+			break
+		}
+		if time.Now().After(retryDeadline) {
+			t.Fatalf("outage did not schedule a reconnect: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err = b.ResumeReplication(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err = a.TestReplicationPeer(ctx, nodeB); err != nil {
 		t.Fatalf("administrative mTLS test: %v", err)
+	}
+	var firstSession string
+	deadline := time.Now().Add(10 * time.Second)
+	for firstSession == "" {
+		err = a.QueryRow(`SELECT coalesce(last_session_uuid,'') FROM replication_peer_connections WHERE peer_node_uuid=? AND session_state='connected'`, nodeB).Scan(&firstSession)
+		if time.Now().After(deadline) {
+			t.Fatalf("initial replication session did not connect: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	dialPeer.HeartbeatInterval = 200 * time.Millisecond
+	dialPeer.HeartbeatTimeout = 3 * time.Second
+	if err = a.UpsertReplicationPeer(ctx, dialPeer); err != nil {
+		t.Fatalf("live heartbeat update: %v", err)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	var replacementSession string
+	for replacementSession == "" || replacementSession == firstSession {
+		err = a.QueryRow(`SELECT coalesce(last_session_uuid,'') FROM replication_peer_connections WHERE peer_node_uuid=? AND session_state='connected'`, nodeB).Scan(&replacementSession)
+		if time.Now().After(deadline) {
+			t.Fatalf("replacement replication session did not connect: first=%s replacement=%s err=%v", firstSession, replacementSession, err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if statusA.SchemaHash == statusB.SchemaHash {
 		t.Fatal("test peers unexpectedly began with the same schema hash")
@@ -113,7 +157,7 @@ func TestReplicationMTLSEndToEndAndAdministrativePeerTest(t *testing.T) {
 	if _, err = a.Exec(`INSERT INTO items(id,name) VALUES('one','authenticated')`); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	deadline = time.Now().Add(10 * time.Second)
 	for {
 		var name string
 		err = b.QueryRow(`SELECT name FROM items WHERE id='one'`).Scan(&name)
